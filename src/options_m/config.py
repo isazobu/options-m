@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     log_format: str = "json"
 
-    # HTTP server. Northflank (and most platforms) inject PORT.
+    # HTTP server. Render (like most platforms) injects PORT.
     host: str = "0.0.0.0"  # noqa: S104 - containers must bind all interfaces
     port: int = Field(default=8080, ge=1, le=65535)
 

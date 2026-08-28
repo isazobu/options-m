@@ -232,36 +232,6 @@ The pool is configured with `check=check_connection` for the same reason: when
 Neon scales to zero it drops idle connections, and a stale pooled connection
 would otherwise fail the next query.
 
-## Deploying to Northflank
-
-The free Sandbox tier allows 2 services + 2 cron jobs + 1 addon, with
-always-on compute (no sleeping). This app fits in **1 service + 1 addon**.
-
-1. **Create the Postgres addon** first. Copy its connection string.
-2. **Create a Combined (build + deploy) service** from this repo.
-   - Build type: **Dockerfile**, path `/Dockerfile`.
-   - Port: **8080**, protocol HTTP, and publish it so the dashboard is
-     reachable.
-3. **Set environment variables** on the service:
-   - `DATABASE_URL` — from the addon (link it as a secret rather than pasting
-     the DSN, so credential rotation propagates).
-   - `LOG_FORMAT=json`, `LOG_LEVEL=INFO`.
-   - Leave `PORT` alone unless you change the exposed port.
-4. **Point the health check at `/health`** (not `/ready`) — readiness failures
-   should not trigger restarts.
-
-Notes:
-
-- Northflank requires a payment method on file even for the free tier, and
-  documents the free tier as *not for production* — expect restarts and do not
-  store anything there you cannot lose.
-- The free tier gives **one** addon, so there is no Redis alongside Postgres.
-  If you need a work queue, build it on Postgres with
-  `SELECT ... FOR UPDATE SKIP LOCKED` rather than adding a broker.
-- If you later split the agents and the dashboard into two services, both can
-  run the same image with different env vars — the second service still fits in
-  the free tier's 2-service budget.
-
 ## Adding dependencies
 
 Add them to `[project].dependencies` in `pyproject.toml` (dev-only tools go
