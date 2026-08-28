@@ -1,0 +1,9 @@
+# Normalize to LF in the repository. The runtime image is Linux, so CRLF in
+# checked-in files would break scripts and entrypoints inside the container.
+* text=auto eol=lf
+
+# Binary files must never be normalized.
+*.png binary
+*.jpg binary
+*.gz  binary
+*.zip binary
