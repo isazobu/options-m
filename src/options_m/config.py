@@ -33,9 +33,15 @@ class Settings(BaseSettings):
 
     # Postgres. Unset means "run without a database" (useful locally).
     database_url: str | None = None
+    # Set min_size=0 against serverless Postgres that bills compute time
+    # (e.g. Neon): holding an idle connection open keeps its compute awake.
     db_pool_min_size: int = Field(default=1, ge=0)
     db_pool_max_size: int = Field(default=4, ge=1)
     db_connect_timeout_seconds: float = Field(default=10.0, gt=0)
+    db_pool_max_idle_seconds: float = Field(default=120.0, gt=0)
+    # Readiness must answer quickly: a hanging probe is worse than a failing
+    # one, because the platform's own health check times out instead.
+    db_ping_timeout_seconds: float = Field(default=3.0, gt=0)
 
     # Agent loop pacing.
     agent_interval_seconds: float = Field(default=30.0, gt=0)

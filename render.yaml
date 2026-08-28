@@ -1,0 +1,55 @@
+# Render Blueprint. Apply with: Render dashboard -> New -> Blueprint.
+#
+# Deployed as a *web service*, not a background worker: the agent loops run
+# inside this same process, and Render's free tier covers web services only.
+#
+# Free tier caveats this file cannot solve:
+#   * Render sleeps a free web service after 15 minutes without inbound
+#     traffic. An external pinger must hit /health (see README).
+#   * The 750 free instance hours per month are shared across the whole
+#     workspace, so this must be the only always-on free service.
+#   * Postgres is deliberately NOT defined here — Render's free database is
+#     deleted 30 days after creation. Point DATABASE_URL at Neon instead.
+
+services:
+  - type: web
+    name: options-m
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    # Liveness only. /ready would restart the service on a database blip.
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LOG_FORMAT
+        value: json
+
+      # Neon bills compute time, and an idle pooled connection keeps its
+      # compute awake. Hold no idle connections, and stay small: the free
+      # instance has little memory to spare.
+      - key: DB_POOL_MIN_SIZE
+        value: "0"
+      - key: DB_POOL_MAX_SIZE
+        value: "2"
+      - key: DB_POOL_MAX_IDLE_SECONDS
+        value: "60"
+
+      # Every tick that touches the database keeps Neon's compute awake, and
+      # the free plan allows 100 compute-hours per month. Pace accordingly.
+      - key: AGENT_INTERVAL_SECONDS
+        value: "60"
+      - key: AGENT_ERROR_BACKOFF_SECONDS
+        value: "10"
+      - key: AGENT_MAX_BACKOFF_SECONDS
+        value: "600"
+
+      # Render sends SIGTERM and force-kills 30s later; finish before that.
+      - key: SHUTDOWN_GRACE_SECONDS
+        value: "20"
+
+      # Set in the Render dashboard — never committed.
+      - key: DATABASE_URL
+        sync: false

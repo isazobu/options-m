@@ -150,6 +150,9 @@ image runs unchanged everywhere.
 | `LOG_FORMAT`                  | `json`    | `json` for prod, `text` for local       |
 | `HOST` / `PORT`               | `0.0.0.0` / `8080` | HTTP bind address              |
 | `DATABASE_URL`                | unset     | Postgres DSN; unset disables the pool   |
+| `DB_POOL_MIN_SIZE`            | `1`       | Idle connections held; `0` for Neon     |
+| `DB_POOL_MAX_SIZE`            | `4`       | Pool ceiling                            |
+| `DB_POOL_MAX_IDLE_SECONDS`    | `120`     | Idle connection recycle age             |
 | `AGENT_INTERVAL_SECONDS`      | `30`      | Delay between successful iterations     |
 | `AGENT_ERROR_BACKOFF_SECONDS` | `5`       | First retry delay after a failure       |
 | `AGENT_MAX_BACKOFF_SECONDS`   | `300`     | Backoff ceiling                         |
@@ -180,6 +183,54 @@ The image is multi-stage (build deps stay out of the runtime layer), runs as an
 unprivileged `app` user, and ships the dependencies in an isolated virtualenv at
 `/opt/venv`. `ENTRYPOINT` uses exec form so python is PID 1 and receives
 SIGTERM directly.
+
+## Deploying to Render (free tier)
+
+`render.yaml` deploys this as a **web service** — the agent loops run inside
+the same process, and Render's free tier covers web services only, not
+background workers.
+
+1. **Create the database on [Neon](https://neon.com)**, not on Render: a free
+   Render Postgres is deleted 30 days after creation. Neon's free plan does
+   not expire and needs no card.
+2. **Render → New → Blueprint**, point it at this repo. It reads `render.yaml`.
+3. **Set `DATABASE_URL`** in the Render dashboard (it is `sync: false`, so it
+   is never committed). Use Neon's *pooled* connection string.
+4. **Add an external pinger** — see below. Without it the service sleeps.
+
+### Keeping it awake
+
+Render sleeps a free web service after **15 minutes without inbound HTTP
+traffic**. Busy agent loops do not count — only requests do. So an external
+monitor must hit `https://<your-service>.onrender.com/health` every 10 minutes
+(UptimeRobot's free plan does this at 5-minute intervals).
+
+Render's own cron jobs are not free, so the pinger has to live elsewhere.
+Avoid GitHub Actions for it: scheduled workflows are delayed under load and
+are disabled entirely after 60 days of repo inactivity.
+
+Two consequences worth internalising:
+
+- **The agent loops' uptime depends on that pinger.** If it stops, the service
+  sleeps and the agents stop with it. It recovers on the next successful ping
+  (~1 minute cold start), but the iterations in between simply never ran, and
+  nothing alerts you. Monitor the pinger itself.
+- **750 free instance hours per month are shared across the workspace.** A
+  31-day month is 744 hours, so this must be the *only* always-on free
+  service. A second one suspends both before the month ends.
+
+### Neon's compute budget
+
+Neon's free plan allows **100 compute-hours per month** and scales compute to
+zero after 5 minutes of inactivity. An always-connected app never lets it
+idle, which would exhaust the budget in about four days. `render.yaml`
+therefore sets `DB_POOL_MIN_SIZE=0` and a 60-second agent interval — but the
+budget still depends on how often your agents actually touch the database.
+Batch writes rather than writing on every tick.
+
+The pool is configured with `check=check_connection` for the same reason: when
+Neon scales to zero it drops idle connections, and a stale pooled connection
+would otherwise fail the next query.
 
 ## Deploying to Northflank
 

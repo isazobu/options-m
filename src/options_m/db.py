@@ -7,6 +7,7 @@ code that owns the data.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -32,6 +33,8 @@ class Database:
         self._min_size = settings.db_pool_min_size
         self._max_size = settings.db_pool_max_size
         self._timeout = settings.db_connect_timeout_seconds
+        self._max_idle = settings.db_pool_max_idle_seconds
+        self._ping_timeout = settings.db_ping_timeout_seconds
         self._pool: AsyncConnectionPool[AsyncConnection[object]] | None = None
 
     @property
@@ -48,13 +51,25 @@ class Database:
             conninfo=self._dsn,
             min_size=self._min_size,
             max_size=self._max_size,
+            # Serverless Postgres (Neon and friends) drops idle connections when
+            # it scales its compute to zero. Without this check a stale pooled
+            # connection would surface as an error on the next query.
+            check=AsyncConnectionPool.check_connection,
+            max_idle=self._max_idle,
             open=False,
         )
-        await pool.open(wait=True, timeout=self._timeout)
+        # wait=False keeps startup independent of database availability: with
+        # min_size=0 there is nothing to pre-open, and a transient outage must
+        # not turn into a container crash-loop.
+        await pool.open(wait=self._min_size > 0, timeout=self._timeout)
         self._pool = pool
         logger.info(
             "database pool ready",
-            extra={"min_size": self._min_size, "max_size": self._max_size},
+            extra={
+                "min_size": self._min_size,
+                "max_size": self._max_size,
+                "max_idle_seconds": self._max_idle,
+            },
         )
 
     async def close(self) -> None:
@@ -77,12 +92,21 @@ class Database:
             yield conn
 
     async def ping(self) -> bool:
-        """Return whether a trivial query succeeds. Never raises."""
+        """Return whether a trivial query succeeds. Never raises, never hangs.
+
+        Bounded by ``db_ping_timeout_seconds``: when the database is
+        unreachable, borrowing a connection would otherwise block for the
+        pool's full timeout and leave the readiness probe hanging.
+        """
         if self._pool is None:
             return False
         try:
-            async with self.connection() as conn, conn.cursor() as cur:
-                await cur.execute("SELECT 1")
+            async with asyncio.timeout(self._ping_timeout):
+                async with self.connection() as conn, conn.cursor() as cur:
+                    await cur.execute("SELECT 1")
+        except TimeoutError:
+            logger.warning("database ping timed out", extra={"timeout_seconds": self._ping_timeout})
+            return False
         except Exception:
             logger.exception("database ping failed")
             return False
