@@ -84,7 +84,10 @@ Collect via `AlpacaMcp`:
   **ourselves** from the bars; do not add a `stockstats`/`pandas` dependency for it.
 - `get_option_chain(symbol, ...)` filtered to the DTE window → summarise into
   `iv_atm`, `iv_rank` (vs the last N snapshots we stored), `put_call_skew`,
-  `term_structure` (near vs far ATM IV), `median_spread_pct`, `total_open_interest`
+  `term_structure` (near vs far ATM IV), `median_spread_pct`, `total_open_interest`.
+  The math already exists: `options_m.volatility` has `iv_rank` / `iv_percentile`
+  and BSM `implied_vol` (invert a mid quote when the chain carries no IV), and
+  `Store.iv_rank_for(symbol)` / `Store.recent_iv(symbol)` read the history below.
 - `get_news(symbols=[symbol], limit=5)` — headline + summary only, truncated. The MCP
   server classifies this tool's output as `external_text` in its trust-boundary envelope
   (`../alpaca-mcp-server/src/alpaca_mcp_server/security.py`): it is attacker-influenceable
@@ -102,7 +105,122 @@ a model from inventing an IV number.
 Persist every pack into `proposals.evidence` (JSONB) so a judge can replay the decision.
 
 Store an `iv_history` row per symbol per day so `iv_rank` becomes meaningful within a day
-or two of running — start writing it in this phase.
+or two of running — start writing it in this phase. The table
+(`iv_history(id, ts, symbol, iv_atm, dte, spot, payload)`) and
+`Store.append_iv_snapshot(...)` already exist; this phase adds the writer (a per-symbol
+ATM-IV reading from the chain, once per pull).
+
+#### Pack shape (as built)
+
+`EvidenceCollector(settings, mcp, store).collect(symbol, dte_min=7, dte_max=45)` returns the
+dict below. Every leaf is a number/int/str **or** the literal `"NO_DATA_AVAILABLE"`; a whole
+section degrades to that string when its fetch fails, and the rest of the pack still returns
+(the collector never raises for a single failed sub-fetch). Helpers live in
+`src/options_m/occ.py` (`parse_occ_symbol` — read-only, no inverse) and
+`src/options_m/indicators.py` (SMA / Wilder RSI / Wilder ATR / realised-vol / 52-week
+distance, pure stdlib). IV-rank math stays in `options_m.volatility` via
+`Store.iv_rank_for`; the collector adds no second implementation.
+
+```
+symbol            str          uppercased
+as_of             str          UTC ISO-8601, "…Z"
+note              str          the NO_DATA_AVAILABLE instruction (verbatim)
+dte_window        [int, int]   [dte_min, dte_max]
+spot              dict | "NO_DATA_AVAILABLE"
+trend             dict | "NO_DATA_AVAILABLE"
+options           dict | "NO_DATA_AVAILABLE"
+position          list[dict] | null | "NO_DATA_AVAILABLE"   (null = confirmed flat,
+                                                             the string = read failed)
+untrusted_news    list[dict] | "NO_DATA_AVAILABLE"          (≤ 5 items)
+lessons           list[str]                                 (always [] until Phase 4)
+```
+
+`spot` — from `get_stock_snapshot`:
+
+```
+bid / ask                     ← latestQuote.bp / .ap
+bid_size / ask_size           ← latestQuote.bs / .as
+mid  spread  spread_pct       derived
+last                          ← latestTrade.p
+day_open/high/low/close       ← dailyBar.o/h/l/c
+day_volume  day_vwap          ← dailyBar.v / .vw
+prev_close                    ← prevDailyBar.c
+change_from_prev_close_pct    derived
+quote_time                    ← latestQuote.t
+```
+
+`trend` — computed here from ~252 daily bars (not 60; needed for a real 52-week range and a
+defined SMA50):
+
+```
+bars_used            int
+sma_20  sma_50
+rsi_14               Wilder
+atr_14               Wilder, price units
+atr_14_pct_of_spot
+realised_vol_20d     annualised vol fraction (0.24 == 24%)
+high_52w  low_52w
+pct_from_52w_high    <= 0
+pct_from_52w_low     >= 0
+```
+
+`options` — from `get_option_chain` filtered to the DTE window and a ±15% strike band,
+plus `get_option_contracts` joined by OCC symbol for open interest (the market-data chain
+carries none):
+
+```
+dte_window           [int, int]
+contracts_scanned    int
+expiries_scanned     list[str]  ISO dates
+near_expiry  near_dte
+far_expiry   far_dte
+iv_atm               mean of ATM call/put IV at the near expiry
+iv_atm_near  iv_atm_far
+iv_source            "chain" | "bsm_from_mid" | "NO_DATA_AVAILABLE"
+iv_rank              volatility.iv_rank over iv_history; "NO_DATA_AVAILABLE" until 2 readings
+iv_percentile        volatility.iv_percentile; same 2-reading guard
+put_call_skew        atm_put_iv - atm_call_iv
+term_structure       iv_atm_far - iv_atm_near
+median_spread_pct    across scanned contracts
+total_open_interest  int
+atm_call  atm_put    dict | "NO_DATA_AVAILABLE"
+```
+
+`atm_call` / `atm_put` (the contract nearest spot at the near expiry — a real OCC symbol
+taken from the chain, never constructed):
+
+```
+symbol  strike  expiry  dte
+bid  ask  mid  spread_pct
+iv
+delta  gamma  theta  vega
+open_interest
+```
+
+`position` — `get_all_positions` filtered to this underlying (equity by ticker, option legs
+by parsed OCC underlying):
+
+```
+option leg:  kind="option", symbol, option_type, strike, expiry,
+             side, qty, avg_entry_price, market_value, unrealized_pl, unrealized_plpc
+equity:      kind="equity", symbol, side, qty, avg_entry_price,
+             market_value, unrealized_pl, unrealized_plpc
+```
+
+`untrusted_news` — from `get_news`, headline + summary only:
+
+```
+headline      truncated ≤ 200 chars
+summary       truncated ≤ 320 chars
+source
+created_at
+```
+
+`collect()` only reads and returns — it does not persist. Writing the pack into
+`proposals.evidence` is done by whichever component owns the `proposals` row (the Phase 3
+strategist, or `ExecutionAgent`), so the `proposals` table and its `Store` methods land with
+that work, not here. The one write `collect()` does make is the IV-history row
+(`append_iv_snapshot`), once per pull, right before the rank is read.
 
 ### 3. `src/options_m/strategy_builder.py`
 
@@ -114,8 +232,8 @@ The core anti-hallucination component. Steps:
    inside `[dte_min, dte_max]`. Prefer standard monthly expiries when several qualify.
 2. **Select the long leg** as the contract whose absolute delta is closest to
    `intent.target_delta`. If the chain snapshot carries no greeks, compute delta with
-   Black-Scholes from mid price, spot, strike, DTE and implied vol — port
-   `VibeHedge/src/options/options_lab.py:91-158`, which is clean and Alpaca-decoupled.
+   Black-Scholes from mid price, spot, strike, DTE and implied vol — use
+   `options_m.volatility.bsm_greeks` (and `implied_vol` to recover sigma from the mid).
    Use the chain's greeks when present; BS is the fallback, and the plan records which was used.
 3. **Verticals:** pick the short leg at `long_strike ± spread_width`, same expiry, snapping
    to the nearest listed strike. Reject if no listed strike is within one strike increment.

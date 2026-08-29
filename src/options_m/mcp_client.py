@@ -548,6 +548,137 @@ class AlpacaMcp:
     async def get_news(self, symbols: tuple[str, ...] | list[str], limit: int = 20) -> Any:
         return await self.call("get_news", {"symbols": ",".join(symbols), "limit": limit})
 
+    # ---- Read tools for the evidence pack (phase 2) ------------------
+
+    async def get_stock_snapshot(self, symbol: str) -> dict[str, Any]:
+        """Latest trade, quote, minute bar, daily bar and previous daily bar.
+
+        The tool keys its response by symbol (and, against some server builds,
+        nests it under ``snapshots``); this unwraps both shapes so callers get
+        the one symbol's snapshot object directly.
+        """
+        payload = self._expect_mapping(
+            "get_stock_snapshot", await self.call("get_stock_snapshot", {"symbols": symbol})
+        )
+        inner = payload.get("snapshots")
+        if isinstance(inner, dict):
+            payload = inner
+        snapshot = payload.get(symbol) or payload.get(symbol.upper())
+        if isinstance(snapshot, dict):
+            return snapshot
+        # A single-symbol call may already be the snapshot itself.
+        if {"latestQuote", "latestTrade", "dailyBar"} & set(payload):
+            return payload
+        msg = f"get_stock_snapshot returned no snapshot for {symbol!r}"
+        raise McpProtocolError(msg)
+
+    async def get_stock_bars(
+        self, symbol: str, *, timeframe: str = "1Day", limit: int = 252
+    ) -> list[dict[str, Any]]:
+        """Historical OHLCV bars for one symbol, oldest first.
+
+        ``days`` is sized generously from ``limit`` so weekends and holidays do
+        not starve a daily-bar request; the API still caps the result at
+        ``limit``.
+        """
+        payload = self._expect_mapping(
+            "get_stock_bars",
+            await self.call(
+                "get_stock_bars",
+                {
+                    "symbols": symbol,
+                    "timeframe": timeframe,
+                    "limit": limit,
+                    "days": int(limit * 1.6) + 15,
+                    "sort": "asc",
+                },
+            ),
+        )
+        bars = payload.get("bars", payload)
+        if isinstance(bars, dict):
+            bars = bars.get(symbol) or bars.get(symbol.upper()) or []
+        if not isinstance(bars, list):
+            msg = "get_stock_bars returned no bar list"
+            raise McpProtocolError(msg)
+        return [bar for bar in bars if isinstance(bar, dict)]
+
+    async def get_option_chain(
+        self,
+        underlying: str,
+        *,
+        option_type: str | None = None,
+        expiration_gte: str | None = None,
+        expiration_lte: str | None = None,
+        strike_gte: float | None = None,
+        strike_lte: float | None = None,
+        limit: int = 250,
+        feed: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Per-contract snapshots (quote, trade, IV, greeks) for an underlying.
+
+        Returns the ``{occ_symbol: snapshot}`` mapping. The chain is large; the
+        caller is expected to pass a DTE window and a strike band.
+        """
+        args: dict[str, Any] = {"underlying_symbol": underlying, "limit": limit}
+        if option_type is not None:
+            args["type"] = option_type
+        if expiration_gte is not None:
+            args["expiration_date_gte"] = expiration_gte
+        if expiration_lte is not None:
+            args["expiration_date_lte"] = expiration_lte
+        if strike_gte is not None:
+            args["strike_price_gte"] = strike_gte
+        if strike_lte is not None:
+            args["strike_price_lte"] = strike_lte
+        if feed is not None:
+            args["feed"] = feed
+        payload = self._expect_mapping(
+            "get_option_chain", await self.call("get_option_chain", args)
+        )
+        snapshots = payload.get("snapshots", payload)
+        if not isinstance(snapshots, dict):
+            msg = "get_option_chain returned no snapshots object"
+            raise McpProtocolError(msg)
+        return {key: value for key, value in snapshots.items() if isinstance(value, dict)}
+
+    async def get_option_contracts(
+        self,
+        underlying: str,
+        *,
+        option_type: str | None = None,
+        expiration_gte: str | None = None,
+        expiration_lte: str | None = None,
+        strike_gte: float | None = None,
+        strike_lte: float | None = None,
+        limit: int = 250,
+    ) -> list[dict[str, Any]]:
+        """Reference data for an underlying's contracts — carries open interest,
+        which the market-data chain does not."""
+        args: dict[str, Any] = {
+            "underlying_symbols": underlying,
+            "limit": limit,
+            "status": "active",
+        }
+        if option_type is not None:
+            args["type"] = option_type
+        if expiration_gte is not None:
+            args["expiration_date_gte"] = expiration_gte
+        if expiration_lte is not None:
+            args["expiration_date_lte"] = expiration_lte
+        if strike_gte is not None:
+            args["strike_price_gte"] = strike_gte
+        if strike_lte is not None:
+            args["strike_price_lte"] = strike_lte
+        payload = await self.call("get_option_contracts", args)
+        if isinstance(payload, dict):
+            contracts = payload.get("option_contracts", payload.get("data"))
+        else:
+            contracts = payload
+        if not isinstance(contracts, list):
+            msg = "get_option_contracts returned no contract list"
+            raise McpProtocolError(msg)
+        return [item for item in contracts if isinstance(item, dict)]
+
     @staticmethod
     def _expect_mapping(tool: str, payload: Any) -> dict[str, Any]:
         if not isinstance(payload, dict):

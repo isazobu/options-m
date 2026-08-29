@@ -23,7 +23,8 @@ options-m/
 │   ├── healthcheck.py       # container probe (no dependencies)
 │   ├── lifecycle.py         # signal handling, interruptible sleep
 │   ├── logging_config.py    # logging setup (JSON / text)
-│   └── server.py            # uvicorn wired to the shutdown signal
+│   ├── server.py            # uvicorn wired to the shutdown signal
+│   └── volatility.py        # Black-Scholes greeks + IV Rank (pure stdlib)
 ├── tests/
 ├── pyproject.toml           # deps, build, ruff, mypy, pytest config
 ├── Dockerfile

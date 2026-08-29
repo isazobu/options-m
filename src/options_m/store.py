@@ -20,6 +20,7 @@ from decimal import Decimal
 from typing import Any, cast
 
 from options_m.db import Database
+from options_m.volatility import iv_rank
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,16 @@ def _as_decimal(value: float | None) -> Decimal | None:
     return Decimal(str(value))
 
 
+def _maybe_float(value: object) -> float | None:
+    """Coerce a stored numeric back to float. ``numeric`` columns read as Decimal."""
+    if value is None:
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
 class Store:
     """Repository over :class:`~options_m.db.Database`."""
 
@@ -47,6 +58,7 @@ class Store:
         self._memory_equity: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
         self._memory_snapshots: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
         self._memory_candidates: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
+        self._memory_iv_history: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
         self._memory_kill_switch: tuple[bool, str | None] = (False, None)
         if not db.is_enabled:
             logger.warning(
@@ -163,6 +175,48 @@ class Store:
             )
             await conn.commit()
 
+    async def append_iv_snapshot(
+        self,
+        symbol: str,
+        *,
+        iv_atm: float,
+        dte: int | None = None,
+        spot: float | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """One near-the-money implied-vol reading for ``symbol``.
+
+        The evidence pack's IV Rank is this symbol's latest reading against its
+        own recent history, so this needs to be written on a regular cadence
+        (once per pull) for the rank to mean anything.
+        """
+        symbol = symbol.upper()
+        if not self._db.is_enabled:
+            self._memory_iv_history.appendleft(
+                {
+                    "ts": _now(),
+                    "symbol": symbol,
+                    "iv_atm": iv_atm,
+                    "dte": dte,
+                    "spot": spot,
+                    "payload": payload,
+                }
+            )
+            return
+        async with self._db.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO iv_history (symbol, iv_atm, dte, spot, payload) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (
+                    symbol,
+                    _as_decimal(iv_atm),
+                    dte,
+                    _as_decimal(spot),
+                    json.dumps(payload) if payload else None,
+                ),
+            )
+            await conn.commit()
+
     async def recent_agent_runs(self, limit: int = 50) -> list[dict[str, Any]]:
         if not self._db.is_enabled:
             return list(self._memory_agent_runs)[:limit]
@@ -189,6 +243,36 @@ class Store:
             "FROM candidates ORDER BY ts DESC LIMIT %s",
             (limit,),
         )
+
+    async def recent_iv(self, symbol: str, limit: int = 252) -> list[dict[str, Any]]:
+        """This symbol's implied-vol readings, newest first."""
+        symbol = symbol.upper()
+        if not self._db.is_enabled:
+            rows = [r for r in self._memory_iv_history if r["symbol"] == symbol]
+            return rows[:limit]
+        return await self._fetch(
+            "SELECT ts, symbol, iv_atm, dte, spot "
+            "FROM iv_history WHERE symbol = %s ORDER BY ts DESC LIMIT %s",
+            (symbol, limit),
+        )
+
+    async def iv_rank_for(self, symbol: str, *, window: int = 252) -> float | None:
+        """IV Rank of ``symbol``'s latest reading over its last ``window`` readings.
+
+        ``None`` until at least two readings exist. This is the number the
+        volatility analyst reasons about.
+        """
+        rows = await self.recent_iv(symbol, window)
+        # recent_iv is newest-first; iv_rank wants chronological order.
+        values = [_maybe_float(row.get("iv_atm")) for row in reversed(rows)]
+        return iv_rank(values)
+
+    async def recent_lessons(self, symbol: str | None = None, n: int = 3) -> list[str]:
+        """Post-trade lessons for a symbol (or portfolio-wide when ``symbol`` is
+        ``None``). Phase 4's reflection agent fills this; until then it is
+        deliberately empty rather than absent, so callers can wire it now."""
+        del symbol, n
+        return []
 
     async def is_kill_switch_engaged(self) -> bool:
         if not self._db.is_enabled:
