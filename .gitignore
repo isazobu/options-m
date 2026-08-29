@@ -28,3 +28,6 @@ htmlcov/
 # Local tooling state
 .observer.lock
 observer.log
+
+# Stray artifact, not produced by this project's build
+tests.zip

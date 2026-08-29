@@ -48,6 +48,12 @@ class Store:
         self._memory_snapshots: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
         self._memory_candidates: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
         self._memory_kill_switch: tuple[bool, str | None] = (False, None)
+        self._memory_proposals: dict[int, dict[str, Any]] = {}
+        self._memory_proposal_seq = 0
+        self._memory_orders: dict[str, dict[str, Any]] = {}
+        self._memory_order_seq = 0
+        self._memory_risk_events: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
+        self._memory_iv_history: dict[str, deque[dict[str, Any]]] = {}
         if not db.is_enabled:
             logger.warning(
                 "no database configured; the store is keeping the last %d rows per table "
@@ -211,6 +217,367 @@ class Store:
                 (engaged, reason),
             )
             await conn.commit()
+
+    # ---- Proposals -----------------------------------------------------
+
+    async def save_proposal(
+        self, *, underlying: str, intent: dict[str, Any], evidence: dict[str, Any]
+    ) -> int:
+        """Insert a new pending proposal. Returns its id."""
+        if not self._db.is_enabled:
+            self._memory_proposal_seq += 1
+            proposal_id = self._memory_proposal_seq
+            self._memory_proposals[proposal_id] = {
+                "id": proposal_id,
+                "ts": _now(),
+                "underlying": underlying,
+                "status": "pending",
+                "intent": intent,
+                "evidence": evidence,
+                "arguments": None,
+                "verdict": None,
+                "plan": None,
+                "error": None,
+            }
+            return proposal_id
+        async with self._db.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO proposals (underlying, intent, evidence) "
+                "VALUES (%s, %s, %s) RETURNING id",
+                (underlying, json.dumps(intent), json.dumps(evidence)),
+            )
+            row = cast("tuple[Any, ...] | None", await cur.fetchone())
+            await conn.commit()
+            assert row is not None  # noqa: S101 - RETURNING always yields a row on success
+            return int(row[0])
+
+    async def pending_proposals(self, limit: int = 5) -> list[dict[str, Any]]:
+        """Proposals awaiting execution, oldest first — a fair queue."""
+        if not self._db.is_enabled:
+            rows = [row for row in self._memory_proposals.values() if row["status"] == "pending"]
+            rows.sort(key=lambda row: row["id"])
+            return rows[:limit]
+        return await self._fetch(
+            "SELECT id, ts, underlying, status, intent, evidence, arguments, verdict, plan, error "
+            "FROM proposals WHERE status = 'pending' ORDER BY ts ASC LIMIT %s",
+            (limit,),
+        )
+
+    async def recent_proposals(
+        self, limit: int = 50, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Most recent proposals, newest first — the decision-timeline feed.
+
+        List-shaped on purpose: no ``evidence``/``intent`` blobs, so the
+        payload stays small when listing many rows. Use :meth:`get_proposal`
+        for the full detail of one.
+        """
+        if not self._db.is_enabled:
+            rows = list(self._memory_proposals.values())
+            if status is not None:
+                rows = [row for row in rows if row["status"] == status]
+            rows.sort(key=lambda row: row["ts"], reverse=True)
+            return [
+                {
+                    "id": row["id"],
+                    "ts": row["ts"],
+                    "underlying": row["underlying"],
+                    "status": row["status"],
+                    "has_arguments": row["arguments"] is not None,
+                    "has_verdict": row["verdict"] is not None,
+                }
+                for row in rows[:limit]
+            ]
+        if status is not None:
+            return await self._fetch(
+                "SELECT id, ts, underlying, status, "
+                "(arguments IS NOT NULL) AS has_arguments, "
+                "(verdict IS NOT NULL) AS has_verdict "
+                "FROM proposals WHERE status = %s ORDER BY ts DESC LIMIT %s",
+                (status, limit),
+            )
+        return await self._fetch(
+            "SELECT id, ts, underlying, status, "
+            "(arguments IS NOT NULL) AS has_arguments, "
+            "(verdict IS NOT NULL) AS has_verdict "
+            "FROM proposals ORDER BY ts DESC LIMIT %s",
+            (limit,),
+        )
+
+    async def get_proposal(self, proposal_id: int) -> dict[str, Any] | None:
+        if not self._db.is_enabled:
+            return self._memory_proposals.get(proposal_id)
+        rows = await self._fetch(
+            "SELECT id, ts, underlying, status, intent, evidence, arguments, verdict, plan, error "
+            "FROM proposals WHERE id = %s",
+            (proposal_id,),
+        )
+        return rows[0] if rows else None
+
+    async def update_proposal_status(
+        self,
+        proposal_id: int,
+        status: str,
+        *,
+        plan: dict[str, Any] | None = None,
+        verdict: dict[str, Any] | None = None,
+        arguments: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Partial update: only the fields passed are overwritten."""
+        if not self._db.is_enabled:
+            row = self._memory_proposals.get(proposal_id)
+            if row is None:
+                return
+            row["status"] = status
+            if plan is not None:
+                row["plan"] = plan
+            if verdict is not None:
+                row["verdict"] = verdict
+            if arguments is not None:
+                row["arguments"] = arguments
+            if error is not None:
+                row["error"] = error
+            return
+        async with self._db.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE proposals SET status = %s, "
+                "plan = COALESCE(%s, plan), verdict = COALESCE(%s, verdict), "
+                "arguments = COALESCE(%s, arguments), error = COALESCE(%s, error) "
+                "WHERE id = %s",
+                (
+                    status,
+                    json.dumps(plan) if plan is not None else None,
+                    json.dumps(verdict) if verdict is not None else None,
+                    json.dumps(arguments) if arguments is not None else None,
+                    error,
+                    proposal_id,
+                ),
+            )
+            await conn.commit()
+
+    # ---- Orders ----------------------------------------------------------
+
+    async def order_by_client_id(self, client_order_id: str) -> dict[str, Any] | None:
+        if not self._db.is_enabled:
+            return self._memory_orders.get(client_order_id)
+        rows = await self._fetch(
+            "SELECT id, proposal_id, client_order_id, submitted_at, status, request, "
+            "response, filled_qty, filled_avg_price, error FROM orders WHERE client_order_id = %s",
+            (client_order_id,),
+        )
+        return rows[0] if rows else None
+
+    async def record_order(
+        self,
+        *,
+        proposal_id: int,
+        client_order_id: str,
+        status: str,
+        request: dict[str, Any],
+        response: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> None:
+        """First write for one order attempt.
+
+        A duplicate ``client_order_id`` here means the caller is retrying an
+        already-recorded attempt, so it is a no-op rather than an overwrite —
+        status transitions go through :meth:`update_order_status` instead.
+        """
+        if not self._db.is_enabled:
+            if client_order_id in self._memory_orders:
+                return
+            self._memory_order_seq += 1
+            self._memory_orders[client_order_id] = {
+                "id": self._memory_order_seq,
+                "proposal_id": proposal_id,
+                "client_order_id": client_order_id,
+                "submitted_at": _now(),
+                "status": status,
+                "request": request,
+                "response": response,
+                "filled_qty": None,
+                "filled_avg_price": None,
+                "error": error,
+            }
+            return
+        async with self._db.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO orders "
+                "(proposal_id, client_order_id, status, request, response, error) "
+                "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (client_order_id) DO NOTHING",
+                (
+                    proposal_id,
+                    client_order_id,
+                    status,
+                    json.dumps(request),
+                    json.dumps(response) if response is not None else None,
+                    error,
+                ),
+            )
+            await conn.commit()
+
+    async def update_order_status(
+        self,
+        client_order_id: str,
+        *,
+        status: str,
+        response: dict[str, Any] | None = None,
+        filled_qty: float | None = None,
+        filled_avg_price: float | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Used by reconciliation and by the duplicate-as-success path."""
+        if not self._db.is_enabled:
+            row = self._memory_orders.get(client_order_id)
+            if row is None:
+                return
+            row["status"] = status
+            if response is not None:
+                row["response"] = response
+            if filled_qty is not None:
+                row["filled_qty"] = filled_qty
+            if filled_avg_price is not None:
+                row["filled_avg_price"] = filled_avg_price
+            if error is not None:
+                row["error"] = error
+            return
+        async with self._db.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE orders SET status = %s, response = COALESCE(%s, response), "
+                "filled_qty = COALESCE(%s, filled_qty), "
+                "filled_avg_price = COALESCE(%s, filled_avg_price), "
+                "error = COALESCE(%s, error) WHERE client_order_id = %s",
+                (
+                    status,
+                    json.dumps(response) if response is not None else None,
+                    _as_decimal(filled_qty),
+                    _as_decimal(filled_avg_price),
+                    error,
+                    client_order_id,
+                ),
+            )
+            await conn.commit()
+
+    async def orders_for_proposal(self, proposal_id: int) -> list[dict[str, Any]]:
+        """Every order attempt tied to one proposal, oldest first."""
+        if not self._db.is_enabled:
+            rows = [
+                row for row in self._memory_orders.values() if row["proposal_id"] == proposal_id
+            ]
+            rows.sort(key=lambda row: row["submitted_at"])
+            return rows
+        return await self._fetch(
+            "SELECT id, proposal_id, client_order_id, submitted_at, status, request, "
+            "response, filled_qty, filled_avg_price, error FROM orders "
+            "WHERE proposal_id = %s ORDER BY submitted_at ASC",
+            (proposal_id,),
+        )
+
+    async def recent_orders(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Most recent order attempts across every proposal, newest first."""
+        if not self._db.is_enabled:
+            rows = sorted(
+                self._memory_orders.values(), key=lambda row: row["submitted_at"], reverse=True
+            )
+            return rows[:limit]
+        return await self._fetch(
+            "SELECT id, proposal_id, client_order_id, submitted_at, status, request, "
+            "response, filled_qty, filled_avg_price, error FROM orders "
+            "ORDER BY submitted_at DESC LIMIT %s",
+            (limit,),
+        )
+
+    async def orders_in_flight(self, limit: int = 50) -> list[dict[str, Any]]:
+        if not self._db.is_enabled:
+            rows = [row for row in self._memory_orders.values() if row["status"] == "submitted"]
+            return rows[:limit]
+        return await self._fetch(
+            "SELECT id, proposal_id, client_order_id, submitted_at, status, request, "
+            "response, filled_qty, filled_avg_price, error FROM orders "
+            "WHERE status = 'submitted' ORDER BY submitted_at ASC LIMIT %s",
+            (limit,),
+        )
+
+    # ---- Risk events -------------------------------------------------------
+
+    async def record_risk_event(
+        self, *, proposal_id: int | None, rule: str, detail: dict[str, Any]
+    ) -> None:
+        row = {"ts": _now(), "proposal_id": proposal_id, "rule": rule, "detail": detail}
+        if not self._db.is_enabled:
+            self._memory_risk_events.appendleft(row)
+            return
+        async with self._db.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO risk_events (proposal_id, rule, detail) VALUES (%s, %s, %s)",
+                (proposal_id, rule, json.dumps(detail)),
+            )
+            await conn.commit()
+
+    async def recent_risk_events(self, limit: int = 50) -> list[dict[str, Any]]:
+        if not self._db.is_enabled:
+            return list(self._memory_risk_events)[:limit]
+        return await self._fetch(
+            "SELECT ts, proposal_id, rule, detail FROM risk_events ORDER BY ts DESC LIMIT %s",
+            (limit,),
+        )
+
+    # ---- IV history ----------------------------------------------------
+
+    async def save_iv_history(
+        self,
+        *,
+        symbol: str,
+        iv_atm: float | None,
+        put_call_skew: float | None,
+        term_structure: float | None,
+        median_spread_pct: float | None,
+        total_open_interest: int | None,
+    ) -> None:
+        row = {
+            "ts": _now(),
+            "symbol": symbol,
+            "iv_atm": iv_atm,
+            "put_call_skew": put_call_skew,
+            "term_structure": term_structure,
+            "median_spread_pct": median_spread_pct,
+            "total_open_interest": total_open_interest,
+        }
+        if not self._db.is_enabled:
+            self._memory_iv_history.setdefault(symbol, deque(maxlen=_MEMORY_LIMIT)).appendleft(row)
+            return
+        async with self._db.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO iv_history (symbol, iv_atm, put_call_skew, term_structure, "
+                "median_spread_pct, total_open_interest) VALUES (%s, %s, %s, %s, %s, %s)",
+                (
+                    symbol,
+                    _as_decimal(iv_atm),
+                    _as_decimal(put_call_skew),
+                    _as_decimal(term_structure),
+                    _as_decimal(median_spread_pct),
+                    total_open_interest,
+                ),
+            )
+            await conn.commit()
+
+    async def recent_iv(self, symbol: str, n: int = 20) -> list[dict[str, Any]]:
+        if not self._db.is_enabled:
+            return list(self._memory_iv_history.get(symbol, ()))[:n]
+        return await self._fetch(
+            "SELECT ts, iv_atm, put_call_skew, term_structure, median_spread_pct, "
+            "total_open_interest FROM iv_history WHERE symbol = %s ORDER BY ts DESC LIMIT %s",
+            (symbol, n),
+        )
+
+    async def recent_lessons(self, symbol: str, n: int = 5) -> list[dict[str, Any]]:
+        """Phase 4 fills this in with a real ``lessons`` table.
+
+        Returns an empty list unconditionally so evidence.py's shape is stable
+        now and does not need to change again when Phase 4 lands.
+        """
+        return []
 
     async def _fetch(self, sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
         async with self._db.connection() as conn, conn.cursor() as cur:

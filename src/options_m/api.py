@@ -13,21 +13,56 @@ this phase; the kill-switch control arrives with the dashboard proper.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, Request, Response, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
 
-from options_m import __version__
+from options_m import __version__, chat
 from options_m.agents import Agent
+from options_m.config import Settings
 from options_m.db import Database
+from options_m.llm import FeatherlessLlm
 from options_m.mcp_client import AlpacaMcp
 from options_m.store import Store
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _settings(request: Request) -> Settings:
+    settings: Settings = request.app.state.settings
+    return settings
+
+
+def require_admin_token(
+    request: Request, authorization: str | None = Header(default=None)
+) -> None:
+    """Guard for the dashboard-facing routes below.
+
+    A single shared bearer token, deliberately simpler than a real user-auth
+    system: this protects a judge-facing demo, not a multi-tenant product. If
+    no token is configured the routes stay open — that only matters for
+    local/dev use, since ``ADMIN_TOKEN`` must be set wherever this is
+    reachable from the public internet.
+    """
+    settings = _settings(request)
+    if not settings.admin_token:
+        logger.warning("ADMIN_TOKEN is not set; the dashboard API routes are unauthenticated")
+        return
+    if authorization != f"Bearer {settings.admin_token}":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid token")
+
+
+# Dashboard-facing routes, added alongside the pre-existing unauthenticated
+# router below. Kept separate so the original /api/status, /api/agent-runs,
+# /api/candidates contract is untouched.
+admin_router = APIRouter(prefix="/api", dependencies=[Depends(require_admin_token)])
 
 
 def _state(request: Request) -> tuple[Database, list[Agent]]:
@@ -131,6 +166,161 @@ async def api_candidates(request: Request, limit: int = 20) -> Response:
     return JSONResponse(jsonable({"candidates": rows}))
 
 
+@admin_router.get("/positions", include_in_schema=False)
+async def api_positions(request: Request) -> Response:
+    """Live open positions, enriched with greeks/IV for option legs.
+
+    No Postgres table backs this yet (positions_history is a later phase), so
+    it is entirely a live read through MCP, refreshed on every poll.
+    """
+    mcp = _mcp(request)
+    positions: list[dict[str, Any]] = []
+    broker_error: str | None = None
+
+    if mcp is not None and mcp.is_enabled:
+        try:
+            raw_positions = await mcp.get_all_positions()
+        except Exception as exc:
+            broker_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("positions broker read failed", exc_info=True)
+            raw_positions = []
+
+        option_symbols = [
+            str(row["symbol"])
+            for row in raw_positions
+            if row.get("asset_class") == "us_option" and row.get("symbol")
+        ]
+        snapshots: dict[str, dict[str, Any]] = {}
+        snapshot_error: str | None = None
+        if option_symbols:
+            try:
+                snapshots = await mcp.get_option_snapshot(option_symbols)
+            except Exception as exc:
+                snapshot_error = f"{type(exc).__name__}: {exc}"
+                logger.warning("option snapshot read failed", exc_info=True)
+
+        for row in raw_positions:
+            symbol = row.get("symbol")
+            is_option = row.get("asset_class") == "us_option"
+            snapshot = snapshots.get(symbol) if is_option and isinstance(symbol, str) else None
+            row_error: str | None = None
+            if is_option:
+                row_error = snapshot_error
+                if row_error is None and snapshot is None:
+                    row_error = "snapshot unavailable"
+            positions.append({**row, "snapshot": snapshot, "snapshot_error": row_error})
+
+    return JSONResponse(
+        jsonable(
+            {
+                "positions": positions,
+                "broker": {
+                    "enabled": mcp.is_enabled if mcp else False,
+                    "connected": mcp.is_connected if mcp else False,
+                    "error": broker_error,
+                },
+            }
+        )
+    )
+
+
+@admin_router.get("/portfolio", include_in_schema=False)
+async def api_portfolio(request: Request, period: str = "1M", timeframe: str = "1D") -> Response:
+    """Account snapshot, Alpaca's own portfolio-history series, and our own
+    polled equity-curve tail, side by side.
+    """
+    mcp = _mcp(request)
+    store = _store(request)
+
+    account: dict[str, Any] | None = None
+    portfolio_history: dict[str, Any] | None = None
+    broker_error: str | None = None
+    if mcp is not None and mcp.is_enabled:
+        try:
+            account = await mcp.get_account_info()
+            portfolio_history = await mcp.get_portfolio_history(period=period, timeframe=timeframe)
+        except Exception as exc:
+            broker_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("portfolio broker read failed", exc_info=True)
+
+    equity_tail = await store.recent_equity(limit=200) if store else []
+
+    return JSONResponse(
+        jsonable(
+            {
+                "account": account,
+                "portfolio_history": portfolio_history,
+                "equity_curve_tail": list(reversed(equity_tail)),
+                "broker_error": broker_error,
+            }
+        )
+    )
+
+
+@admin_router.get("/proposals", include_in_schema=False)
+async def api_proposals(
+    request: Request, limit: int = 50, status_filter: str | None = None
+) -> Response:
+    store = _store(request)
+    rows = (
+        await store.recent_proposals(limit=min(limit, 500), status=status_filter)
+        if store
+        else []
+    )
+    return JSONResponse(jsonable({"proposals": rows}))
+
+
+@admin_router.get("/proposals/{proposal_id}", include_in_schema=False)
+async def api_proposal_detail(request: Request, proposal_id: int) -> Response:
+    store = _store(request)
+    if store is None:
+        return JSONResponse(
+            {"detail": "store not configured"}, status_code=status.HTTP_404_NOT_FOUND
+        )
+    proposal = await store.get_proposal(proposal_id)
+    if proposal is None:
+        return JSONResponse({"detail": "not found"}, status_code=status.HTTP_404_NOT_FOUND)
+    orders = await store.orders_for_proposal(proposal_id)
+    return JSONResponse(jsonable({"proposal": proposal, "orders": orders}))
+
+
+@admin_router.get("/risk-events", include_in_schema=False)
+async def api_risk_events(request: Request, limit: int = 50) -> Response:
+    store = _store(request)
+    rows = await store.recent_risk_events(limit=min(limit, 500)) if store else []
+    return JSONResponse(jsonable({"risk_events": rows}))
+
+
+class ChatRequest(BaseModel):
+    question: str
+
+
+@admin_router.post("/chat", include_in_schema=False)
+async def api_chat(request: Request, body: ChatRequest) -> Response:
+    """Read-only Q&A over the account and the agent's own decision history.
+
+    Always 200, even on failure: a chat panel that 500s mid-demo is worse
+    than one that plainly says it could not reach the broker or the model.
+    """
+    settings = _settings(request)
+    mcp = _mcp(request)
+    store = _store(request)
+    llm = FeatherlessLlm(
+        api_key=settings.featherless_api_key,
+        base_url=settings.featherless_base_url,
+        model=settings.featherless_chat_model,
+        timeout_seconds=settings.chat_timeout_seconds,
+    )
+    answer = await chat.answer_question(
+        body.question,
+        mcp=mcp,
+        store=store,
+        llm=llm,
+        max_tool_calls=settings.chat_max_tool_calls,
+    )
+    return JSONResponse(jsonable(dataclasses.asdict(answer)))
+
+
 def jsonable(value: Any) -> Any:
     """Make datetimes and Decimals safe for JSONResponse.
 
@@ -176,6 +366,7 @@ def create_app(
     *,
     mcp: AlpacaMcp | None = None,
     store: Store | None = None,
+    settings: Settings | None = None,
 ) -> FastAPI:
     """Build the ASGI application with its dependencies attached."""
     app = FastAPI(title="options-m admin", version=__version__, docs_url=None, redoc_url=None)
@@ -183,5 +374,18 @@ def create_app(
     app.state.agents = agents
     app.state.mcp = mcp
     app.state.store = store
+    app.state.settings = settings if settings is not None else Settings()
+
+    cors_origins = app.state.settings.cors_origins
+    if cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(cors_origins),
+            allow_methods=["GET", "POST"],
+            allow_headers=["Authorization", "Content-Type"],
+            allow_credentials=False,
+        )
+
     app.include_router(router)
+    app.include_router(admin_router)
     return app

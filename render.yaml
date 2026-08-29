@@ -68,10 +68,21 @@ services:
       - key: KILL_SWITCH
         value: "false"
 
+      # The dashboard (a separate Next.js app on Vercel) calls the guarded
+      # /api/* routes with this bearer token and from this origin.
+      - key: CORS_ALLOWED_ORIGINS
+        value: ""  # set to the deployed Vercel URL once known
+
       # Set in the Render dashboard — never committed.
       - key: DATABASE_URL
         sync: false
       - key: ALPACA_API_KEY
         sync: false
       - key: ALPACA_SECRET_KEY
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: FEATHERLESS_API_KEY
+        sync: false
+      - key: FEATHERLESS_CHAT_MODEL
         sync: false
