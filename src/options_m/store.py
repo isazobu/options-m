@@ -270,7 +270,10 @@ class Store:
 
         List-shaped on purpose: no ``evidence``/``intent`` blobs, so the
         payload stays small when listing many rows. Use :meth:`get_proposal`
-        for the full detail of one.
+        for the full detail of one. ``is_mock`` reads ``evidence->>'mock'``:
+        seed data (see scripts/seed_demo_data.py) sets it so the dashboard can
+        label synthetic rows honestly rather than let them read as real agent
+        output.
         """
         if not self._db.is_enabled:
             rows = list(self._memory_proposals.values())
@@ -285,6 +288,7 @@ class Store:
                     "status": row["status"],
                     "has_arguments": row["arguments"] is not None,
                     "has_verdict": row["verdict"] is not None,
+                    "is_mock": bool((row["evidence"] or {}).get("mock", False)),
                 }
                 for row in rows[:limit]
             ]
@@ -292,14 +296,16 @@ class Store:
             return await self._fetch(
                 "SELECT id, ts, underlying, status, "
                 "(arguments IS NOT NULL) AS has_arguments, "
-                "(verdict IS NOT NULL) AS has_verdict "
+                "(verdict IS NOT NULL) AS has_verdict, "
+                "COALESCE((evidence->>'mock')::boolean, false) AS is_mock "
                 "FROM proposals WHERE status = %s ORDER BY ts DESC LIMIT %s",
                 (status, limit),
             )
         return await self._fetch(
             "SELECT id, ts, underlying, status, "
             "(arguments IS NOT NULL) AS has_arguments, "
-            "(verdict IS NOT NULL) AS has_verdict "
+            "(verdict IS NOT NULL) AS has_verdict, "
+            "COALESCE((evidence->>'mock')::boolean, false) AS is_mock "
             "FROM proposals ORDER BY ts DESC LIMIT %s",
             (limit,),
         )

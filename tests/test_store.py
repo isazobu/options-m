@@ -116,7 +116,18 @@ async def test_recent_proposals_are_returned_newest_first_without_the_blobs() ->
     assert [row["underlying"] for row in rows] == ["AAPL", "QQQ", "SPY"]
     assert rows[0]["has_arguments"] is False
     assert rows[0]["has_verdict"] is False
+    assert rows[0]["is_mock"] is False
     assert "evidence" not in rows[0]
+
+
+async def test_recent_proposals_flags_seeded_mock_rows() -> None:
+    """The dashboard must never let seeded demo data read as a real decision."""
+    store = _store()
+    await store.save_proposal(underlying="SPY", intent={}, evidence={"mock": True})
+
+    row = (await store.recent_proposals())[0]
+
+    assert row["is_mock"] is True
 
 
 async def test_recent_proposals_filters_by_status() -> None:
