@@ -118,7 +118,15 @@ class EvidenceCollector:
         now = datetime.now(UTC)
 
         spot_block, spot_price = await self._spot(symbol)
-        options_block = await self._options(symbol, spot_price, dte_min, dte_max, now)
+        trend_block = await self._trend(symbol, spot_price)
+        realised_vol = (
+            trend_block.get("realised_vol_20d") if isinstance(trend_block, dict) else None
+        )
+        if not isinstance(realised_vol, float):
+            realised_vol = None
+        options_block = await self._options(
+            symbol, spot_price, dte_min, dte_max, now, realised_vol
+        )
 
         return {
             "symbol": symbol,
@@ -126,7 +134,7 @@ class EvidenceCollector:
             "note": NOTE,
             "dte_window": [dte_min, dte_max],
             "spot": spot_block,
-            "trend": await self._trend(symbol, spot_price),
+            "trend": trend_block,
             "options": options_block,
             "position": await self._position(symbol),
             "untrusted_news": await self._news(symbol),
@@ -229,9 +237,12 @@ class EvidenceCollector:
         dte_min: int,
         dte_max: int,
         now: datetime,
+        realised_vol: float | None = None,
     ) -> dict[str, Any] | str:
         """Chain summary: ATM IV, IV rank/percentile, skew, term structure,
-        median spread, total open interest, and the two ATM contracts."""
+        median spread, total open interest, the two ATM contracts, and — since
+        ``realised_vol`` (20-day, from the trend block) is passed in — the
+        IV-minus-RV vol risk premium a judge reads as "options rich vs cheap"."""
         today = now.date()
         exp_gte = (today + timedelta(days=dte_min)).isoformat()
         exp_lte = (today + timedelta(days=dte_max)).isoformat()
@@ -297,6 +308,12 @@ class EvidenceCollector:
             "iv_source": iv_source,
             "iv_rank": _or_missing(_round(iv_rank, 2)),
             "iv_percentile": _or_missing(_round(iv_pctile, 2)),
+            "realised_vol_20d": _or_missing(_round(realised_vol, 4)),
+            "iv_minus_rv": _or_missing(
+                _round(iv_atm - realised_vol, 4)
+                if iv_atm is not None and realised_vol is not None
+                else None
+            ),
             "put_call_skew": _or_missing(
                 _round(iv_put - iv_call, 4) if iv_put is not None and iv_call is not None else None
             ),

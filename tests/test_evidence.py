@@ -217,6 +217,26 @@ async def test_options_block_summarises_the_chain_with_real_symbols() -> None:
     assert options["total_open_interest"] == 500 * len(_chain())
 
 
+async def test_options_block_carries_realised_vol_and_the_iv_minus_rv_premium() -> None:
+    collector, _store = _collector(_FakeMcp())
+
+    pack = await collector.collect("SPY")
+    trend_rv = pack["trend"]["realised_vol_20d"]
+    options = pack["options"]
+
+    assert options["realised_vol_20d"] == trend_rv
+    assert options["iv_minus_rv"] == pytest.approx(options["iv_atm"] - trend_rv, abs=1e-9)
+
+
+async def test_iv_minus_rv_is_missing_when_the_bars_fail() -> None:
+    collector, _store = _collector(_FakeMcp(bars=True))
+
+    options = (await collector.collect("SPY"))["options"]
+
+    assert options["realised_vol_20d"] == MISSING
+    assert options["iv_minus_rv"] == MISSING
+
+
 async def test_open_interest_is_missing_when_the_contract_fetch_fails() -> None:
     collector, _store = _collector(_FakeMcp(contracts=True))
 

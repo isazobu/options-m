@@ -179,6 +179,8 @@ iv_atm_near  iv_atm_far
 iv_source            "chain" | "bsm_from_mid" | "NO_DATA_AVAILABLE"
 iv_rank              volatility.iv_rank over iv_history; "NO_DATA_AVAILABLE" until 2 readings
 iv_percentile        volatility.iv_percentile; same 2-reading guard
+realised_vol_20d     the trend block's RV, carried here for side-by-side comparison
+iv_minus_rv          iv_atm - realised_vol_20d — vol risk premium (>0 rich, <0 cheap)
 put_call_skew        atm_put_iv - atm_call_iv
 term_structure       iv_atm_far - iv_atm_near
 median_spread_pct    across scanned contracts
