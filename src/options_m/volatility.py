@@ -98,10 +98,7 @@ def bsm_greeks(
     if t <= 0.0 or sigma <= 0.0:
         # At/after expiry the option is its intrinsic value: delta is a step,
         # every other sensitivity is zero.
-        if kind == CALL:
-            delta = 1.0 if S > K else 0.0
-        else:
-            delta = -1.0 if S < K else 0.0
+        delta = (1.0 if S > K else 0.0) if kind == CALL else -1.0 if S < K else 0.0
         return Greeks(delta=delta, gamma=0.0, vega=0.0, theta=0.0, rho=0.0)
 
     d1, d2 = _d1_d2(S, K, t, r, q, sigma)

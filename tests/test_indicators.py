@@ -48,7 +48,7 @@ def test_atr_of_constant_range_bars_is_that_range() -> None:
 
 
 def test_atr_skips_bars_missing_a_leg() -> None:
-    bars = [{"h": 1.0, "l": 0.0}] + _RAMP_BARS  # first bar has no close
+    bars = [{"h": 1.0, "l": 0.0}, *_RAMP_BARS]  # first bar has no close
     assert atr(bars, 14) is not None
 
 
@@ -66,7 +66,8 @@ def test_distance_from_high_is_zero_at_a_new_high() -> None:
 
 
 def test_distance_from_low_is_positive_above_the_low() -> None:
-    assert distance_from_low_pct(_RAMP, current=59.0) > 0.0
+    value = distance_from_low_pct(_RAMP, current=59.0)
+    assert value is not None and value > 0.0
 
 
 def test_window_extremes_returns_min_and_max() -> None:

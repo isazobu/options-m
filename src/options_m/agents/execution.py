@@ -239,10 +239,10 @@ class ExecutionAgent:
         gte = today.isoformat()
         lte = (today + timedelta(days=intent.dte_max)).isoformat()
         contracts = await self._mcp.get_option_contracts(
-            intent.underlying, expiration_date_gte=gte, expiration_date_lte=lte
+            intent.underlying, expiration_gte=gte, expiration_lte=lte
         )
         snapshots = await self._mcp.get_option_chain(
-            intent.underlying, expiration_date_gte=gte, expiration_date_lte=lte
+            intent.underlying, expiration_gte=gte, expiration_lte=lte
         )
         existing_position = await self._mcp.get_open_position(intent.underlying)
 

@@ -164,7 +164,11 @@ def _fake_server() -> tuple[FastMCP, dict[str, int]]:
 
     @server.tool
     def get_stock_bars(
-        symbols: str, timeframe: str = "1Day", days: int = 5, limit: int = 1000
+        symbols: str,
+        timeframe: str = "1Day",
+        days: int = 5,
+        limit: int = 1000,
+        sort: str = "asc",
     ) -> dict[str, Any]:
         bars = [
             {
@@ -778,7 +782,7 @@ async def test_get_option_contracts_returns_the_contracts_list() -> None:
     mcp = await _connected(_settings(), server)
     try:
         contracts = await mcp.get_option_contracts(
-            "SPY", expiration_date_gte="2026-09-01", expiration_date_lte="2026-10-01"
+            "SPY", expiration_gte="2026-09-01", expiration_lte="2026-10-01"
         )
     finally:
         await mcp.close()

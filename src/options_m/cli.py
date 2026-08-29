@@ -18,6 +18,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from options_m import strategy_builder
+from options_m.agents.execution import ExecutionAgent, build_portfolio_snapshot
 from options_m.api import jsonable
 from options_m.config import Settings
 from options_m.db import Database
@@ -26,7 +27,6 @@ from options_m.migrate import apply as apply_migrations
 from options_m.models import Rejection, StrategyIntent
 from options_m.risk import RiskEngine, RiskLimits
 from options_m.store import Store
-from options_m.agents.execution import ExecutionAgent, build_portfolio_snapshot
 
 _STRATEGIES = (
     "long_call",
@@ -93,10 +93,10 @@ async def _run_plan(
     today = date.today()
     gte, lte = today.isoformat(), (today + timedelta(days=intent.dte_max)).isoformat()
     contracts = await mcp.get_option_contracts(
-        intent.underlying, expiration_date_gte=gte, expiration_date_lte=lte
+        intent.underlying, expiration_gte=gte, expiration_lte=lte
     )
     snapshots = await mcp.get_option_chain(
-        intent.underlying, expiration_date_gte=gte, expiration_date_lte=lte
+        intent.underlying, expiration_gte=gte, expiration_lte=lte
     )
     existing_position = await mcp.get_open_position(intent.underlying)
 
