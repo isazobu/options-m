@@ -33,6 +33,10 @@ from options_m.store import Store
 logger = logging.getLogger(__name__)
 
 _PENDING_BATCH_SIZE = 5
+# Strike band around spot for the contract/chain pulls, as a fraction of spot.
+# Wider than evidence.py's 0.15 because the builder has to reach a target
+# delta and may need strikes further out than an ATM IV read ever does.
+_STRIKE_BAND = 0.25
 
 
 def _looks_like_duplicate(message: str) -> bool:
@@ -101,6 +105,43 @@ def _minutes_until(timestamp: Any) -> float | None:
     except ValueError:
         return None
     return (when - datetime.now(UTC)).total_seconds() / 60
+
+
+async def fetch_chain_window(
+    mcp: AlpacaMcp, intent: StrategyIntent, *, spot: float
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Pull the contracts and snapshots for exactly the window ``intent`` wants.
+
+    Both calls are capped (250 rows) and Alpaca returns nearest expiry first,
+    so asking "from today" spends the entire budget on 2-6 DTE contracts and
+    never reaches a 21-38 DTE target — every proposal then died in the builder
+    as ``no_contracts_in_window``. Starting the window at ``dte_min`` is the
+    fix; the strike band keeps the same cap from truncating *inside* the
+    window on a wide chain.
+
+    Shared with ``cli.py``'s ``plan`` so the manual diagnostic path and the
+    running agent cannot drift into fetching different data.
+    """
+    today = date.today()
+    gte = (today + timedelta(days=intent.dte_min)).isoformat()
+    lte = (today + timedelta(days=intent.dte_max)).isoformat()
+    strike_gte = spot * (1 - _STRIKE_BAND)
+    strike_lte = spot * (1 + _STRIKE_BAND)
+    contracts = await mcp.get_option_contracts(
+        intent.underlying,
+        expiration_gte=gte,
+        expiration_lte=lte,
+        strike_gte=strike_gte,
+        strike_lte=strike_lte,
+    )
+    snapshots = await mcp.get_option_chain(
+        intent.underlying,
+        expiration_gte=gte,
+        expiration_lte=lte,
+        strike_gte=strike_gte,
+        strike_lte=strike_lte,
+    )
+    return contracts, snapshots
 
 
 async def build_portfolio_snapshot(
@@ -235,15 +276,7 @@ class ExecutionAgent:
             detail["rejected"] += 1
             return
 
-        today = date.today()
-        gte = today.isoformat()
-        lte = (today + timedelta(days=intent.dte_max)).isoformat()
-        contracts = await self._mcp.get_option_contracts(
-            intent.underlying, expiration_gte=gte, expiration_lte=lte
-        )
-        snapshots = await self._mcp.get_option_chain(
-            intent.underlying, expiration_gte=gte, expiration_lte=lte
-        )
+        contracts, snapshots = await fetch_chain_window(self._mcp, intent, spot=spot)
         existing_position = await self._mcp.get_open_position(intent.underlying)
 
         result = await strategy_builder.build(

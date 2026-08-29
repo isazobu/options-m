@@ -14,11 +14,14 @@ import asyncio
 import json
 import pprint
 import sys
-from datetime import date, timedelta
 from typing import Any
 
 from options_m import strategy_builder
-from options_m.agents.execution import ExecutionAgent, build_portfolio_snapshot
+from options_m.agents.execution import (
+    ExecutionAgent,
+    build_portfolio_snapshot,
+    fetch_chain_window,
+)
 from options_m.api import jsonable
 from options_m.config import Settings
 from options_m.db import Database
@@ -35,6 +38,7 @@ _STRATEGIES = (
     "debit_put_spread",
     "covered_call",
     "cash_secured_put",
+    "long_strangle",
 )
 
 
@@ -90,14 +94,7 @@ async def _run_plan(
     if spot is None:
         return {"rejection": {"reason": "no_spot_price"}}
 
-    today = date.today()
-    gte, lte = today.isoformat(), (today + timedelta(days=intent.dte_max)).isoformat()
-    contracts = await mcp.get_option_contracts(
-        intent.underlying, expiration_gte=gte, expiration_lte=lte
-    )
-    snapshots = await mcp.get_option_chain(
-        intent.underlying, expiration_gte=gte, expiration_lte=lte
-    )
+    contracts, snapshots = await fetch_chain_window(mcp, intent, spot=spot)
     existing_position = await mcp.get_open_position(intent.underlying)
 
     result = await strategy_builder.build(
