@@ -692,6 +692,20 @@ class Store:
         value = rows[0]["max_date"] if rows else None
         return cast("date | None", value)
 
+    async def calendar_min_date(self) -> date | None:
+        """The earliest date currently cached, or None if never populated.
+
+        The counterpart to :meth:`calendar_max_date`: it tells MarketPulseAgent
+        whether the backward half of the window is covered, so a cache written
+        by an older build (forward-only, starting at today) heals itself
+        instead of staying permanently unable to name the last session.
+        """
+        if not self._db.is_enabled:
+            return min(self._memory_calendar) if self._memory_calendar else None
+        rows = await self._fetch("SELECT min(date) AS min_date FROM market_calendar", ())
+        value = rows[0]["min_date"] if rows else None
+        return cast("date | None", value)
+
     async def market_is_open(self, at: datetime) -> bool:
         """Local, cache-only market-open check -- never calls the broker.
 
@@ -711,6 +725,29 @@ class Store:
         if row is None:
             return False
         return bool(row["open"] <= at <= row["close"])
+
+    async def last_session_close(self, at: datetime) -> datetime | None:
+        """Close time of the most recent session that had opened by ``at``.
+
+        Read only by the REPLAY_LAST_SESSION testing mode (see session.py).
+        Selecting on ``open <= at`` rather than ``close <= at`` means an
+        in-progress session returns its own close, not yesterday's.
+
+        Returns None when the calendar cache holds no past session, which is
+        what keeps the replay mode honest: it can replay a real session or
+        nothing at all, never a fabricated one.
+        """
+        if not self._db.is_enabled:
+            closes = [row["close"] for row in self._memory_calendar.values() if row["open"] <= at]
+            return max(closes) if closes else None
+        rows = await self._fetch(
+            "SELECT close FROM market_calendar WHERE open <= %s ORDER BY open DESC LIMIT 1",
+            (at,),
+        )
+        if not rows:
+            return None
+        close = rows[0]["close"]
+        return close if isinstance(close, datetime) else None
 
     # ---- Account cache (2026-08-29 design change) -----------------------
     # Sole writer: MarketPulseAgent, piggybacked on the get_account_info /

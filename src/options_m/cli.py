@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import pprint
 import sys
 from typing import Any
 
-from options_m import strategy_builder
+from options_m import strategy_builder, trace
 from options_m.agents.execution import (
     ExecutionAgent,
     build_portfolio_snapshot,
@@ -25,6 +26,7 @@ from options_m.agents.execution import (
 from options_m.api import jsonable
 from options_m.config import Settings
 from options_m.db import Database
+from options_m.llm import FeatherlessLlm
 from options_m.mcp_client import AlpacaMcp, finite_float
 from options_m.migrate import apply as apply_migrations
 from options_m.models import Rejection, StrategyIntent
@@ -68,6 +70,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     trade_p = sub.add_parser("trade", help="run one ExecutionAgent iteration")
     trade_p.add_argument("--once", action="store_true", required=True)
+
+    trace_p = sub.add_parser(
+        "trace", help="walk the full decision chain for one symbol; never submits"
+    )
+    trace_p.add_argument("--symbol", required=True)
+    trace_p.add_argument(
+        "--fresh-evidence",
+        action="store_true",
+        help="collect evidence live instead of reading MarketPulseAgent's cache",
+    )
 
     return parser
 
@@ -131,6 +143,23 @@ async def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
             return {"chain": await mcp.get_option_chain(args.symbol.upper())}
         if args.command == "plan":
             return await _run_plan(args, mcp=mcp, store=store, settings=settings)
+        if args.command == "trace":
+            llm = FeatherlessLlm(
+                api_key=settings.featherless_api_key,
+                base_url=settings.featherless_base_url,
+                model=settings.featherless_model_deep,
+                timeout_seconds=settings.llm_timeout_seconds,
+                daily_token_budget=settings.llm_daily_token_budget,
+            )
+            result = await trace.run(
+                args.symbol.upper(),
+                mcp=mcp,
+                store=store,
+                settings=settings,
+                llm=llm,
+                use_cached_evidence=not args.fresh_evidence,
+            )
+            return {"trace": result}
         if args.command == "trade":
             risk_engine = RiskEngine(RiskLimits.from_settings(settings))
             agent = ExecutionAgent(settings, mcp, store, risk_engine)
@@ -141,6 +170,15 @@ async def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _print(result: Any, *, as_json: bool) -> None:
+    # A trace is a narrative, not a record: printing its dataclass repr would
+    # bury the one thing it exists to show — which stage stopped the chain.
+    traced = result.get("trace") if isinstance(result, dict) else None
+    if isinstance(traced, trace.Trace):
+        if as_json:
+            print(json.dumps(jsonable(dataclasses.asdict(traced)), indent=2))
+        else:
+            print(traced.render())
+        return
     if as_json:
         print(json.dumps(jsonable(result), indent=2))
     else:

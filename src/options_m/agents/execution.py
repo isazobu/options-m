@@ -23,7 +23,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from options_m import strategy_builder
+from options_m import session, strategy_builder
 from options_m.config import Settings
 from options_m.mcp_client import AlpacaMcp, finite_float
 from options_m.models import OrderPlan, Rejection, StrategyIntent
@@ -119,8 +119,8 @@ async def fetch_chain_window(
     fix; the strike band keeps the same cap from truncating *inside* the
     window on a wide chain.
 
-    Shared with ``cli.py``'s ``plan`` so the manual diagnostic path and the
-    running agent cannot drift into fetching different data.
+    Shared with ``cli.py``'s ``plan`` and ``trace`` so the manual diagnostic
+    path and the running agent cannot drift into fetching different data.
     """
     today = date.today()
     gte = (today + timedelta(days=intent.dte_min)).isoformat()
@@ -176,7 +176,12 @@ async def build_portfolio_snapshot(
         total_open_option_premium=sum(
             abs(finite_float(p.get("market_value")) or 0.0) for p in option_positions
         ),
-        market_is_open=bool(clock.get("is_open")),
+        # The session gate, not the raw clock: under REPLAY_LAST_SESSION the
+        # broker correctly reports closed while the agents are deliberately
+        # replaying the last real session. minutes_to_close still comes from
+        # the clock — out of hours next_close is the *next* session's close, so
+        # the end-of-day blackout passes rather than rejecting on a negative.
+        market_is_open=(await session.current(store, settings, datetime.now(UTC))).is_open,
         minutes_to_close=_minutes_until(clock.get("next_close")),
         kill_switch_engaged=settings.kill_switch or await store.is_kill_switch_engaged(),
         already_submitted=existing_order is not None,

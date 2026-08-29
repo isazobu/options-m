@@ -30,7 +30,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from options_m import matrix
+from options_m import matrix, session
 from options_m.config import Settings
 from options_m.earnings import is_earnings_blackout
 from options_m.llm import FeatherlessLlm, LlmContractError
@@ -98,9 +98,11 @@ class StrategistAgent:
 
         # 1. Market-open check (local cache, no MCP call).
         now = datetime.now(UTC)
-        if not await self._store.market_is_open(now):
+        state = await session.current(self._store, self._settings, now)
+        if not state.is_open:
             detail["skipped"] = "market_closed"
             return detail
+        detail["session_replayed"] = state.replayed
 
         # 2. Kill switch + LLM budget.
         if self._settings.kill_switch or await self._store.is_kill_switch_engaged():
