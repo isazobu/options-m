@@ -29,12 +29,46 @@ from typing import Any, Literal
 from options_m.config import Settings
 from options_m.mcp_client import finite_float
 from options_m.models import Leg, OrderPlan, Rejection, StrategyIntent
+from options_m.volatility import implied_vol
+
+# Dividend yield assumed away for the IV solve, matching evidence.py's own
+# fallback so the two modules recover the same sigma from the same quote. The
+# risk-free rate is passed in instead, so the vol we solve for and the delta we
+# then compute from it come from one consistent model.
+_DIVIDEND_YIELD = 0.0
 
 _CALL_STRATEGIES = frozenset({"long_call", "debit_call_spread", "covered_call"})
 _PUT_STRATEGIES = frozenset({"long_put", "debit_put_spread", "cash_secured_put"})
 _VERTICAL_STRATEGIES = frozenset({"debit_call_spread", "debit_put_spread"})
 _SHORT_ONLY_STRATEGIES = frozenset({"covered_call", "cash_secured_put"})
 _CONTRACT_MULTIPLIER = 100.0
+
+# matrix.py names the two debit verticals the other way round from the names
+# this module grew up with. Same structure, same legs — canonicalised on the
+# way in so there is exactly one spelling below this line.
+_STRATEGY_ALIASES = {
+    "call_debit_spread": "debit_call_spread",
+    "put_debit_spread": "debit_put_spread",
+}
+
+# What this module can actually assemble and price today. The Strategy Matrix
+# can emit put_credit_spread, call_credit_spread, iron_condor, iron_butterfly
+# and long_strangle, none of which have a builder yet — see
+# docs/PIPELINE-STATUS.md. They must be refused by name: every one of them
+# falls through the option-type and leg logic below into a *different*
+# structure (a lone put, priced with a cash-secured put's risk profile), and
+# submitting a wrong structure is far worse than submitting nothing.
+_SUPPORTED_STRATEGIES = frozenset(
+    {
+        "long_call",
+        "long_put",
+        "debit_call_spread",
+        "debit_put_spread",
+        "covered_call",
+        "cash_secured_put",
+        "long_strangle",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,13 +126,25 @@ def _is_standard_monthly(expiry: date) -> bool:
 
 
 def normalize_contracts(
-    contracts: list[dict[str, Any]], snapshots: dict[str, dict[str, Any]]
+    contracts: list[dict[str, Any]],
+    snapshots: dict[str, dict[str, Any]],
+    *,
+    spot: float | None = None,
+    risk_free_rate: float = 0.0,
 ) -> list[NormalizedContract]:
     """Join contract metadata with live quotes/greeks by OCC symbol.
 
     A contract that fails to parse (missing/malformed strike, expiry, or
     type) is dropped, not guessed at — it simply cannot be selected, which
     surfaces downstream as a normal ``Rejection`` if nothing usable remains.
+
+    ``spot`` enables the implied-vol fallback. Alpaca's option snapshots carry
+    ``greeks`` and ``impliedVolatility`` only on the OPRA feed; on the feed a
+    paper account gets, both come back ``None`` for every contract. Without a
+    fallback that makes delta unrecoverable and every selection ends in
+    ``no_delta_data_available``. Solving sigma from the quote mid is the same
+    thing ``evidence.py`` already does for its IV/RV read, so the two agree on
+    where a missing IV comes from.
     """
     normalized: list[NormalizedContract] = []
     for contract in contracts:
@@ -132,6 +178,19 @@ def normalize_contracts(
         quote = snapshot.get("latestQuote")
         bid = finite_float(quote.get("bp")) if isinstance(quote, dict) else None
         ask = finite_float(quote.get("ap")) if isinstance(quote, dict) else None
+
+        if iv is None and spot is not None and bid and ask and bid > 0 and ask > 0:
+            dte_days = (expiry - date.today()).days
+            if dte_days > 0:
+                iv = implied_vol(
+                    (bid + ask) / 2,
+                    spot,
+                    strike,
+                    dte_days / 365.0,
+                    risk_free_rate,
+                    _DIVIDEND_YIELD,
+                    option_type,
+                )
 
         normalized.append(
             NormalizedContract(
@@ -223,7 +282,35 @@ async def build(
     spot: float,
 ) -> OrderPlan | Rejection:
     """Build a fully-priced :class:`OrderPlan`, or explain why one is refused."""
-    universe = normalize_contracts(contracts, snapshots)
+    canonical = _STRATEGY_ALIASES.get(intent.strategy, intent.strategy)
+    if canonical not in _SUPPORTED_STRATEGIES:
+        return _reject(
+            proposal_id,
+            "unsupported_strategy",
+            strategy=intent.strategy,
+            supported=sorted(_SUPPORTED_STRATEGIES),
+        )
+    if canonical != intent.strategy:
+        intent = intent.model_copy(update={"strategy": canonical})
+
+    universe = normalize_contracts(
+        contracts, snapshots, spot=spot, risk_free_rate=settings.risk_free_rate
+    )
+
+    # A strangle is selected on a different axis from everything below: two
+    # legs of *different* option types sharing one expiry, rather than one
+    # primary contract with an optional same-type partner. It gets its own
+    # builder instead of being bent through the single-type funnel.
+    if intent.strategy == "long_strangle":
+        return _build_long_strangle(
+            intent,
+            universe=universe,
+            account=account,
+            settings=settings,
+            proposal_id=proposal_id,
+            spot=spot,
+        )
+
     wants_call = intent.strategy in _CALL_STRATEGIES
     option_type: Literal["call", "put"] = "call" if wants_call else "put"
 
@@ -364,6 +451,143 @@ async def build(
         breakeven=breakeven,
         client_order_id=client_order_id,
     )
+
+
+def _build_long_strangle(
+    intent: StrategyIntent,
+    *,
+    universe: list[NormalizedContract],
+    account: dict[str, Any],
+    settings: Settings,
+    proposal_id: int,
+    spot: float,
+) -> OrderPlan | Rejection:
+    """Buy an OTM call and an OTM put on the same expiry.
+
+    The matrix reaches for this in a flat trend with cheap premium: no
+    directional view, paying for movement in either direction. Both legs are
+    long, so max loss is the debit and Alpaca's naked-short-leg validation is
+    not in play at all.
+    """
+    today = date.today()
+    in_window = [
+        contract
+        for contract in universe
+        if intent.dte_min <= (contract.expiry - today).days <= intent.dte_max
+    ]
+    if not in_window:
+        return _reject(
+            proposal_id,
+            "no_contracts_in_window",
+            underlying=intent.underlying,
+            dte_min=intent.dte_min,
+            dte_max=intent.dte_max,
+        )
+
+    # Both legs must share an expiry, so the expiry is chosen first: the one
+    # whose best call and best put together sit closest to the target delta.
+    best: tuple[float, NormalizedContract, float, NormalizedContract, float] | None = None
+    for expiry in sorted({contract.expiry for contract in in_window}):
+        same_expiry = [contract for contract in in_window if contract.expiry == expiry]
+        call = _closest_to_delta(same_expiry, "call", intent.target_delta, settings, spot)
+        put = _closest_to_delta(same_expiry, "put", intent.target_delta, settings, spot)
+        if call is None or put is None:
+            continue
+        call_contract, call_delta, call_diff = call
+        put_contract, put_delta, put_diff = put
+        # A strangle needs the two strikes apart; equal strikes are a straddle,
+        # a different structure with a different risk profile.
+        if call_contract.strike <= put_contract.strike:
+            continue
+        penalty = (
+            0.0
+            if not settings.standard_monthly_expiry_preference or _is_standard_monthly(expiry)
+            else 1e-6
+        )
+        score = call_diff + put_diff + penalty
+        if best is None or score < best[0]:
+            best = (score, call_contract, call_delta, put_contract, put_delta)
+
+    if best is None:
+        return _reject(proposal_id, "no_strangle_pair_available", underlying=intent.underlying)
+    _score, call_contract, call_delta, put_contract, put_delta = best
+
+    for contract in (call_contract, put_contract):
+        rejection = _liquidity_rejection(
+            proposal_id,
+            contract,
+            max_spread_pct=settings.max_spread_pct,
+            min_oi=settings.min_open_interest,
+        )
+        if rejection is not None:
+            return rejection
+
+    assert call_contract.bid is not None and call_contract.ask is not None  # noqa: S101
+    assert put_contract.bid is not None and put_contract.ask is not None  # noqa: S101
+    call_mid = (call_contract.bid + call_contract.ask) / 2
+    put_mid = (put_contract.bid + put_contract.ask) / 2
+    width = (call_contract.ask - call_contract.bid) + (put_contract.ask - put_contract.bid)
+    entry_price = call_mid + put_mid + settings.limit_price_spread_nudge_pct * width
+
+    max_loss = entry_price * _CONTRACT_MULTIPLIER
+    equity = finite_float(account.get("equity"))
+    if equity is None:
+        return _reject(proposal_id, "no_account_equity")
+    qty = math.floor(settings.max_premium_pct_per_trade * equity / max_loss)
+    if qty <= 0:
+        return _reject(
+            proposal_id,
+            "zero_quantity",
+            max_premium_budget=settings.max_premium_pct_per_trade * equity,
+            max_loss_per_contract=max_loss,
+        )
+
+    return OrderPlan(
+        proposal_id=proposal_id,
+        underlying=intent.underlying,
+        strategy=intent.strategy,
+        legs=[
+            _leg_from_contract(
+                call_contract, side="buy", delta=call_delta, delta_source="black_scholes"
+            ),
+            _leg_from_contract(
+                put_contract, side="buy", delta=put_delta, delta_source="black_scholes"
+            ),
+        ],
+        qty=qty,
+        limit_price=entry_price,
+        max_loss=max_loss * qty,
+        # Unbounded on the upside, and the downside is capped only at a zero
+        # underlying — there is no honest single max_profit here.
+        max_profit=None,
+        # A strangle has two breakevens (call strike + debit, put strike -
+        # debit). One field cannot hold both, and reporting either alone reads
+        # as "the" breakeven, so this stays empty rather than half-true.
+        breakeven=None,
+        client_order_id=f"om-{proposal_id}",
+    )
+
+
+def _closest_to_delta(
+    contracts: list[NormalizedContract],
+    option_type: Literal["call", "put"],
+    target_delta: float,
+    settings: Settings,
+    spot: float,
+) -> tuple[NormalizedContract, float, float] | None:
+    """The contract of ``option_type`` whose |delta| is nearest ``target_delta``."""
+    best: tuple[NormalizedContract, float, float] | None = None
+    for contract in contracts:
+        if contract.option_type != option_type:
+            continue
+        effective = _effective_delta(contract, spot=spot, risk_free_rate=settings.risk_free_rate)
+        if effective is None:
+            continue
+        delta, _source = effective
+        diff = abs(abs(delta) - target_delta)
+        if best is None or diff < best[2]:
+            best = (contract, delta, diff)
+    return best
 
 
 def _price(
