@@ -6,6 +6,17 @@ Phase 3 (the LLM crew) exists to produce real ones. Requires DATABASE_URL —
 run against the same Postgres the running backend uses, since the in-memory
 fallback is per-process and would not be visible to it.
 
+Every row is stamped ``"mock": True`` in its evidence/detail JSON so the
+dashboard can label it honestly (Store.recent_proposals()'s ``is_mock``,
+and the risk-events endpoint's raw ``detail.mock``) rather than let it read
+as a real agent decision.
+
+Never seed a proposal with status literally ``"pending"`` — that is exactly
+what ExecutionAgent's pending_proposals() polls for in the running service,
+so a seeded "pending" row gets picked up by the real agent loop and turned
+into a genuine (non-mock) order attempt or risk event, exactly as it did
+once. Use a different placeholder status (e.g. "awaiting_review") instead.
+
 Usage: python scripts/seed_demo_data.py
 """
 
@@ -107,7 +118,11 @@ PROPOSALS: list[dict[str, object]] = [
     },
     {
         "underlying": "NVDA",
-        "status": "pending",
+        # Never literally "pending": that status is what ExecutionAgent's
+        # pending_proposals() polls for, so a seeded row would get picked up
+        # by the real, running agent loop and turned into a genuine (non-mock)
+        # order attempt / risk event — which is exactly what happened once.
+        "status": "awaiting_review",
         "intent": {
             "action": "open",
             "strategy": "debit_put_spread",
@@ -135,19 +150,21 @@ async def main() -> None:
     async with Database(settings) as db:
         store = Store(db)
         for row in PROPOSALS:
+            evidence = {**row["evidence"], "mock": True}  # type: ignore[dict-item]
             proposal_id = await store.save_proposal(
                 underlying=str(row["underlying"]),
                 intent=row["intent"],  # type: ignore[arg-type]
-                evidence=row["evidence"],  # type: ignore[arg-type]
+                evidence=evidence,
             )
             status = str(row["status"])
             await store.update_proposal_status(proposal_id, status)
 
             if status == "rejected":
+                risk_detail = {**row["risk_detail"], "mock": True}  # type: ignore[dict-item]
                 await store.record_risk_event(
                     proposal_id=proposal_id,
                     rule=str(row["risk_rule"]),
-                    detail=row["risk_detail"],  # type: ignore[arg-type]
+                    detail=risk_detail,
                 )
             elif status == "approved":
                 client_order_id = f"om-demo-{proposal_id}"
@@ -164,15 +181,20 @@ async def main() -> None:
         await store.record_risk_event(
             proposal_id=None,
             rule="daily_loss_halt",
-            detail={"daily_pnl_pct": -0.034, "limit_pct": -0.03},
+            detail={"daily_pnl_pct": -0.034, "limit_pct": -0.03, "mock": True},
         )
         await store.record_risk_event(
             proposal_id=None,
             rule="min_open_interest",
-            detail={"symbol": "AMD250321C00160000", "open_interest": 42, "limit": 100},
+            detail={
+                "symbol": "AMD250321C00160000",
+                "open_interest": 42,
+                "limit": 100,
+                "mock": True,
+            },
         )
 
-        print(f"Seeded {len(PROPOSALS)} proposals and their risk events/orders.")
+        print(f"Seeded {len(PROPOSALS)} proposals and their risk events/orders, all marked mock.")
 
 
 if __name__ == "__main__":
