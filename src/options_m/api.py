@@ -114,6 +114,7 @@ async def api_status(request: Request) -> Response:
     _db, agents = _state(request)
     mcp = _mcp(request)
     store = _store(request)
+    settings = _settings(request)
 
     clock: Any = None
     account: Any = None
@@ -145,6 +146,10 @@ async def api_status(request: Request) -> Response:
                     "error": broker_error,
                 },
                 "agents": [agent.name for agent in agents],
+                # The clock above says closed while the agents deliberately act
+                # on the last session. The dashboard must be able to say so
+                # rather than present a replayed run as a live one.
+                "replay_last_session": settings.replay_last_session,
                 "persistent": store.is_persistent if store else False,
                 "equity_tail": list(reversed(equity)),
             }

@@ -36,8 +36,14 @@ async def run(settings: Settings) -> None:
             "port": settings.port,
             "dry_run": settings.dry_run,
             "paper": settings.alpaca_paper_trade,
+            "replay_last_session": settings.replay_last_session,
         },
     )
+    if settings.replay_last_session:
+        logger.warning(
+            "REPLAY_LAST_SESSION is on: agents are treating the last completed session as "
+            "current. Every decision is built on stale data and no order can be submitted."
+        )
 
     # Both dependencies tolerate being unconfigured, so the process still boots
     # without credentials and reports the gap on /ready instead of crash-looping.
@@ -77,6 +83,18 @@ def main() -> int:
 
     settings = Settings()
     setup_logging(settings.log_level, fmt=settings.log_format)
+
+    # A replayed session reasons over the previous session's bars and chain.
+    # That is fine for exercising the pipeline and unacceptable for order
+    # entry, so the two are interlocked here rather than trusted to whoever
+    # edits .env next.
+    if settings.replay_last_session and not settings.dry_run:
+        logger.error(
+            "refusing to start: REPLAY_LAST_SESSION replays a completed session, so every "
+            "decision is built on stale market data. It requires DRY_RUN=true."
+        )
+        return 1
+
     try:
         asyncio.run(run(settings))
     except KeyboardInterrupt:
