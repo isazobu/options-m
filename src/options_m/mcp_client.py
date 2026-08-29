@@ -530,8 +530,25 @@ class AlpacaMcp:
     # Added as phases need them, so every broker interaction stays greppable.
 
     async def get_clock(self) -> dict[str, Any]:
-        """Market state. The single source of truth — never a hardcoded calendar."""
+        """Market state, straight from the broker.
+
+        Kept for an optional startup sanity-check against the local
+        ``market_calendar`` cache. Per the 2026-08-29 design change, the normal
+        agent loops no longer call this every iteration -- they read the cache
+        (populated from :meth:`get_calendar`) instead. Do not add a new call site
+        for this outside ``market_pulse.py`` and tests.
+        """
         return self._expect_mapping("get_clock", await self.call("get_clock"))
+
+    async def get_calendar(self, start: str, end: str) -> list[dict[str, Any]]:
+        """Trading-day calendar entries for ``[start, end]`` (ISO date strings).
+
+        The one live call that populates the local ``market_calendar`` cache.
+        ``MarketPulseAgent`` is the only caller.
+        """
+        return self._expect_sequence(
+            "get_calendar", await self.call("get_calendar", {"start": start, "end": end})
+        )
 
     async def get_account_info(self) -> dict[str, Any]:
         return self._expect_mapping("get_account_info", await self.call("get_account_info"))

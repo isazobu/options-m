@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     # value; everything else falls back to agent_interval_seconds above.
     market_pulse_interval_seconds: float = Field(default=60.0, gt=0)
     execution_agent_interval_seconds: float = Field(default=30.0, gt=0)
+    position_manager_interval_seconds: float = Field(default=60.0, gt=0)
 
     # Alpaca, reached only through its official MCP server (spawned as a stdio
     # subprocess). Unset keys mean "run without a broker session", mirroring
@@ -62,9 +63,16 @@ class Settings(BaseSettings):
     # ALPACA_PAPER_TRADE="true" for the server regardless, and setting this
     # False makes startup fail rather than arming live trading.
     alpaca_paper_trade: bool = True
-    alpaca_toolsets: str = "account,trading,assets,options-data,stock-data,news"
+    alpaca_toolsets: str = "account,trading,assets,options-data,stock-data"
     mcp_call_timeout_seconds: float = Field(default=30.0, gt=0)
     mcp_max_retries: int = Field(default=2, ge=0)
+
+    # Local market-calendar cache (2026-08-29 design change): MarketPulseAgent
+    # fetches get_calendar once for this forward window and refreshes once the
+    # cached window shrinks under the margin, instead of calling get_clock on
+    # every agent iteration across every agent.
+    market_calendar_horizon_days: int = Field(default=400, gt=0)
+    market_calendar_refresh_margin_days: int = Field(default=30, gt=0)
 
     # Trading universe and safety switches.
     universe: str = "SPY,QQQ,IWM,AAPL,MSFT,NVDA,AMD,TSLA,META,GOOGL"

@@ -1,6 +1,6 @@
 # Phase 6 — Submission package
 
-**Master doc:** `hackathonda-in-a-etmen-istenen-shiny-clarke.md`
+**Master doc:** `00-MASTER.md`
 **Prerequisite:** Phase 5 complete — the service is live on the dedicated $100k paper
 account with real trade history, and all demo material is captured.
 **Deadline: 4 September 2026, 15:00 UTC.** Work backwards from that. Have everything
@@ -55,9 +55,13 @@ Lead with what makes this different, not with the architecture. Suggested shape:
    Alpaca. Five independent agent loops in one asyncio process, each crash-isolated with
    exponential backoff, sharing one clean shutdown path. It has been running continuously
    on a dedicated $100k paper account since <date>.
-3. **How the agents reason.** Deterministic evidence pack → Bull, Bear and Volatility
-   analysts in parallel on Featherless → a Portfolio Manager judge that emits a *typed
-   intent*, never a contract.
+3. **How it reasons — technical analysis, not news.** A deterministic evidence pack (trend
+   from SMA/ADX/RSI, an IV/RV volatility-regime read from the option chain, an earnings-date
+   blackout check — no headlines, no sentiment) feeds one Featherless LLM call inside a
+   single `StrategistAgent`, which produces a thesis, an invalidation condition, and a
+   conviction score. A deterministic **Strategy Matrix** then turns the already-classified
+   trend and volatility regime into one of nine defined-risk option structures — the model
+   never picks the structure, it only narrates and scores a read the code has already made.
 4. **The safety architecture — lead with this, it is the differentiator.**
    - The LLM cannot name an option contract. It emits direction, target delta, DTE window and
      structure; deterministic code selects real contracts from the live chain. Hallucinating
@@ -69,16 +73,18 @@ Lead with what makes this different, not with the architecture. Suggested shape:
      A failed order is recorded as failed and never as a synthetic fill.
    - Exits are deterministic and keep working when the LLM is down or the kill switch is on.
 5. **Alpaca infrastructure.** The official Alpaca MCP Server (**v2.3.0**, FastMCP +
-   OpenAPI), consumed in-process as a long-lived MCP client over stdio — clock, account,
-   chain snapshots with greeks and IV, multi-leg option orders, positions, news. Plus a CLI
-   over the same modules. Name two specifics that show it is real integration, not a
-   checkbox: the server-side toolset allowlist (`ALPACA_TOOLSETS`) that narrows the surface
-   to what we actually use, and the trust-boundary envelope we unwrap and honour — news
-   arrives tagged as untrusted external text and is fenced inside the prompts. Say that the
-   order workflow follows Alpaca's own `alpaca-trading-paper-trading-mcp` skill: preview,
-   verify paper mode, submit with an idempotency key, monitor.
-6. **It learns.** Closed trades become short lessons in Postgres, re-injected into the
-   Portfolio Manager's prompt for that symbol.
+   OpenAPI), consumed in-process as a long-lived MCP client over stdio — calendar, account,
+   chain snapshots with greeks and IV, multi-leg option orders, positions. Plus a CLI over
+   the same modules. Name two specifics that show it is real integration, not a checkbox: the
+   server-side toolset allowlist (`ALPACA_TOOLSETS`) that narrows the surface to what we
+   actually use (deliberately excluding `news` — this system trades on technical analysis
+   only), and a local-cache design that turns the market calendar, account state and open
+   positions into single-writer Postgres tables instead of hitting the live API on every
+   agent iteration. Say that the order workflow follows Alpaca's own
+   `alpaca-trading-paper-trading-mcp` skill: preview, verify paper mode, submit with an
+   idempotency key, monitor.
+6. **It learns.** Closed trades become short lessons in Postgres, re-injected into
+   `StrategistAgent`'s next evidence pack for that symbol.
 7. **Results.** Real numbers from the live run: proposals made, trades taken, trades
    declined and by which rule, realised P/L, equity curve.
 8. **A screenshot of the decision timeline.** One expanded decision chain says more than a
@@ -94,7 +100,7 @@ Keep it to one page. Cut the architecture diagram before you cut the safety sect
 | --- | --- |
 | 0:00–0:20 | The hook: "This has been trading options on its own since Tuesday. Here is every decision it made, and every one it refused." Dashboard on screen, live. |
 | 0:20–0:50 | The problem: autonomy is easy, auditable autonomy is not. |
-| 0:50–1:40 | **Walk one real decision end to end** on the dashboard: evidence → three analysts → PM verdict with thesis and invalidation → the real contracts the code selected → the risk verdict → the filled order in Alpaca. This is the whole video; give it the time. |
+| 0:50–1:40 | **Walk one real decision end to end** on the dashboard: evidence (trend + IV/RV regime) → the LLM's thesis and invalidation → the Strategy Matrix verdict → the real contracts the code selected → the risk verdict → the filled order in Alpaca. This is the whole video; give it the time. |
 | 1:40–2:10 | Safety: the risk-events feed of declined trades; hit the kill switch live and show new orders stop while an exit still goes through. |
 | 2:10–2:35 | Architecture in one breath: five supervised loops, Alpaca MCP, Featherless, Postgres audit trail, deployed and running 24/7. |
 | 2:35–3:00 | Results: equity curve, trades, lessons learned. Close on the live dashboard. |
@@ -106,9 +112,10 @@ see it is not a mock. Do not narrate code.
 
 ## `SLIDES.md` — 10 slides
 
-Title · The problem · Architecture (five loops) · The reasoning crew · **The LLM cannot name
-a contract** · The risk engine · Alpaca MCP integration · Live results · It learns · Try it
-(repo + live URL + account ID).
+Title · The problem · Architecture (five loops) · Technical analysis, not news — the
+Strategy Matrix · **The LLM cannot name a contract** · The risk engine · Alpaca MCP
+integration (+ the local-cache design) · Live results · It learns · Try it (repo + live URL
++ account ID).
 
 ---
 
@@ -145,6 +152,8 @@ history, and the licence and repo visibility are set correctly.
 - [ ] Paper Account ID in the submission
 - [ ] Featherless voucher `ALPACAA26` applied and the integration clearly stated
 - [ ] **Submitted well before 4 Sep 15:00 UTC**
+- [ ] `options-m flatten` run and confirmed clean before the deadline (Phase 5) — no
+      unmonitored open positions at judging time
 - [ ] Service left running through judging — do not redeploy after submitting
 
 ---

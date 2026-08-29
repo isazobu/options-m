@@ -22,6 +22,7 @@ from options_m.risk import RiskEngine, RiskLimits
 from options_m.store import Store
 from options_m.trading.execution import ExecutionAgent
 from options_m.trading.market_pulse import MarketPulseAgent
+from options_m.trading.position_manager import PositionManagerAgent
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ def build_agents(settings: Settings, mcp: AlpacaMcp, store: Store) -> list[Agent
     risk_engine = RiskEngine(RiskLimits.from_settings(settings))
     return [
         MarketPulseAgent(settings, mcp, store),
+        PositionManagerAgent(settings, mcp, store),
         ExecutionAgent(settings, mcp, store, risk_engine),
     ]
 

@@ -1,11 +1,13 @@
 # Phase 4 — Position management, reflection memory, judge-facing dashboard
 
-**Master doc:** `hackathonda-in-a-etmen-istenen-shiny-clarke.md`
-**Prerequisite:** Phase 3 complete — the crew produces proposals autonomously and
-`ExecutionAgent` places real paper options orders.
+**Master doc:** `00-MASTER.md`
+**Prerequisite:** Phase 3 complete — `StrategistAgent` produces proposals autonomously
+(one LLM call per iteration, gated by the deterministic Strategy Matrix) and `ExecutionAgent`
+places real paper options orders.
 **Goal:** close the loop. Positions get managed and exited, closed trades become lessons that
-feed back into future prompts, and everything becomes visible in a dashboard a judge can
-read in 60 seconds.
+feed back into future `StrategistAgent` iterations, everything becomes visible in a dashboard
+a judge can read in 60 seconds, and the service has a deliberate, manually-triggered way to
+flatten every position before the deadline.
 
 **Local reference repos (read-only — never modify):** `../alpaca-mcp-server` (official Alpaca
 MCP server **v2.3.0**) and `../alpaca-skills` (official Alpaca agent skills) are checked out
@@ -30,10 +32,19 @@ budget is exhausted, the model is down, or the kill switch is engaged. The kill 
 
 Each iteration:
 
-1. `positions = await mcp.get_all_positions()`, filtered to option positions.
-2. Match each to its originating proposal via `orders.client_order_id`.
-3. Mark to market from `get_option_snapshot` / `get_option_latest_quote`; write
-   `positions_history` and update the position's unrealised P/L.
+1. `positions = await mcp.get_all_positions()`, filtered to option positions. **This agent is
+   the sole writer of the local `positions` cache** (`00-MASTER.md`'s local-cache table) —
+   upsert every current position into it here, and remove rows for anything that dropped out
+   of the response since the last tick. `StrategistAgent`'s "already positioned" pre-filter
+   and `ExecutionAgent`'s pre-order position check both read this table instead of calling
+   `get_all_positions`/`get_open_position` themselves.
+2. Match each to its originating proposal via `orders.client_order_id` (read from the local
+   `orders` cache — no live `get_orders` call needed here either).
+3. Mark to market from `get_option_snapshot` / `get_option_latest_quote`; update the
+   position's unrealised P/L (kept on the same `positions` cache row from step 1, not a
+   separate table — the file previously specified a `positions_history` table; that is
+   folded into `positions.payload` plus the `trades` row written on close, so no extra
+   history table is needed).
 4. Apply exit rules, first match wins, each configurable:
 
 | Rule | Default |
@@ -70,16 +81,20 @@ Position awareness and idempotency are what separate a demo from a toy.
 Cadence hourly, plus one run after the close. This is the "it learns" story and it is cheap.
 
 1. Find `trades` rows with `reflected = false`.
-2. For each, build a compact record: the original evidence highlights, the PM thesis, what
-   actually happened (realised P/L, holding period, exit reason), and the underlying's move
-   over the holding period.
-3. One fast-tier LLM call using `prompts/reflection.md`, capped at **2–4 sentences** — the
+2. For each, build a compact record: the original evidence highlights, the `StrategistAgent`
+   thesis from `proposals.llm_read`, what actually happened (realised P/L, holding period,
+   exit reason), and the underlying's move over the holding period.
+3. One LLM call using `prompts/reflection.md`, on the same single `featherless_model_deep`
+   tier Phase 3 uses (there is no separate fast tier to reach for here — the two-tier design
+   was retired along with the analyst crew), capped at **2–4 sentences** — the
    `TradingAgents` reflection prompt caps length for exactly this reason
    (`graph/reflection.py:20-29`): a lesson is only useful if it is cheap to re-inject.
 4. Write to `lessons(id, ts, symbol, trade_id, lesson, outcome_pct, tags)`.
 5. `store.recent_lessons(symbol, n)` returns same-symbol lessons first, then a couple of
    cross-symbol ones — the `n_same=5, n_cross=3` shape from
-   `TradingAgents/.../utils/memory.py:70-95`. Phase 3's `StrategistAgent` already calls this.
+   `TradingAgents/.../utils/memory.py:70-95`. Phase 3's `StrategistAgent` already calls this
+   inside its evidence-collection step, so the lesson feeds the *next* regime read, not the
+   one that produced the closed trade.
 
 **No vector store.** Plain SQL over a `lessons` table is simpler, human-auditable, has no
 embedding dependency or cost, and reads better on stage. `AlpacaTradingAgent` runs five
@@ -104,11 +119,13 @@ Sections, in the order a judge should read them:
 3. **Open positions** — underlying, structure, legs, DTE, delta, entry vs mark, unrealised
    P/L, the exit rule that will fire first.
 4. **Decision timeline** — the centrepiece. Each proposal is one row: timestamp, symbol,
-   verdict, conviction, status. Expanding it reveals the bull argument, the bear argument,
-   the volatility read, the PM's JSON verdict with its thesis and invalidation, the selected
-   real OCC contracts, the risk verdict, and the resulting order. **This is the single most
-   persuasive artefact in the submission** — it proves the agent reasons rather than
-   pattern-matches, and no reference project surfaces it.
+   verdict, conviction, status. Expanding it reveals the evidence pack (trend classification,
+   IV/RV regime, earnings-blackout flag), the `StrategistAgent`'s regime read (thesis,
+   invalidation, conviction — `proposals.llm_read`), the Strategy Matrix's verdict
+   (`proposals.matrix` — which cell fired and why, or the earnings gate short-circuit), the
+   selected real OCC contracts, the risk verdict, and the resulting order. **This is the
+   single most persuasive artefact in the submission** — it proves the agent reasons rather
+   than pattern-matches, and no reference project surfaces it.
 5. **Risk events** — every rejection with its rule and detail. "Declined 14 trades, here is
    why" is a stronger story than the trades taken.
 6. **Agent health** — one row per agent from `agent_runs`: last run, duration, consecutive
@@ -132,7 +149,32 @@ medium.
 `trades(id, proposal_id, symbol, strategy, opened_at, closed_at, entry_price, exit_price,
 qty, realized_pnl numeric, exit_reason, reflected bool default false)`,
 `lessons(id, ts, symbol, trade_id, lesson, outcome_pct numeric, tags text[])`,
-`llm_calls(id, ts, role, tier, model, prompt_tokens, completion_tokens, latency_ms, ok, error)`.
+`llm_calls(id, ts, role, model, prompt_tokens, completion_tokens, latency_ms, ok, error)` —
+`tier` is dropped from the original column list since there is only one model tier now.
+
+### 5. `options-m flatten` — the wind-down CLI
+
+Added to `src/options_m/cli.py` alongside the Phase 2 subcommands. This is the operational
+answer to `00-MASTER.md`'s "Operational window & wind-down" section: the run only has until
+4 Sep 2026 15:00 UTC, and nothing should be left open and unmonitored at that point.
+
+- `options-m flatten` (optionally `--dry-run` to print what it *would* close, `--yes` to
+  skip a confirmation prompt when run non-interactively): reads the local `positions` cache,
+  and for each open position calls `close_position(symbol)` — **one call per symbol, in a
+  loop, never `close_all_positions`** (permanently forbidden per Phase 1's
+  `FORBIDDEN_TOOLS`). Waits for each close order to reach a terminal state before moving to
+  the next symbol (per the "closing is order entry" rule above), logs the result, and writes
+  the normal `trades` row for each one so `ReflectionAgent` still produces a lesson from it.
+- Exit code is non-zero if any position failed to close, so it is safe to script a check
+  around it (`options-m flatten && echo "clean"`).
+- This is **manually triggered, not an automatic timer** — per Alpaca's own skill, an
+  unattended service should not take irreversible-feeling actions with nobody watching, and a
+  human running one command a couple of hours before the deadline is a better tradeoff than a
+  cron job that fires when nobody is available to notice if it misbehaves.
+- Separately, `risk.py`'s wind-down cutoff rule (Phase 2 §2.6) stops `ExecutionAgent` from
+  *opening* new positions starting ~2–3 hours before the deadline — `flatten` only needs to
+  run once, after that cutoff, and its job is closing what already exists, not preventing new
+  entries (that is `risk.py`'s job).
 
 ---
 
@@ -153,10 +195,18 @@ qty, realized_pnl numeric, exit_reason, reflected bool default false)`,
 ## Acceptance criteria
 
 - [ ] A position that hits +50% is closed automatically and a `trades` row is written.
+- [ ] The local `positions` cache reflects reality within one `PositionManagerAgent` tick,
+      and `StrategistAgent`/`ExecutionAgent` never call `get_all_positions`/`get_open_position`
+      directly (grep confirms it).
 - [ ] A closed trade produces a lesson, and the next proposal for that symbol shows the
-      lesson inside its PM prompt (assert via the persisted prompt or a debug field).
-- [ ] The dashboard renders the full decision chain for a real proposal, end to end.
+      lesson inside `StrategistAgent`'s prompt (assert via the persisted prompt or a debug
+      field).
+- [ ] The dashboard renders the full decision chain for a real proposal, end to end,
+      including the regime read and the matrix verdict.
 - [ ] The kill switch blocks new orders while letting an exit through.
+- [ ] `options-m flatten --dry-run` lists every open position with no MCP write call;
+      `options-m flatten` against a seeded set of fake open positions closes each one and
+      exits 0.
 - [ ] The dashboard is readable in a 1080p screen recording.
 - [ ] `ruff check . && mypy && pytest` green.
 
@@ -169,3 +219,7 @@ qty, realized_pnl numeric, exit_reason, reflected bool default false)`,
 - Do not add a charting library or a frontend build step this late.
 - Do not expose the kill switch without an auth token on a public URL.
 - Do not let a reflection failure propagate into the trading path.
+- Do not wire `flatten` to `close_all_positions` "for simplicity" — it is permanently
+  forbidden; loop over `close_position` per symbol even though it is more code.
+- Do not make `flatten` run automatically on a timer — it is a deliberate, human-triggered
+  command by design.

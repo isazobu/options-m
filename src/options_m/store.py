@@ -15,9 +15,10 @@ from __future__ import annotations
 import json
 import logging
 from collections import deque
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 from options_m.db import Database
 from options_m.volatility import iv_rank
@@ -26,6 +27,11 @@ logger = logging.getLogger(__name__)
 
 # Enough history for the dashboard without letting a long run eat the heap.
 _MEMORY_LIMIT = 2_000
+
+# The exchange's own calendar is expressed in its local time; every
+# open/close boundary check must happen in this zone, never in UTC directly,
+# or a late-evening UTC timestamp can resolve to the wrong trading day.
+_EXCHANGE_TZ = ZoneInfo("America/New_York")
 
 
 def _now() -> datetime:
@@ -66,6 +72,9 @@ class Store:
         self._memory_order_seq = 0
         self._memory_risk_events: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
         self._memory_iv_history: dict[str, deque[dict[str, Any]]] = {}
+        self._memory_calendar: dict[date, dict[str, Any]] = {}
+        self._memory_account: dict[str, Any] | None = None
+        self._memory_positions: dict[str, dict[str, Any]] = {}
         if not db.is_enabled:
             logger.warning(
                 "no database configured; the store is keeping the last %d rows per table "
@@ -662,6 +671,169 @@ class Store:
         now and does not need to change again when Phase 4 lands.
         """
         return []
+
+    # ---- Market calendar cache (2026-08-29 design change) --------------
+    # Sole writer: MarketPulseAgent. Every other agent's "is the market open"
+    # check goes through market_is_open() below -- never a live get_clock call.
+
+    async def upsert_market_calendar(self, rows: list[dict[str, Any]]) -> None:
+        """Upsert calendar rows. Each row: {date, open (datetime), close (datetime),
+        session_type}. ``open``/``close`` must already be timezone-aware."""
+        if not rows:
+            return
+        if not self._db.is_enabled:
+            for row in rows:
+                self._memory_calendar[row["date"]] = row
+            return
+        payload = [
+            (row["date"], row["open"], row["close"], row.get("session_type", "full"))
+            for row in rows
+        ]
+        async with self._db.connection() as conn, conn.cursor() as cur:
+            await cur.executemany(
+                "INSERT INTO market_calendar (date, open, close, session_type) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (date) DO UPDATE SET open = EXCLUDED.open, "
+                "close = EXCLUDED.close, session_type = EXCLUDED.session_type",
+                payload,
+            )
+            await conn.commit()
+
+    async def calendar_max_date(self) -> date | None:
+        """The furthest-out date currently cached, or None if never populated.
+
+        MarketPulseAgent uses this to decide whether the rolling window needs
+        extending -- it does not track a separate "last refreshed" timestamp,
+        because the window shrinking under the configured margin is itself the
+        signal that a refresh is due.
+        """
+        if not self._db.is_enabled:
+            return max(self._memory_calendar) if self._memory_calendar else None
+        rows = await self._fetch("SELECT max(date) AS max_date FROM market_calendar", ())
+        value = rows[0]["max_date"] if rows else None
+        return cast("date | None", value)
+
+    async def market_is_open(self, at: datetime) -> bool:
+        """Local, cache-only market-open check -- never calls the broker.
+
+        A missing calendar row (weekend, holiday, or a gap in the cache) reads
+        as closed. That is the conservative direction: opening a real position
+        because of a caching gap would be the dangerous failure, sitting out a
+        session because of one is merely a missed opportunity.
+        """
+        local_date = at.astimezone(_EXCHANGE_TZ).date()
+        if not self._db.is_enabled:
+            row = self._memory_calendar.get(local_date)
+        else:
+            rows = await self._fetch(
+                "SELECT open, close FROM market_calendar WHERE date = %s", (local_date,)
+            )
+            row = rows[0] if rows else None
+        if row is None:
+            return False
+        return bool(row["open"] <= at <= row["close"])
+
+    # ---- Account cache (2026-08-29 design change) -----------------------
+    # Sole writer: MarketPulseAgent, piggybacked on the get_account_info /
+    # get_account_config call it already makes every tick for equity_curve.
+
+    async def upsert_account(
+        self,
+        *,
+        equity: float | None,
+        cash: float | None,
+        buying_power: float | None,
+        options_trading_level: int | None,
+    ) -> None:
+        if not self._db.is_enabled:
+            self._memory_account = {
+                "equity": equity,
+                "cash": cash,
+                "buying_power": buying_power,
+                "options_trading_level": options_trading_level,
+                "updated_at": _now(),
+            }
+            return
+        async with self._db.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO account (id, equity, cash, buying_power, "
+                "options_trading_level, updated_at) VALUES (1, %s, %s, %s, %s, now()) "
+                "ON CONFLICT (id) DO UPDATE SET equity = EXCLUDED.equity, "
+                "cash = EXCLUDED.cash, buying_power = EXCLUDED.buying_power, "
+                "options_trading_level = EXCLUDED.options_trading_level, updated_at = now()",
+                (
+                    _as_decimal(equity),
+                    _as_decimal(cash),
+                    _as_decimal(buying_power),
+                    options_trading_level,
+                ),
+            )
+            await conn.commit()
+
+    async def get_cached_account(self) -> dict[str, Any] | None:
+        """The last account snapshot MarketPulseAgent wrote. Never a live call."""
+        if not self._db.is_enabled:
+            return self._memory_account
+        rows = await self._fetch(
+            "SELECT equity, cash, buying_power, options_trading_level, updated_at "
+            "FROM account WHERE id = 1",
+            (),
+        )
+        return rows[0] if rows else None
+
+    # ---- Positions cache (2026-08-29 design change) ----------------------
+    # Sole writer: PositionManagerAgent, piggybacked on its existing per-tick
+    # get_all_positions call. Keyed by underlying symbol, current state only --
+    # this table is overwritten in place, unlike the append-only tables above.
+
+    async def upsert_position(self, symbol: str, payload: dict[str, Any]) -> None:
+        if not self._db.is_enabled:
+            self._memory_positions[symbol] = payload
+            return
+        async with self._db.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO positions (symbol, payload, updated_at) "
+                "VALUES (%s, %s, now()) "
+                "ON CONFLICT (symbol) DO UPDATE SET payload = EXCLUDED.payload, "
+                "updated_at = now()",
+                (symbol, json.dumps(payload)),
+            )
+            await conn.commit()
+
+    async def remove_position(self, symbol: str) -> None:
+        if not self._db.is_enabled:
+            self._memory_positions.pop(symbol, None)
+            return
+        async with self._db.connection() as conn, conn.cursor() as cur:
+            await cur.execute("DELETE FROM positions WHERE symbol = %s", (symbol,))
+            await conn.commit()
+
+    async def get_cached_positions(self) -> list[dict[str, Any]]:
+        """Every currently-open position, from the local cache -- never a live call.
+
+        Each row is ``{"symbol": ..., "payload": ..., "updated_at": ...}`` in both
+        the Postgres and in-memory paths -- the shape must match so callers never
+        need an `is_persistent` branch of their own.
+        """
+        if not self._db.is_enabled:
+            return [
+                {"symbol": symbol, "payload": payload, "updated_at": None}
+                for symbol, payload in sorted(self._memory_positions.items())
+            ]
+        rows = await self._fetch(
+            "SELECT symbol, payload, updated_at FROM positions ORDER BY symbol", ()
+        )
+        return rows
+
+    async def replace_positions(self, payload_by_symbol: dict[str, dict[str, Any]]) -> None:
+        """Upsert every currently-open position and drop whatever closed since
+        the last tick, in one call -- what PositionManagerAgent calls each
+        iteration with the fresh get_all_positions response."""
+        existing = {row["symbol"] for row in await self.get_cached_positions()}
+        for symbol, payload in payload_by_symbol.items():
+            await self.upsert_position(symbol, payload)
+        for stale_symbol in existing - set(payload_by_symbol):
+            await self.remove_position(stale_symbol)
 
     async def _fetch(self, sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
         async with self._db.connection() as conn, conn.cursor() as cur:

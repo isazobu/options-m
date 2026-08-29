@@ -278,6 +278,12 @@ step():
 
 Market state comes **only** from `get_clock`. Never hardcode a calendar.
 
+> **Superseded 2026-08-29 — see the Addendum at the end of this doc.** This describes
+> `MarketPulseAgent` as shipped in Phase 1. The revised design (technical-analysis-only,
+> local caching) has `MarketPulseAgent` populate a `market_calendar` table from `get_calendar`
+> once at startup instead of calling `get_clock` every tick, and add an `account` table
+> alongside `equity_curve`. `get_news` is removed. The addendum has the exact follow-up.
+
 ### 7. Wiring
 
 - `agents.py`: delete `HeartbeatAgent`; `build_agents(settings, mcp, store)` returns
@@ -406,7 +412,73 @@ UptimeRobot), which need account access.
 
 - Never fabricate account or market values on failure — raise or record `None`.
 - Do not build a new client per call; hold one session.
-- Do not hardcode market hours; `get_clock` is authoritative.
+- Do not hardcode market hours; `get_clock` is authoritative. (Superseded below — the point
+  still holds, it just now means "authoritative source for the cache," not "call it every
+  iteration.")
 - Do not let a `numeric` money field become a Python `float` in the DB schema.
 - `dry_run` must be enforced in the transport layer, not at the call sites, or one forgotten
   call site places a real order.
+
+---
+
+## Addendum (2026-08-29): technical-analysis-only design + local caching
+
+Everything above this line describes Phase 1 exactly as it shipped, and none of it was
+wrong for the design in force at the time. Two decisions made afterward change what the
+*next* phase builds on top of this foundation — recorded here rather than by rewriting
+history above.
+
+### 1. `news` is dropped from the toolset
+
+The system no longer reads news at all — every decision comes from technical indicators on
+the underlying plus the option chain's IV vs. realized vol (see `00-MASTER.md`'s Strategy
+Matrix section). Concretely:
+
+- `ALPACA_TOOLSETS` changes from `account,trading,assets,stock-data,options-data,news` to
+  **`account,trading,assets,stock-data,options-data`**.
+- `get_news` is removed from `AlpacaMcp`'s typed convenience methods; nothing calls it.
+- **Known drift:** `config.py` shipped in Phase 1 with `alpaca_toolsets: str =
+  "account,trading,assets,options-data,stock-data,news"` as the default. That one-line
+  default needs to change as part of Phase 2 — flagged here so it is not missed, since
+  Phase 1 itself is marked complete and this doc will not be revisited otherwise.
+
+### 2. Market state moves from a live `get_clock` call to a local `market_calendar` cache
+
+The original rule ("market state comes only from `get_clock`, never hardcode a calendar")
+was aimed at one specific trap: a hardcoded holiday list that silently drifts out of date
+(`AlpacaTradingAgent`'s holiday list hardcoded through 2027). A **cache populated from the
+real API and refreshed daily** is not that trap — it is the same authoritative source, just
+not re-fetched on every single agent iteration across five agents.
+
+Revised design, to build in Phase 2:
+
+- New table `market_calendar(date primary key, open timestamptz, close timestamptz,
+  session_type text)`. `MarketPulseAgent` calls `get_calendar` once at startup for roughly a
+  1-year forward window, upserts it, and refreshes once a day (e.g. at its first tick after
+  midnight UTC).
+- Every other "is the market open right now" check becomes a local read: `now()` between
+  today's `open`/`close` in `market_calendar`, no Alpaca round-trip. `risk.py`'s market-hours
+  gate reads this table instead of calling `get_clock`.
+- `get_clock()` stays on `AlpacaMcp` (it is a real, useful tool) but is no longer called from
+  the normal per-iteration agent loops. It would still be reasonable to call it once at
+  startup to sanity-check the freshly-loaded calendar row for *today* against Alpaca's live
+  clock, but that is optional polish, not a requirement.
+- **Accepted risk, stated explicitly:** a once-daily refresh will not catch an unscheduled
+  intraday circuit-breaker halt. For a ~4.5-day hackathon run this is an acceptable trade
+  against saved API calls and Neon compute; it would need revisiting before running this
+  against a longer window or real capital.
+
+### 3. `account` becomes a second table `MarketPulseAgent` owns
+
+`MarketPulseAgent` already calls `get_account_info()`/`get_account_config()` every tick for
+`equity_curve`. Add an `account(id smallint primary key default 1, equity numeric, cash
+numeric, buying_power numeric, options_trading_level int, updated_at timestamptz)` singleton
+row, upserted from that same call — no new Alpaca traffic, since the call was already
+happening. `ExecutionAgent`'s buying-power and options-level checks in Phase 2 read this row
+locally instead of calling `get_account_info` themselves. Accepted staleness: up to ~60 s
+old, which is fine for a paper account; tighten the refresh interval before ever pointing
+this at real capital.
+
+Both new tables are specified fully in `phase-2-evidence-risk-execution.md` §2.1 (schema) —
+this addendum only records *why* they exist and what part of the already-shipped Phase 1
+code they revise.

@@ -143,3 +143,41 @@ CREATE TABLE IF NOT EXISTS iv_history (
 );
 
 CREATE INDEX IF NOT EXISTS iv_history_symbol_ts_idx ON iv_history (symbol, ts DESC);
+
+-- Local cache of Alpaca's trading calendar (2026-08-29 design change). Populated
+-- by MarketPulseAgent from get_calendar for a rolling forward window and
+-- refreshed once the window shrinks under the configured margin. Every other
+-- agent's "is the market open" check reads this table instead of calling
+-- get_clock -- accepted risk: a once-a-day refresh will not catch an
+-- unscheduled intraday circuit-breaker halt.
+CREATE TABLE IF NOT EXISTS market_calendar (
+    date          date        PRIMARY KEY,
+    open          timestamptz NOT NULL,
+    close         timestamptz NOT NULL,
+    session_type  text        NOT NULL DEFAULT 'full'
+);
+
+-- Single-row cache of account state, upserted by MarketPulseAgent on the same
+-- per-tick get_account_info/get_account_config call that already feeds
+-- equity_curve -- no extra Alpaca traffic. Other agents read this instead of
+-- calling get_account_info themselves.
+CREATE TABLE IF NOT EXISTS account (
+    id                     smallint    PRIMARY KEY DEFAULT 1,
+    equity                 numeric,
+    cash                   numeric,
+    buying_power           numeric,
+    options_trading_level  int,
+    updated_at             timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT account_singleton CHECK (id = 1)
+);
+
+-- Current-state cache of open positions, keyed by underlying symbol. Sole
+-- writer is PositionManagerAgent, piggybacked on its existing per-tick
+-- get_all_positions call. Unlike every other table in this file this one is
+-- overwritten in place rather than appended to -- it mirrors "what is open
+-- right now", not history.
+CREATE TABLE IF NOT EXISTS positions (
+    symbol      text        PRIMARY KEY,
+    payload     jsonb       NOT NULL,
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);

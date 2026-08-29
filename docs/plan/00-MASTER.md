@@ -11,8 +11,8 @@
 ## Context
 
 **Why:** LabLab.ai × Alpaca × Featherless "AI Trading Agents" hackathon. Deadline
-**4 September 2026, 15:00 UTC** (~6 days from 29 Aug). Mandatory rules (verified against
-the hackathon page and the requirement matrix in `../VibeHedge/implementation_plan.md`):
+**4 September 2026, 15:00 UTC**. Mandatory rules (verified against the hackathon page and
+the requirement matrix in `../VibeHedge/implementation_plan.md`):
 
 1. An autonomous AI trading agent.
 2. Must use Alpaca's **Trading API** *and* either its **MCP server** or **CLI**.
@@ -26,18 +26,24 @@ long-running service skeleton — independent supervised agent loops in a single
 process (`agents.py`, with per-iteration error isolation and exponential backoff), a
 FastAPI admin/health surface (`api.py`, `server.py`), a Postgres pool (`db.py`), clean
 SIGTERM handling (`lifecycle.py`), env-driven config (`config.py`), plus a multi-stage
-Dockerfile and a Render blueprint. 925 lines, strict mypy, ruff, pytest.
+Dockerfile and a Render blueprint. Phase 1 (below) is code-complete on top of that skeleton.
 
 **Target outcome:** On top of that skeleton, a **24/7 multi-agent autonomous options
-trading service** that consumes the official Alpaca MCP server in-process, reasons with
-Featherless-hosted LLMs, and exposes a live judge-facing dashboard. Deployed on Render
-with Postgres on Neon.
+trading service** that consumes the official Alpaca MCP server in-process, reasons with a
+Featherless-hosted LLM over pure technical analysis (no news), and exposes a live
+judge-facing dashboard. Deployed on Render with Postgres on Neon.
 
 **Differentiating thesis:** The reference projects are one-shot CLI runs (`TradingAgents`,
 `AlpacaTradingAgent`) or a naive `while True` daemon (`VibeHedge`). Ours is a
 *supervised, persistent, auditable service*: every autonomous decision stores its evidence
-pack, the agents' arguments, the risk-gate verdict, and the order outcome in Postgres, and
-the dashboard lets a judge replay any decision after the fact.
+pack, the LLM's regime read, the deterministic strategy-matrix verdict, the risk-gate
+verdict, and the order outcome in Postgres, and the dashboard lets a judge replay any
+decision after the fact.
+
+**Operational reality:** this run only has until the 4 Sep 15:00 UTC deadline — see
+[Operational window & wind-down](#operational-window--wind-down-45-days) below. That constraint
+shapes several design choices (IV/RV over `iv_rank`, the earnings gate, the flatten CLI), so
+read it before touching Phase 2 or 3.
 
 ### Local reference repos (read-only — never modify)
 
@@ -55,11 +61,12 @@ Three concrete things they change in the plan (already folded into the phase doc
 1. **Entrypoint** — `python -m alpaca_mcp_server.cli` does *not* work (no `__main__` guard);
    resolve the `alpaca-mcp-server` console script with `shutil.which`. See Phase 1.
 2. **Trust-boundary envelope** — every tool result is `{"_alpaca_mcp_security": {...},
-   "data": ...}`, so the client must unwrap `data` and keep the `risk` tag. News is tagged
-   `external_text` (attacker-influenceable), which is what Phase 3's prompt fence is for.
+   "data": ...}`, so the client must unwrap `data` and keep the `risk` tag. This still matters
+   even though `news` is no longer in our toolset — any future toolset addition inherits the
+   same envelope, and `get_option_chain`/`get_stock_bars` payloads are tagged `api_structured`.
 3. **`place_option_order` contract** — string-typed `qty`/`limit_price`, `time_in_force`
-   `"day"` only, ≤4 legs with `ratio_qty`, net debit positive, and errors returned as an
-   `{"error": ...}` dict rather than raised. See Phase 2.
+   `"day"` only, ≤4 legs with `ratio_qty`, net debit positive/net credit negative, and errors
+   returned as an `{"error": ...}` dict rather than raised. See Phase 2.
 
 The skills also matter for the *submission story*: our two pieces of evidence for hackathon
 rule #2 are the in-process official MCP server plus the `options-m` CLI, and the workflow
@@ -74,46 +81,184 @@ this doc). `alpaca-mcp-server` and `alpaca-skills` are first-party dependencies/
 
 ## Architecture
 
+### Design change (2026-08-29): technical analysis only, no news
+
+The original design ran a Bull/Bear/Volatility analyst crew that read news headlines
+alongside price action. That is now replaced end to end: **every decision is driven by
+deterministic technical indicators on the underlying plus the option chain's implied vol
+relative to realized vol — no news, no sentiment, no headline text anywhere in the evidence
+pack or the prompt.** Two consequences ripple through every phase doc:
+
+- `news` is dropped from `ALPACA_TOOLSETS` entirely (Phase 1), `get_news` is never called,
+  and the `untrusted_news` / prompt-injection-fence machinery that Phase 3 originally
+  specified is gone — there is no external text in the pipeline to fence.
+- The three-analyst-plus-judge crew (`crew.py`, `bull_analyst.md`, `bear_analyst.md`,
+  `volatility_analyst.md`, `portfolio_manager.md`) is replaced by a **single `StrategistAgent`**
+  that internally reads trend + volatility regime with one LLM call and then runs a
+  deterministic **Strategy Matrix** to pick the structure. See Phase 3.
+
 ### Layer 1 — Supervised loops (existing `Agent` protocol, registered in `build_agents()`)
 
 Each runs at its own cadence, isolated from the others. We deliberately **do not use
 LangGraph**: the skeleton already provides a better supervisor for a long-running service,
-and adding that dependency in a 6-day window is pure risk.
+and adding that dependency this close to the deadline is pure risk.
 
 | Agent | Cadence | LLM | Responsibility |
 | --- | --- | --- | --- |
-| `MarketPulseAgent` | 60 s | ✗ | MCP `get_clock`, `get_market_movers`, `get_most_active_stocks`, `get_news` → market context + candidate watchlist; writes `equity_curve` |
-| `StrategistAgent` | 5–15 min (only while market open) | ✓ | Gather evidence pack → run the reasoning crew → write a typed `StrategyIntent` into `proposals` |
-| `ExecutionAgent` | 30 s | ✗ | Pick up `pending` proposals → deterministic risk gates → size → MCP `place_option_order` |
-| `PositionManagerAgent` | 60 s | ✗ (optional LLM review) | Open option positions: P/L, DTE, profit-target / stop rules, `close_position` |
-| `ReflectionAgent` | hourly / after close | ✓ | Closed trades → extract a lesson → `lessons` table → injected into future prompts |
+| `MarketPulseAgent` | 60 s | ✗ | MCP `get_clock`/`get_calendar` once at startup → `market_calendar` table; `get_account_info`/`get_account_config` every tick → `account` table; writes `equity_curve` |
+| `StrategistAgent` | 5–15 min (only while market open, per local `market_calendar`) | ✓ (one call/iteration) | Filter candidates (position/proposal/earnings-blackout) → evidence pack (technical only) → LLM trend+regime+thesis read → deterministic **Strategy Matrix + Earnings Gate** → typed `StrategyIntent` into `proposals`, or `hold` |
+| `ExecutionAgent` | 30 s | ✗ | Pick up `pending` proposals → deterministic risk gates (reading `account`/`positions` locally) → size → MCP `place_option_order` → upsert `orders` |
+| `PositionManagerAgent` | 60 s | ✗ | `get_all_positions` → upsert local `positions` cache; P/L, DTE, profit-target / stop rules → `close_position` |
+| `ReflectionAgent` | hourly / after close | ✓ | Closed trades (read from local `orders`) → extract a lesson → `lessons` table → injected into the next `StrategistAgent` LLM call for that symbol |
 
-### Layer 2 — Reasoning crew (inside one `StrategistAgent` iteration)
-
-1. **Evidence pack (deterministic, no LLM):** underlying bars + indicators, option chain
-   snapshot (greeks/IV), news, current positions, past lessons. Missing data becomes an
-   explicit `NO_DATA_AVAILABLE` sentinel with an instruction forbidding estimation
-   (pattern borrowed from `TradingAgents/tradingagents/dataflows/interface.py:242`).
-2. **Bull Analyst + Bear Analyst + Volatility Analyst** — run **in parallel** via
-   `asyncio.gather`. (Running analysts sequentially is `TradingAgents`' single biggest
-   wall-clock mistake.) The volatility analyst reads IV rank / term structure / skew and
-   says which *structure* fits.
-3. **Portfolio Manager (judge, larger model)** — returns structured JSON:
-   `{action, strategy, underlying, direction, target_delta, dte_window, conviction, thesis, invalidation}`.
+`StrategistAgent` is **one agent, one process, one `step()`** — the trend read, the
+volatility-regime read, and the thesis/conviction narrative are internal sub-steps of a
+single LLM call, not separate agents or separate LLM calls. See Phase 3 for exactly how
+that call is structured and why the matrix decision itself is never delegated to the model.
 
 ### Core safety principle: the LLM never invents an option symbol
 
-The PM emits an **intent** only (direction, target delta, DTE window, structure type). A
-deterministic `strategy_builder.py` then **selects** real contracts from the live chain
-(`get_option_chain` / `get_option_contracts`) closest to the requested delta and DTE, and
-assembles the legs. This is the single biggest weakness in all three reference projects —
-`VibeHedge` hand-formats OCC symbols and falls back to a hardcoded `550.0` spot price.
+The LLM's output narrows to a *regime read* (trend direction, IV/RV classification, thesis,
+invalidation, conviction). The deterministic Strategy Matrix (Phase 3) turns that regime read
+into a `strategy` literal, and `strategy_builder.py` (Phase 2) then **selects real contracts**
+from the live chain (`get_option_chain` / `get_option_contracts`) closest to the calibrated
+delta and DTE window, and assembles the legs. This is the single biggest weakness in all
+three reference projects — `VibeHedge` hand-formats OCC symbols and falls back to a
+hardcoded `550.0` spot price.
 
-**Supported structures (all defined-risk):**
-- Long call / long put (Level 2)
-- Debit call spread / debit put spread — verticals (Level 3)
-- Covered call / cash-secured put (Level 1, when the underlying position exists)
-- Naked short legs are hard-rejected in the risk engine.
+**Supported structures (all defined-risk, all ≤4 legs):**
+
+| Structure | Legs | Requires |
+| --- | --- | --- |
+| Long call / long put | 1 | Level 2 fallback when spreads are unavailable |
+| Call debit spread / put debit spread | 2 | Level 3 |
+| Put credit spread / call credit spread | 2 | Level 3 |
+| Long strangle | 2 (both long) | Level 2 |
+| Iron condor | 4 | Level 3 |
+| Iron butterfly | 4 | Level 3 — only when IV/RV ≥ 1.40 |
+
+Every short leg's protective wing is submitted **in the same multi-leg order** — this is not
+just a risk-engine rule, it is an Alpaca API constraint: the MLeg endpoint rejects a
+multi-leg order containing a naked short leg, so `risk.py`'s "defined risk only" rule and
+Alpaca's own order validation are two independent layers catching the same mistake. See
+[Strategy matrix](#strategy-matrix-regime--priced-order) below and Phase 2/3 for the full
+mechanics (calibration table, credit/debit-specific checks, sign convention).
+
+---
+
+## Strategy matrix: regime → priced order
+
+Two deterministic reads feed a 2×3 matrix, plus one volatility-intensity override:
+
+- **Trend** (from SMA20/50, ADX, RSI14 on the underlying): yukarı (up) / yatay (flat) / aşağı
+  (down).
+- **Volatility regime** (chain IV at-the-money ÷ 20-day realized volatility): pahalı
+  (expensive, IV/RV ≥ 1.10) / ucuz (cheap, IV/RV < 1.10), with a **çok pahalı** (very
+  expensive) tier at IV/RV ≥ 1.40 that upgrades the flat/expensive cell.
+
+| | Prim pahalı (IV/RV ≥ 1.10) | Prim ucuz |
+| --- | --- | --- |
+| **Yukarı eğilimli** | Put credit spread | Call debit spread |
+| **Yatay** | Iron condor (→ **iron butterfly** if IV/RV ≥ 1.40) | Long strangle |
+| **Aşağı eğilimli** | Call credit spread | Put debit spread |
+
+The LLM produces the trend/regime *read* (with thesis and invalidation) from the evidence
+pack; the matrix lookup and the earnings-blackout gate are pure code — the model never picks
+the strategy family or negotiates a threshold. See Phase 3, "Structure gating in code, not
+prompt."
+
+**Calibration (measured against a real chain, IV 30% / RV 16%):**
+
+| Structure | Legs | Net | Max loss | Max profit | Example qty |
+| --- | --- | --- | --- | --- | --- |
+| Iron condor | 4 | +$1.51 | $349 | $151 | 5 |
+| Iron butterfly | 4 | +$7.89 | $211 | $789 | 9 |
+| Put credit spread | 2 | +$0.74 | $426 | $74 | 4 |
+| Call debit spread | 2 | −$1.84 | $184 | $316 | 10 |
+| Long strangle | 2 | −$5.27 | $527 | unlimited | 3 |
+
+(Call credit spread and put debit spread on the same chain were not repriced in this pass —
+same construction as their mirror structures above; build them the same way and confirm
+before relying on the numbers.)
+
+**Short-delta → credit/width calibration**, measured on a 38-day chain (width barely moves
+this ratio — short delta does):
+
+| Short delta | Credit / width |
+| --- | --- |
+| 0.15 | ~10% |
+| 0.20 | ~14% |
+| 0.25 | ~18% |
+| 0.30 | ~21% |
+| 0.35 | ~27% |
+
+Minimum acceptable credit/width is **12%** (not 15% — that made the 0.20-delta setup
+unreachable). To get fatter credit, raise `SHORT_DELTA`, not the wing width. See Phase 2 for
+the code home of this table.
+
+**Credit vs. debit structures check different things.** Credit structures (put/call credit
+spread, iron condor, iron butterfly): still-credit-at-worst-fill, credit ≥ 12% of width,
+IV > RV edge. Debit structures (call/put debit spread): genuinely debit, paying ≤ 45% of
+width, reward/risk ≥ 1×. Long strangle has no width concept — max loss is the premium paid.
+
+**Sign convention**, verified against real prices: Alpaca's multi-leg `limit_price` is
+positive = debit, negative = credit. `net_worst` in our own calculation is computed positive
+when we are collecting a credit, so `-net_worst` yields the correctly signed value in both
+cases (iron condor → −1.51 submitted, debit spread → +1.84 submitted).
+
+**Earnings gate:** `earnings.py` (new module, Phase 2/3) blocks any *new* structure on a
+symbol within its earnings blackout window (3 days before through 1 day after, by default) —
+selling premium into a print is the most common way a short-vol strategy blows up. Alpaca
+exposes no earnings-calendar endpoint, so this is a hand-maintained dict; see
+[Operational window & wind-down](#operational-window--wind-down-45-days) for why it is
+dormant for this specific run and must not be deleted anyway.
+
+---
+
+## Local cache: what we still fetch live vs. what we read from Postgres
+
+Per an explicit design decision: **do not hit Alpaca for everything.** Four tables move from
+"ask Alpaca live" to "read from a local cache that one agent owns and refreshes":
+
+| Table | Sole writer | Refresh | Who reads it locally | Accepted staleness risk |
+| --- | --- | --- | --- | --- |
+| `market_calendar` | `MarketPulseAgent` | Once at startup (`get_calendar`, ~1yr window), then daily | Every agent's "is the market open" check | Won't catch an unscheduled circuit-breaker halt — accepted for a run this short |
+| `account` | `MarketPulseAgent` | Every 60 s tick (piggybacked on the existing `get_account_info`/`get_account_config` call — no new Alpaca traffic) | `ExecutionAgent`'s buying-power / options-level checks | Up to ~60 s stale; fine on paper, would need tightening for real capital |
+| `positions` | `PositionManagerAgent` | Every 60 s tick (piggybacked on the existing `get_all_positions` call) | `StrategistAgent`'s "already positioned in this underlying" pre-filter | Up to ~60 s stale |
+| `orders` | `ExecutionAgent` | Upserted on submit and on every reconciliation pass | `ReflectionAgent` (never calls `get_orders` live) | None — write-through on every state change |
+
+`get_clock()` is **removed from the normal agent loop** — it was called by nearly every
+agent every iteration in the original design, and that is exactly the live-call volume this
+change eliminates. `MarketPulseAgent` is now the only agent that calls `get_calendar`, and
+every other market-open check becomes a local read against `market_calendar`. See Phase 1
+for the schema and Phase 2 for the migration path.
+
+---
+
+## Operational window & wind-down (~4.5 days)
+
+This run only executes from now through **4 September 2026, 15:00 UTC** (11:00 EDT, mid
+trading day). That is roughly 4.5 calendar days, or three-and-a-bit full trading sessions.
+Three consequences, all already folded into the phase docs:
+
+1. **The earnings gate is coded but dormant for this run.** None of the 7 non-ETF names in
+   the fixed universe report earnings before the deadline (nearest is TSLA, ~Oct 21) — see
+   `earnings.py`. Do not delete or skip implementing the gate: it is required for
+   correctness and for the submission story, it simply will not trigger this week.
+2. **IV/RV ratio, not `iv_rank`, is the primary volatility signal.** `iv_rank` needs a
+   history of chain snapshots to become meaningful (Phase 2 originally planned to let it
+   mature "within a day or two of running"); in a ~4.5-day window it never accumulates enough
+   samples to be trustworthy. The IV/RV ratio needs only the current chain snapshot plus a
+   20-day realized-vol computation from bars we already have, so it is correct from the very
+   first `StrategistAgent` iteration. Keep collecting `iv_history` anyway (it costs nothing
+   and is good submission material), but never gate a decision on `iv_rank` in this run.
+3. **A wind-down policy is required before the deadline, or the judges inherit open risk.**
+   Chosen default (no strong preference expressed): `ExecutionAgent` stops opening *new*
+   positions starting **2–3 hours before the 15:00 UTC deadline**, and every still-open
+   position is closed deterministically, **one `close_position` call per symbol**, through a
+   new, manually-triggered `options-m flatten` CLI subcommand — never an automatic unattended
+   timer, and never `close_all_positions` (permanently forbidden regardless). See Phase 4 for
+   the CLI and Phase 5 for when to actually run it.
 
 ---
 
@@ -124,22 +269,27 @@ assembles the legs. This is the single biggest weakness in all three reference p
 | File | Content |
 | --- | --- |
 | `mcp_client.py` | `AlpacaMcp` facade. `fastmcp.Client` over `StdioTransport` running `alpaca-mcp-server` as a subprocess; long-lived session, reconnect, retry, timeout. **The only module that touches Alpaca.** Refuses write tools in `dry_run` |
-| `llm.py` | Featherless client (`httpx` → `POST {base}/chat/completions`). Two tiers: `model_fast` (analysts) / `model_deep` (PM). Pydantic-validated structured output, one repair retry, then **fail-closed** (no trade) |
-| `evidence.py` | Evidence-pack collector, compact JSON serialisation, `NO_DATA` sentinels |
-| `crew.py` | Bull / Bear / Volatility / PM roles; prompts live as markdown under `prompts/` (configuration, not code) |
-| `strategy_builder.py` | `StrategyIntent` → contract selection from the live chain → `OrderPlan` (legs, qty, limit price, max loss) |
+| `earnings.py` | Hand-maintained earnings-date dict for the fixed universe + `is_earnings_blackout()`. **Done** — see Phase 2/3 |
+| `llm.py` | Featherless client (`httpx` → `POST {base}/chat/completions`). **One tier now** (`model_deep` only — there is no separate fast-tier analyst crew to serve). Pydantic-validated structured output, one repair retry, then **fail-closed** (no trade) |
+| `evidence.py` | Evidence-pack collector (technical only — no news), compact JSON serialisation, `NO_DATA` sentinels |
+| `strategist.py` (LLM read) + `matrix.py` (deterministic gate) | Trend/regime/thesis LLM call; Strategy Matrix + earnings gate lookup. See Phase 3 |
+| `strategy_builder.py` | `StrategyIntent` → contract selection from the live chain → `OrderPlan` (legs, qty, limit price, max loss) for all 9 supported structures |
 | `risk.py` | Deterministic guardrails, zero LLM |
 | `store.py` | Postgres repository layer on top of `db.py`; in-memory fallback when the DB is disabled so local dev works |
 | `schema.sql` + `migrate.py` | Table schema and an idempotent migration runner |
 | `trading/*.py` | One module per Layer-1 agent (`market_pulse.py`, `strategist.py`, `execution.py`, `position_manager.py`, `reflection.py`) |
-| `cli.py` | `options-m status \| propose --dry-run \| trade --once \| positions` — cheap, since the logic lives in the modules, and a second piece of evidence for rule #2 |
+| `cli.py` | `options-m status \| propose --dry-run \| trade --once \| positions \| flatten` — cheap, since the logic lives in the modules, and a second piece of evidence for rule #2 |
 
 ### Existing files to change
 
 - **`config.py`** — Alpaca (`ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `ALPACA_PAPER_TRADE=true`,
-  `ALPACA_TOOLSETS`), Featherless (`FEATHERLESS_API_KEY`,
-  `FEATHERLESS_BASE_URL=https://api.featherless.ai/v1`, `FEATHERLESS_MODEL_FAST/DEEP`),
-  per-agent intervals, and every risk limit. Keep the existing `Field(...)` validation style.
+  `ALPACA_TOOLSETS` **without `news`**), Featherless (`FEATHERLESS_API_KEY`,
+  `FEATHERLESS_BASE_URL=https://api.featherless.ai/v1`, `FEATHERLESS_MODEL_DEEP`),
+  per-agent intervals, every risk limit, and the wind-down cutoff. Keep the existing
+  `Field(...)` validation style. **Note:** the Phase-1 code already shipped with `news` in
+  the default `ALPACA_TOOLSETS` — that one-line default needs to be corrected as part of
+  Phase 2 (it is a real code/design drift now that this doc has been updated; flagged again
+  in Phase 1's addendum below).
 - **`agents.py`** — drop `HeartbeatAgent`; `build_agents()` constructs the five real agents
   with explicit dependencies (`AlpacaMcp`, `Llm`, `Store`, `RiskEngine`). **Do not touch
   the supervisor logic** — it is already correct.
@@ -155,10 +305,11 @@ assembles the legs. This is the single biggest weakness in all three reference p
 - Max concurrent positions; max positions per underlying
 - **Defined risk only** — reject any leg combination with unbounded loss
 - DTE window (7–45), minimum open interest / volume, max bid-ask spread %
+- **Earnings blackout** — reject a new position on a symbol inside its `earnings.py` window
 - Daily-loss halt and drawdown-from-high-water-mark halt
 - Kill switch: DB flag + `POST /admin/kill` + env; every agent checks it each iteration
-- Market-hours gate **via MCP `get_clock`** — no hardcoded calendars
-  (`AlpacaTradingAgent`'s trap #1: holiday lists hardcoded through 2027)
+- Market-hours gate **via the local `market_calendar` cache** — no per-call `get_clock`
+- Wind-down cutoff: no new positions inside the pre-deadline window (config, Phase 4)
 - Idempotency: `client_order_id = f"om-{proposal_id}"`, so one proposal can never place
   two orders (`VibeHedge` re-buys a put every 60 s while a breach persists)
 - **Never fake a fill**: a failed order is written as `orders.status='failed'` and never
@@ -167,10 +318,11 @@ assembles the legs. This is the single biggest weakness in all three reference p
 
 ### Postgres schema
 
-`agent_runs` (per-iteration telemetry), `market_snapshots`, `candidates`, `proposals`
-(evidence + each role's argument + PM verdict as JSONB), `orders` (unique
-`client_order_id`), `fills`, `positions_history`, `equity_curve`, `risk_events`,
-`lessons`, `kill_switch`.
+`agent_runs` (per-iteration telemetry), `market_snapshots`, `candidates`, `market_calendar`
+(local calendar cache, see above), `account` (local account/buying-power/options-level
+cache), `positions` (local open-positions cache), `proposals` (evidence + LLM regime read +
+matrix verdict as JSONB), `orders` (unique `client_order_id`), `fills`, `equity_curve`,
+`risk_events`, `iv_history`, `lessons`, `kill_switch`.
 
 ### Dashboard (`api.py` + `static/`)
 
@@ -179,8 +331,9 @@ A single page with no build step (server-rendered HTML + `fetch` polling on thre
 
 - Equity curve + daily P/L, open option positions (greeks, DTE, P/L)
 - Live agent status (last iteration, duration, error counter) from `agent_runs`
-- **Decision timeline**: expanding a proposal reveals the bull/bear/vol arguments, the
-  PM's JSON verdict, the selected contracts and the risk-gate result
+- **Decision timeline**: expanding a proposal reveals the evidence pack, the LLM's trend +
+  volatility-regime read with thesis and invalidation, the Strategy Matrix + earnings-gate
+  verdict, the selected real contracts, and the risk-gate result
 - Risk-event feed and a kill-switch button
 - `/api/*` JSON endpoints; `/health` and `/ready` stay exactly as they are
 
@@ -192,12 +345,15 @@ Work through them in order. Each doc carries enough context to be executed in a 
 
 | Phase | Doc | Goal | Status |
 | --- | --- | --- | --- |
-| 1 | `phase-1-foundation.md` | Dependencies, config, `mcp_client.py`, `store.py` + schema, `MarketPulseAgent` running end to end. **Deploy to Render early** + UptimeRobot pinger | ✅ **Code complete** — 86 tests, ruff + strict mypy green. Deployment steps pending (need Neon/Render/Alpaca accounts) |
-| 2 | `phase-2-evidence-risk-execution.md` | `evidence.py`, `strategy_builder.py`, `risk.py`, `ExecutionAgent` — producing real order plans from the live chain under `dry_run=true` | ⬜ Next |
-| 3 | `phase-3-llm-crew.md` | `llm.py` + `crew.py` (bull/bear/vol/PM), structured output, `StrategistAgent` wired up. First real paper options order | ⬜ |
-| 4 | `phase-4-position-reflection-dashboard.md` | `PositionManagerAgent`, `ReflectionAgent`, the dashboard | ⬜ |
-| 5 | `phase-5-tests-live-run.md` | Tests, polish, **live paper run** so real trade history accumulates for the judges | ⬜ |
+| 1 | `phase-1-foundation.md` | Dependencies, config, `mcp_client.py`, `store.py` + schema, `MarketPulseAgent` running end to end. **Deploy to Render early** + UptimeRobot pinger | ✅ **Code complete**, with one known drift to fix in Phase 2 (see that doc's addendum) — 86 tests, ruff + strict mypy green. Deployment steps pending (need Neon/Render/Alpaca accounts) |
+| 2 | `phase-2-evidence-risk-execution.md` | `evidence.py`, `earnings.py` (done), `strategy_builder.py` for all 9 structures, `risk.py`, `ExecutionAgent`, the local-cache tables and their write-owners | ⬜ Next — broken into 2.1–2.7, see the doc |
+| 3 | `phase-3-strategist-agent.md` | `llm.py` + the single `StrategistAgent` (LLM regime read → deterministic Strategy Matrix + earnings gate). First real paper options order | ⬜ |
+| 4 | `phase-4-position-reflection-dashboard.md` | `PositionManagerAgent`, `ReflectionAgent`, the dashboard, the `flatten` wind-down CLI | ⬜ |
+| 5 | `phase-5-tests-live-run.md` | Tests, polish, **live paper run** so real trade history accumulates for the judges, then wind-down | ⬜ |
 | 6 | `phase-6-submission.md` | Video, write-up, slides, metadata, deploy freeze | ⬜ |
+
+(Phase 3's file was renamed from `phase-3-llm-crew.md` to `phase-3-strategist-agent.md` to
+match the design: there is no crew anymore, one agent.)
 
 ### Blocked on operator action (not code)
 
@@ -226,25 +382,33 @@ options-m propose --dry-run --symbol SPY    # full decision chain without sendin
 
 **End-to-end (the judge scenario):**
 1. Fill `.env` with the fresh paper-account keys and start the service.
-2. Watch `MarketPulseAgent` pull candidates and `StrategistAgent` produce a proposal.
-3. Open the proposal: bull/bear/vol arguments, PM verdict, and the selected real OCC contracts.
+2. Watch `MarketPulseAgent` populate `market_calendar` and `account` once, then
+   `StrategistAgent` produce a proposal from a technical + IV/RV read.
+3. Open the proposal: the regime read (trend, IV/RV, thesis, invalidation), the matrix
+   verdict, and the selected real OCC contracts.
 4. `ExecutionAgent` submits → the position appears in the Alpaca paper account and matches
    `orders` by `client_order_id`.
 5. Hit the kill switch → agents stop producing new orders, and the event lands in `risk_events`.
 6. `PositionManagerAgent` closes a position that hit its profit target →
    `ReflectionAgent` writes the lesson into `lessons`.
+7. Near the deadline: `options-m flatten` closes every remaining open position one by one and
+   exits non-zero if any close fails, so nothing is left unaccounted for at judging time.
 
 ---
 
 ## Accepted assumptions
 
 - **Options level:** assume up to Level 3 on the paper account (options are enabled by
-  default in Alpaca paper). If it turns out to be Level 2, verticals are disabled by env
-  flag and we continue with single long calls/puts — `risk.py` keeps this configurable.
-- **Featherless models** are not hardcoded; chosen by env — roughly an 8B-class instruct
-  model for the fast tier and a 70B-class one for the deep tier.
-- **Universe** starts as liquid ETFs + mega caps (SPY, QQQ, IWM, AAPL, MSFT, NVDA, …) so
-  option chains have tight spreads.
+  default in Alpaca paper). If it turns out to be Level 2, multi-leg spreads are disabled by
+  env flag and the matrix degrades to `long_call`/`long_put` (still directional, no vol-regime
+  leg selection) plus `long_strangle` (both legs long, permitted at Level 2) — `risk.py`
+  keeps this configurable.
+- **Featherless model** is not hardcoded; chosen by env — a single deep-tier instruct model
+  (there is no separate fast-tier analyst crew to serve now that the crew is gone).
+- **Universe** is a fixed 10-symbol set: `SPY, QQQ, IWM` (ETFs, no earnings risk) plus
+  `AAPL, MSFT, GOOGL, META, AMD, TSLA, NVDA` (mega-cap single names, tracked in
+  `earnings.py`) — chosen for tight option-chain spreads and because it is exactly what
+  `earnings.py` needs to stay small enough to hand-maintain.
 
 ---
 
@@ -261,7 +425,10 @@ describes exactly the system we are building. What it changed:
   switch, so pinning it makes live unreachable.
 - **Unscoped and irreversible tools require human confirmation**, which an unattended service
   cannot provide, so `cancel_all_orders`, `close_all_positions`, `exercise_options_position`
-  and `do_not_exercise_options_position` are permanently disabled.
+  and `do_not_exercise_options_position` are permanently disabled. This is also why the
+  wind-down policy uses a manual `options-m flatten` CLI rather than an automatic timer —
+  even a scoped, allowed action (`close_position`) gets a human-triggered command instead of
+  an unattended cron near the deadline.
 - **Gate on `options_trading_level`**, the effective level, never `options_approved_level`.
 - **Closing a position is order entry** — market order, market hours, unknown fill price.
   Monitor to a terminal state rather than assuming flat (Phase 4).
@@ -307,7 +474,11 @@ Kept here so it is not lost; each phase doc repeats the parts it needs.
 - Hardcoded spot-price fallbacks (`VibeHedge/src/mcp_server/server.py:151`).
 - `auto_execute=True` as an MCP tool default (`VibeHedge/src/mcp_server/server.py:171`).
 - No idempotency / no position awareness in the daemon loop → repeated orders.
-- Hardcoded market-hours calendars instead of `get_clock`.
+- Hardcoded market-hours calendars instead of a properly refreshed local cache — the
+  difference between this project's `market_calendar` table and a hardcoded holiday list is
+  that ours is populated from `get_calendar` and refreshed daily, never typed in by hand.
 - Constructing a new broker client on every call instead of caching it.
-- Pure counter-based debate rounds with no early stop — cost scales with no benefit.
+- Pure counter-based debate rounds with no early stop — cost scales with no benefit. (Moot
+  now that there is no debate — one LLM call per `StrategistAgent` iteration — but keep this
+  in mind if a future extension ever reintroduces multi-role reasoning.)
 - Signal extraction by scanning the last 100 chars for BUY/SELL — "avoid a SELL here" parses as SELL.
