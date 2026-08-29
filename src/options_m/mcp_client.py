@@ -77,6 +77,18 @@ FORBIDDEN_TOOLS = frozenset(
 # does "paper" or "yes!". Anything outside this set is a live endpoint.
 PAPER_VALUES = frozenset({"true", "1", "yes"})
 
+# Every tool result arrives wrapped in a security envelope:
+#     {"_alpaca_mcp_security": {"trust": "untrusted_tool_output",
+#                               "risk": "api_structured" | "external_text", ...},
+#      "data": <the actual payload>}
+# The envelope is the server telling us the payload is data, not instructions.
+# We unwrap it here and keep the risk classification, which matters from phase 3
+# on: anything marked external_text is attacker-influencable prose (news
+# headlines, corporate filings) heading for an LLM prompt.
+SECURITY_KEY = "_alpaca_mcp_security"
+PAYLOAD_KEY = "data"
+RISK_EXTERNAL_TEXT = "external_text"
+
 # Corroborating signals for a paper account. Alpaca documents neither as a
 # guarantee, so they can support the startup assertion but never replace it:
 # live and paper accounts return the same response shape.
@@ -178,6 +190,8 @@ class AlpacaMcp:
         # like a paper account. Neither is treated as proof of paper.
         self._paper_corroborated: bool | None = None
         self._options_trading_level: int | None = None
+        # Risk classification reported by the server, per tool, from its last call.
+        self._tool_risk: dict[str, str] = {}
         # Serialises reconnects so a burst of failing agents cannot spawn a
         # subprocess each. Agents run concurrently; this is not theoretical.
         self._lock = asyncio.Lock()
@@ -209,6 +223,18 @@ class AlpacaMcp:
         the keys belong somewhere unexpected.
         """
         return self._paper_corroborated
+
+    def tool_risk(self, tool: str) -> str | None:
+        """Risk class the server reported for ``tool``, if it has been called.
+
+        ``external_text`` means the payload carries text we did not author and
+        cannot vouch for. Phase 3 must label it as such inside the evidence pack
+        rather than letting it read as trusted context.
+        """
+        return self._tool_risk.get(tool)
+
+    def is_external_text(self, tool: str) -> bool:
+        return self._tool_risk.get(tool) == RISK_EXTERNAL_TEXT
 
     @property
     def options_trading_level(self) -> int | None:
@@ -453,8 +479,8 @@ class AlpacaMcp:
         if isinstance(structured, dict):
             # FastMCP wraps a non-object payload under "result".
             if set(structured) == {"result"}:
-                return structured["result"]
-            return structured
+                return self._unwrap(tool, structured["result"])
+            return self._unwrap(tool, structured)
 
         blocks = getattr(result, "content", None) or []
         texts = [block.text for block in blocks if getattr(block, "text", None) is not None]
@@ -464,10 +490,30 @@ class AlpacaMcp:
 
         joined = "".join(texts)
         try:
-            return json.loads(joined)
+            decoded = json.loads(joined)
         except json.JSONDecodeError as exc:
             msg = f"tool {tool!r} returned content that is not JSON"
             raise McpProtocolError(msg) from exc
+        return self._unwrap(tool, decoded)
+
+    def _unwrap(self, tool: str, payload: Any) -> Any:
+        """Strip the server's security envelope and remember its risk class.
+
+        Raises rather than guessing when the envelope is present but malformed:
+        reading the wrapper as though it were the payload is how every field
+        silently becomes None.
+        """
+        if not isinstance(payload, dict) or SECURITY_KEY not in payload:
+            return payload
+        meta = payload.get(SECURITY_KEY)
+        if isinstance(meta, dict):
+            risk = meta.get("risk")
+            if isinstance(risk, str):
+                self._tool_risk[tool] = risk
+        if PAYLOAD_KEY not in payload:
+            msg = f"tool {tool!r} returned a security envelope with no {PAYLOAD_KEY!r} key"
+            raise McpProtocolError(msg)
+        return payload[PAYLOAD_KEY]
 
     # ---- Typed convenience methods ------------------------------------
     # Added as phases need them, so every broker interaction stays greppable.
@@ -486,14 +532,17 @@ class AlpacaMcp:
     async def get_all_positions(self) -> list[dict[str, Any]]:
         return self._expect_sequence("get_all_positions", await self.call("get_all_positions"))
 
-    async def get_market_movers(self, top: int = 10) -> dict[str, Any]:
+    async def get_market_movers(self, top: int = 25, market_type: str = "stocks") -> dict[str, Any]:
+        """Top gainers and losers. ``market_type`` is required by the tool."""
         return self._expect_mapping(
-            "get_market_movers", await self.call("get_market_movers", {"top": top})
+            "get_market_movers",
+            await self.call("get_market_movers", {"market_type": market_type, "top": top}),
         )
 
-    async def get_most_active_stocks(self, top: int = 10) -> dict[str, Any]:
+    async def get_most_active_stocks(self, top: int = 25, by: str = "volume") -> dict[str, Any]:
         return self._expect_mapping(
-            "get_most_active_stocks", await self.call("get_most_active_stocks", {"top": top})
+            "get_most_active_stocks",
+            await self.call("get_most_active_stocks", {"by": by, "top": top}),
         )
 
     async def get_news(self, symbols: tuple[str, ...] | list[str], limit: int = 20) -> Any:
@@ -509,7 +558,9 @@ class AlpacaMcp:
     @staticmethod
     def _expect_sequence(tool: str, payload: Any) -> list[dict[str, Any]]:
         if isinstance(payload, dict):
-            for key in ("positions", "data", "results"):
+            # FastMCP nests a bare list under "result"; the Alpaca tools use
+            # their own plural keys. Check every shape we have actually seen.
+            for key in ("result", "positions", "data", "results"):
                 nested = payload.get(key)
                 if isinstance(nested, list):
                     return [item for item in nested if isinstance(item, dict)]
