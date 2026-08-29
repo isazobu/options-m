@@ -16,8 +16,10 @@ import time
 from typing import Protocol, runtime_checkable
 
 from options_m.config import Settings
-from options_m.db import Database
 from options_m.lifecycle import sleep_unless_shutdown
+from options_m.mcp_client import AlpacaMcp
+from options_m.store import Store
+from options_m.trading.market_pulse import MarketPulseAgent
 
 logger = logging.getLogger(__name__)
 
@@ -34,39 +36,35 @@ class Agent(Protocol):
         """Perform a single iteration. Raising is safe; it will be retried."""
 
 
-class HeartbeatAgent:
-    """Placeholder agent that proves the loop is alive.
+def agent_interval(agent: Agent, settings: Settings) -> float:
+    """How long to wait between iterations of ``agent``.
 
-    Replace with real agents; this exists so the skeleton runs end to end.
+    Agents run at very different cadences — market telemetry every minute, an
+    LLM deliberation every several minutes — so each may expose its own
+    ``interval_seconds``. Those that do not fall back to the global default.
     """
-
-    def __init__(self, name: str = "heartbeat") -> None:
-        self._name = name
-        self._iterations = 0
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    async def step(self) -> None:
-        self._iterations += 1
-        logger.info("heartbeat", extra={"agent": self._name, "iteration": self._iterations})
+    interval = getattr(agent, "interval_seconds", None)
+    if isinstance(interval, int | float) and interval > 0:
+        return float(interval)
+    return settings.agent_interval_seconds
 
 
-def build_agents(settings: Settings, db: Database) -> list[Agent]:
+def build_agents(settings: Settings, mcp: AlpacaMcp, store: Store) -> list[Agent]:
     """Construct the agents this process should run.
 
     Register real agents here so they receive their dependencies explicitly.
     """
-    del settings, db  # Placeholder agents need neither yet.
-    return [HeartbeatAgent()]
+    return [MarketPulseAgent(settings, mcp, store)]
 
 
 async def run_agent(agent: Agent, settings: Settings, shutdown: asyncio.Event) -> None:
     """Drive one agent until shutdown, isolating and backing off on errors."""
     log = logger.getChild(agent.name)
     consecutive_failures = 0
-    log.info("agent started", extra={"agent": agent.name})
+    log.info(
+        "agent started",
+        extra={"agent": agent.name, "interval_seconds": agent_interval(agent, settings)},
+    )
 
     while not shutdown.is_set():
         started = time.monotonic()
@@ -96,7 +94,7 @@ async def run_agent(agent: Agent, settings: Settings, shutdown: asyncio.Event) -
                 )
             consecutive_failures = 0
             elapsed = time.monotonic() - started
-            delay = max(0.0, settings.agent_interval_seconds - elapsed)
+            delay = max(0.0, agent_interval(agent, settings) - elapsed)
 
         await sleep_unless_shutdown(shutdown, delay)
 

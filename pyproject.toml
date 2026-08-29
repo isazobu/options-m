@@ -14,6 +14,11 @@ dependencies = [
     "uvicorn>=0.30",
     "psycopg[binary,pool]>=3.2",
     "pydantic-settings>=2.4",
+    # Alpaca is reached only through its official MCP server, spawned as a
+    # stdio subprocess. fastmcp gives us the client half of that conversation.
+    "fastmcp>=3.1",
+    "alpaca-mcp-server>=2.3",
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -21,7 +26,6 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "pytest-cov>=5.0",
-    "httpx>=0.27",
     "ruff>=0.6",
     "mypy>=1.11",
 ]
@@ -31,6 +35,8 @@ options-m = "options_m.__main__:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/options_m"]
+# schema.sql is loaded at runtime via importlib.resources, so it must ship.
+artifacts = ["src/options_m/schema.sql"]
 
 [tool.ruff]
 line-length = 100
@@ -57,6 +63,11 @@ python_version = "3.12"
 strict = true
 warn_unreachable = true
 files = ["src", "tests"]
+
+# fastmcp is a large surface and not fully typed; keep the exemption narrow.
+[[tool.mypy.overrides]]
+module = ["fastmcp.*", "mcp.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

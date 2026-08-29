@@ -1,0 +1,519 @@
+"""Tests for the Alpaca MCP facade.
+
+These run against a real FastMCP server held in memory, so the client, the
+protocol encoding and the JSON decoding are all exercised for real — only the
+subprocess and Alpaca itself are replaced.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any
+
+import pytest
+from fastmcp import FastMCP
+from fastmcp.client import Client
+from fastmcp.exceptions import ToolError
+
+from options_m.config import Settings
+from options_m.mcp_client import (
+    FORBIDDEN_TOOLS,
+    WRITE_TOOLS,
+    AlpacaMcp,
+    DryRunViolation,
+    ForbiddenToolError,
+    LiveTradingRefused,
+    McpProtocolError,
+    McpUnavailableError,
+    assert_paper_intent,
+    finite_float,
+)
+
+
+def _settings(**overrides: Any) -> Settings:
+    base: dict[str, Any] = {
+        "alpaca_api_key": "key",
+        "alpaca_secret_key": "secret",
+        "mcp_call_timeout_seconds": 1.0,
+        "mcp_max_retries": 1,
+        "dry_run": True,
+    }
+    base.update(overrides)
+    return Settings(**base)
+
+
+def _fake_server() -> tuple[FastMCP, dict[str, int]]:
+    """A tiny MCP server plus a counter of how often each tool was called."""
+    calls: dict[str, int] = {}
+    server: FastMCP = FastMCP("fake-alpaca")
+
+    @server.tool
+    def get_clock() -> dict[str, Any]:
+        calls["get_clock"] = calls.get("get_clock", 0) + 1
+        return {"is_open": True, "next_close": "2026-08-31T20:00:00Z"}
+
+    @server.tool
+    def get_account_info() -> dict[str, Any]:
+        return {"equity": "100000.00", "cash": "100000.00", "buying_power": "200000.00"}
+
+    @server.tool
+    def get_all_positions() -> list[dict[str, Any]]:
+        return [{"symbol": "SPY"}]
+
+    @server.tool
+    def flaky() -> dict[str, Any]:
+        calls["flaky"] = calls.get("flaky", 0) + 1
+        if calls["flaky"] < 2:
+            msg = "transient"
+            raise RuntimeError(msg)
+        return {"ok": True}
+
+    @server.tool
+    def always_fails() -> dict[str, Any]:
+        calls["always_fails"] = calls.get("always_fails", 0) + 1
+        msg = "permanent"
+        raise RuntimeError(msg)
+
+    @server.tool
+    def slow() -> dict[str, Any]:
+        return {"ok": True}
+
+    @server.tool
+    def place_option_order(symbol: str) -> dict[str, Any]:
+        calls["place_option_order"] = calls.get("place_option_order", 0) + 1
+        return {"id": "should-never-happen", "symbol": symbol}
+
+    return server, calls
+
+
+async def _connected(settings: Settings, server: FastMCP) -> AlpacaMcp:
+    """An AlpacaMcp whose session points at an in-memory server."""
+    mcp = AlpacaMcp(settings)
+    client: Client[Any] = Client(server)
+    await client.__aenter__()  # type: ignore[no-untyped-call]
+    # Substituting the transport is the point: everything above it is real.
+    mcp._client = client
+    return mcp
+
+
+# ---- finite_float -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("100.5", 100.5),
+        (3, 3.0),
+        (None, None),
+        ("", None),
+        ("n/a", None),
+        (float("nan"), None),
+        (float("inf"), None),
+        (True, None),
+    ],
+)
+def test_finite_float_never_invents_a_number(value: Any, expected: float | None) -> None:
+    """An unreadable broker numeric is unavailable, never a passing 0.0."""
+    assert finite_float(value) == expected
+
+
+# ---- the dry-run guard ------------------------------------------------
+
+
+async def test_every_write_tool_is_refused_under_dry_run() -> None:
+    """The guard is in the transport, so no call site can bypass it."""
+    mcp = AlpacaMcp(_settings(dry_run=True))
+    for tool in WRITE_TOOLS - FORBIDDEN_TOOLS:
+        with pytest.raises(DryRunViolation):
+            await mcp.call(tool, {})
+
+
+async def test_dry_run_refusal_happens_before_any_transport_work() -> None:
+    """A refused write tool must not even reach the server."""
+    server, calls = _fake_server()
+    mcp = await _connected(_settings(dry_run=True), server)
+    try:
+        with pytest.raises(DryRunViolation):
+            await mcp.call("place_option_order", {"symbol": "SPY"})
+        assert "place_option_order" not in calls
+    finally:
+        await mcp.close()
+
+
+async def test_write_tool_is_allowed_when_dry_run_is_off() -> None:
+    server, calls = _fake_server()
+    mcp = await _connected(_settings(dry_run=False), server)
+    # Both gates must be open: dry run off *and* paper corroborated.
+    mcp._paper_corroborated = True
+    try:
+        result = await mcp.call("place_option_order", {"symbol": "SPY"})
+        assert result["symbol"] == "SPY"
+        assert calls["place_option_order"] == 1
+    finally:
+        await mcp.close()
+
+
+# ---- unconfigured behaviour -------------------------------------------
+
+
+async def test_missing_credentials_disable_rather_than_crash() -> None:
+    """Mirrors Database: unconfigured is a state, not a fatal error."""
+    mcp = AlpacaMcp(_settings(alpaca_api_key=None, alpaca_secret_key=None))
+    await mcp.connect()
+
+    assert mcp.is_enabled is False
+    assert mcp.is_connected is False
+    with pytest.raises(McpUnavailableError):
+        await mcp.call("get_clock")
+
+
+# ---- calls, retries, decoding -----------------------------------------
+
+
+async def test_typed_reads_decode_real_protocol_payloads() -> None:
+    server, _calls = _fake_server()
+    mcp = await _connected(_settings(), server)
+    try:
+        clock = await mcp.get_clock()
+        account = await mcp.get_account_info()
+        positions = await mcp.get_all_positions()
+    finally:
+        await mcp.close()
+
+    assert clock["is_open"] is True
+    assert finite_float(account["equity"]) == 100000.0
+    assert positions == [{"symbol": "SPY"}]
+
+
+async def test_a_transient_failure_is_retried() -> None:
+    server, calls = _fake_server()
+    mcp = await _connected(_settings(mcp_max_retries=2), server)
+    # Reconnecting would spawn a subprocess; keep the in-memory session.
+    mcp._reconnect_quietly = _noop  # type: ignore[method-assign]
+    try:
+        assert await mcp.call("flaky") == {"ok": True}
+    finally:
+        await mcp.close()
+    assert calls["flaky"] == 2
+
+
+async def test_a_permanent_failure_raises_after_exhausting_retries() -> None:
+    """Failure propagates so the supervisor backs off — it is never swallowed."""
+    server, calls = _fake_server()
+    mcp = await _connected(_settings(mcp_max_retries=1), server)
+    mcp._reconnect_quietly = _noop  # type: ignore[method-assign]
+    try:
+        with pytest.raises(Exception, match="permanent"):
+            await mcp.call("always_fails")
+    finally:
+        await mcp.close()
+    assert calls["always_fails"] == 2
+
+
+async def test_a_timeout_is_bounded_by_the_configured_limit() -> None:
+    server, _calls = _fake_server()
+    mcp = await _connected(_settings(mcp_call_timeout_seconds=0.01, mcp_max_retries=0), server)
+    mcp._reconnect_quietly = _noop  # type: ignore[method-assign]
+
+    async def _hang(*_args: Any, **_kwargs: Any) -> Any:
+        await asyncio.sleep(5)
+
+    assert mcp._client is not None
+    mcp._client.call_tool = _hang  # type: ignore[method-assign]
+    try:
+        with pytest.raises(TimeoutError):
+            await mcp.call("slow")
+    finally:
+        await mcp.close()
+
+
+# ---- decoding discipline ----------------------------------------------
+
+
+def test_unparseable_content_raises_instead_of_defaulting() -> None:
+    """A result we cannot read must never become a plausible-looking value."""
+    mcp = AlpacaMcp(_settings())
+
+    with pytest.raises(McpProtocolError):
+        mcp._as_json("get_account_info", _RawResult("not json at all"))
+    with pytest.raises(McpProtocolError):
+        mcp._as_json("get_account_info", _RawResult(None))
+
+
+def test_a_wrongly_shaped_payload_raises() -> None:
+    mcp = AlpacaMcp(_settings())
+
+    with pytest.raises(McpProtocolError):
+        mcp._expect_mapping("get_clock", ["not", "an", "object"])
+    with pytest.raises(McpProtocolError):
+        mcp._expect_sequence("get_all_positions", "not a list")
+
+
+class _RawResult:
+    """Stand-in for a CallToolResult carrying one text block."""
+
+    structured_content = None
+
+    def __init__(self, text: str | None) -> None:
+        self.content = [_Block(text)] if text is not None else []
+
+
+class _Block:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+async def _noop() -> None:
+    return None
+
+
+# ---- paper-mode enforcement -------------------------------------------
+#
+# Alpaca's own paper-trading skill requires unattended automation to assert
+# paper at startup and exit if it cannot, because a live account returns the
+# same response shape as a paper one — nothing later in the run would catch it.
+
+
+@pytest.mark.parametrize("value", ["true", "TRUE", "1", "yes", "Yes"])
+def test_accepted_paper_values_pass_the_gate(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("ALPACA_PAPER_TRADE", value)
+    assert_paper_intent()
+
+
+def test_an_absent_flag_passes_because_the_server_defaults_to_paper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ALPACA_PAPER_TRADE", raising=False)
+    assert_paper_intent()
+
+
+@pytest.mark.parametrize("value", ["false", "0", "no", "paper", "true ", "yes!", ""])
+def test_anything_else_selects_live_and_is_refused(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """The server does not strip or interpret; only true/1/yes mean paper."""
+    monkeypatch.setenv("ALPACA_PAPER_TRADE", value)
+    with pytest.raises(LiveTradingRefused):
+        assert_paper_intent()
+
+
+async def test_connect_refuses_a_live_selecting_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ALPACA_PAPER_TRADE", "false")
+    with pytest.raises(LiveTradingRefused):
+        await AlpacaMcp(_settings()).connect()
+
+
+async def test_connect_refuses_when_configured_away_from_paper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ALPACA_PAPER_TRADE", raising=False)
+    with pytest.raises(LiveTradingRefused):
+        await AlpacaMcp(_settings(alpaca_paper_trade=False)).connect()
+
+
+def test_the_subprocess_always_receives_paper_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Paper is pinned as a literal, so configuration cannot select live."""
+    monkeypatch.delenv("ALPACA_PAPER_TRADE", raising=False)
+    mcp = AlpacaMcp(_settings())
+
+    transport = mcp._build_transport()
+
+    assert transport.env is not None
+    assert transport.env["ALPACA_PAPER_TRADE"] == "true"
+    # The parent environment is inherited, not replaced: a bare env dict breaks
+    # subprocess spawn on Windows and strips PATH in the image.
+    assert "PATH" in {key.upper(): key for key in transport.env}
+
+
+async def test_write_tools_are_blocked_while_paper_is_uncorroborated() -> None:
+    """Unproven reads as live, so a write must not go out."""
+    server, calls = _fake_server()
+    mcp = await _connected(_settings(dry_run=False), server)
+    mcp._paper_corroborated = None
+    try:
+        with pytest.raises(LiveTradingRefused):
+            await mcp.call("place_option_order", {"symbol": "SPY"})
+        assert "place_option_order" not in calls
+    finally:
+        await mcp.close()
+
+
+async def test_an_account_that_is_not_paper_blocks_writes() -> None:
+    server, _calls = _fake_server()
+    mcp = await _connected(_settings(dry_run=False), server)
+    mcp._paper_corroborated = False
+    try:
+        with pytest.raises(LiveTradingRefused):
+            await mcp.call("place_option_order", {"symbol": "SPY"})
+    finally:
+        await mcp.close()
+
+
+async def test_reads_are_unaffected_by_the_paper_gate() -> None:
+    """Blocking every call would make the service blind rather than safe."""
+    server, _calls = _fake_server()
+    mcp = await _connected(_settings(dry_run=False), server)
+    mcp._paper_corroborated = None
+    try:
+        assert (await mcp.get_clock())["is_open"] is True
+    finally:
+        await mcp.close()
+
+
+@pytest.mark.parametrize(
+    ("account", "expected"),
+    [
+        ({"account_number": "PA3ABCDEF", "status": "ACTIVE"}, True),
+        ({"account_number": "123456789", "status": "PAPER_ONLY"}, True),
+        ({"account_number": "123456789", "status": "ACTIVE"}, False),
+        ({}, False),
+    ],
+)
+async def test_paper_corroboration_reads_the_documented_signals(
+    account: dict[str, Any], expected: bool
+) -> None:
+    mcp = AlpacaMcp(_settings())
+
+    async def _account() -> dict[str, Any]:
+        return account
+
+    mcp.get_account_info = _account  # type: ignore[method-assign]
+    await mcp._corroborate_paper_account()
+
+    assert mcp.paper_corroborated is expected
+
+
+async def test_a_failed_account_read_leaves_paper_unknown_rather_than_true() -> None:
+    """A broker outage at boot must not crash-loop, nor imply paper."""
+    mcp = AlpacaMcp(_settings())
+
+    async def _boom() -> dict[str, Any]:
+        msg = "broker down"
+        raise RuntimeError(msg)
+
+    mcp.get_account_info = _boom  # type: ignore[method-assign]
+    await mcp._corroborate_paper_account()
+
+    assert mcp.paper_corroborated is None
+
+
+async def test_the_effective_options_level_is_captured() -> None:
+    """Gate on options_trading_level, not options_approved_level."""
+    mcp = AlpacaMcp(_settings())
+
+    async def _account() -> dict[str, Any]:
+        return {
+            "account_number": "PA1",
+            "options_approved_level": 3,
+            "options_trading_level": 2,
+        }
+
+    mcp.get_account_info = _account  # type: ignore[method-assign]
+    await mcp._corroborate_paper_account()
+
+    assert mcp.options_trading_level == 2
+
+
+# ---- permanently disabled tools ---------------------------------------
+
+
+async def test_unscoped_and_irreversible_tools_are_always_refused() -> None:
+    """No dry-run or paper state re-enables these; there is nobody to confirm."""
+    server, calls = _fake_server()
+    mcp = await _connected(_settings(dry_run=False), server)
+    mcp._paper_corroborated = True
+    try:
+        for tool in FORBIDDEN_TOOLS:
+            with pytest.raises(ForbiddenToolError):
+                await mcp.call(tool, {})
+    finally:
+        await mcp.close()
+    assert calls == {}
+
+
+def test_scoped_exits_stay_available() -> None:
+    """close_position is how positions close; disabling it would strand them."""
+    assert "close_position" not in FORBIDDEN_TOOLS
+    assert "close_position" in WRITE_TOOLS
+
+
+# ---- regressions ------------------------------------------------------
+
+
+async def test_corroboration_does_not_run_under_the_connect_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: this deadlocked the boot path.
+
+    Corroboration issues a tool call, and a failing tool call reconnects, which
+    needs the same lock. ``asyncio.Lock`` is not reentrant, so running it inside
+    the lock hung the process at startup whenever the account read failed —
+    precisely the broker-outage case it was meant to survive.
+    """
+    monkeypatch.setenv("ALPACA_PAPER_TRADE", "true")
+    mcp = AlpacaMcp(_settings())
+    observed: dict[str, bool] = {}
+
+    async def _skip_transport() -> None:
+        return None
+
+    async def _account() -> dict[str, Any]:
+        observed["locked"] = mcp._lock.locked()
+        msg = "broker down"
+        raise RuntimeError(msg)
+
+    mcp._connect_locked = _skip_transport  # type: ignore[method-assign]
+    mcp.get_account_info = _account  # type: ignore[method-assign]
+
+    await asyncio.wait_for(mcp.connect(), timeout=2)
+
+    assert observed["locked"] is False
+    assert mcp.paper_corroborated is None
+
+
+async def test_a_tool_error_does_not_respawn_the_server() -> None:
+    """The server answered; only transport failures justify a new subprocess."""
+    server, calls = _fake_server()
+    mcp = await _connected(_settings(mcp_max_retries=1), server)
+    reconnects: list[int] = []
+
+    async def _count() -> None:
+        reconnects.append(1)
+
+    mcp._reconnect_quietly = _count  # type: ignore[method-assign]
+    try:
+        with pytest.raises(ToolError):
+            await mcp.call("always_fails")
+    finally:
+        await mcp.close()
+
+    assert reconnects == []
+    assert calls["always_fails"] == 2
+
+
+async def test_a_transport_failure_does_respawn_the_server() -> None:
+    server, _calls = _fake_server()
+    mcp = await _connected(_settings(mcp_max_retries=1), server)
+    reconnects: list[int] = []
+
+    async def _count() -> None:
+        reconnects.append(1)
+
+    async def _broken_pipe(*_args: Any, **_kwargs: Any) -> Any:
+        msg = "broken pipe"
+        raise ConnectionResetError(msg)
+
+    mcp._reconnect_quietly = _count  # type: ignore[method-assign]
+    assert mcp._client is not None
+    mcp._client.call_tool = _broken_pipe  # type: ignore[method-assign]
+    try:
+        with pytest.raises(ConnectionResetError):
+            await mcp.call("get_clock")
+    finally:
+        await mcp.close()
+
+    assert len(reconnects) == 2

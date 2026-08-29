@@ -48,5 +48,40 @@ class Settings(BaseSettings):
     agent_error_backoff_seconds: float = Field(default=5.0, gt=0)
     agent_max_backoff_seconds: float = Field(default=300.0, gt=0)
 
+    # Per-agent cadence. Agents that expose `interval_seconds` use their own
+    # value; everything else falls back to agent_interval_seconds above.
+    market_pulse_interval_seconds: float = Field(default=60.0, gt=0)
+
+    # Alpaca, reached only through its official MCP server (spawned as a stdio
+    # subprocess). Unset keys mean "run without a broker session", mirroring
+    # how DATABASE_URL being unset means "run without a database".
+    alpaca_api_key: str | None = None
+    alpaca_secret_key: str | None = None
+    # Paper-only by design, and not really a knob: the MCP transport pins
+    # ALPACA_PAPER_TRADE="true" for the server regardless, and setting this
+    # False makes startup fail rather than arming live trading.
+    alpaca_paper_trade: bool = True
+    alpaca_toolsets: str = "account,trading,assets,options-data,stock-data,news"
+    mcp_call_timeout_seconds: float = Field(default=30.0, gt=0)
+    mcp_max_retries: int = Field(default=2, ge=0)
+
+    # Trading universe and safety switches.
+    universe: str = "SPY,QQQ,IWM,AAPL,MSFT,NVDA,AMD,TSLA,META,GOOGL"
+    # While true, no write tool can reach Alpaca. Enforced in the MCP
+    # transport, not at call sites, so one forgotten call site cannot trade.
+    dry_run: bool = True
+    # Env-level halt. The kill_switch table is checked in addition to this.
+    kill_switch: bool = False
+
     # How long to let in-flight work finish after SIGTERM.
     shutdown_grace_seconds: float = Field(default=20.0, gt=0)
+
+    @property
+    def universe_symbols(self) -> tuple[str, ...]:
+        """The configured universe as de-duplicated uppercase symbols."""
+        seen: dict[str, None] = {}
+        for raw in self.universe.split(","):
+            symbol = raw.strip().upper()
+            if symbol:
+                seen[symbol] = None
+        return tuple(seen)

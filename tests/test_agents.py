@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from options_m.agents import run_agent, run_agents
+from options_m.agents import agent_interval, run_agent, run_agents
 from options_m.config import Settings
 
 
@@ -80,3 +80,33 @@ async def test_run_agents_waits_when_none_registered() -> None:
 
     shutdown.set()
     await asyncio.wait_for(task, timeout=1)
+
+
+class _PacedAgent(_CountingAgent):
+    """Agent that overrides the global cadence with its own."""
+
+    @property
+    def interval_seconds(self) -> float:
+        return 0.5
+
+
+def test_agent_without_an_interval_uses_the_global_default() -> None:
+    assert agent_interval(_CountingAgent(), _settings()) == 0.01
+
+
+def test_an_agent_may_set_its_own_cadence() -> None:
+    assert agent_interval(_PacedAgent(), _settings()) == 0.5
+
+
+async def test_a_slow_agent_does_not_starve_a_fast_sibling() -> None:
+    """Each loop paces itself; one agent's cadence never gates another's."""
+    fast = _CountingAgent("fast")
+    slow = _PacedAgent("slow")
+    shutdown = asyncio.Event()
+    task = asyncio.create_task(run_agents([fast, slow], _settings(), shutdown))
+
+    await asyncio.sleep(0.15)
+    shutdown.set()
+    await asyncio.wait_for(task, timeout=2)
+
+    assert fast.calls > slow.calls
