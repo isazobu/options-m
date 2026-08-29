@@ -94,3 +94,121 @@ async def test_agent_runs_endpoint_is_empty_without_history(client: httpx.AsyncC
 
     assert response.status_code == 200
     assert response.json() == {"runs": []}
+
+
+# ---- dashboard API: positions/portfolio/proposals/risk-events -----------
+
+
+async def test_positions_renders_without_a_broker(client: httpx.AsyncClient) -> None:
+    """Same honesty rule as /api/status: no broker, no fabricated rows."""
+    response = await client.get("/api/positions")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["positions"] == []
+    assert body["broker"]["enabled"] is False
+
+
+async def test_portfolio_renders_without_a_broker(client: httpx.AsyncClient) -> None:
+    response = await client.get("/api/portfolio")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["account"] is None
+    assert body["portfolio_history"] is None
+    assert body["equity_curve_tail"] == []
+
+
+async def test_proposals_list_is_empty_without_history(client: httpx.AsyncClient) -> None:
+    response = await client.get("/api/proposals")
+
+    assert response.status_code == 200
+    assert response.json() == {"proposals": []}
+
+
+async def test_proposal_detail_reports_the_full_row_and_its_orders() -> None:
+    db = Database(Settings(database_url=None))
+    store = Store(db)
+    app = create_app(db, [], mcp=None, store=store)
+    proposal_id = await store.save_proposal(
+        underlying="SPY", intent={"direction": "long"}, evidence={}
+    )
+    await store.record_order(
+        proposal_id=proposal_id, client_order_id="om-1", status="submitted", request={}
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(f"/api/proposals/{proposal_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["proposal"]["underlying"] == "SPY"
+    assert body["orders"][0]["client_order_id"] == "om-1"
+
+
+async def test_proposal_detail_404s_for_an_unknown_id(client: httpx.AsyncClient) -> None:
+    response = await client.get("/api/proposals/999999")
+
+    assert response.status_code == 404
+
+
+async def test_risk_events_endpoint_is_empty_without_history(client: httpx.AsyncClient) -> None:
+    response = await client.get("/api/risk-events")
+
+    assert response.status_code == 200
+    assert response.json() == {"risk_events": []}
+
+
+# ---- dashboard API: auth and CORS ----------------------------------------
+
+
+async def test_dashboard_routes_are_open_when_no_admin_token_is_configured(
+    client: httpx.AsyncClient,
+) -> None:
+    """Unset ADMIN_TOKEN means local/dev use needs no setup."""
+    response = await client.get("/api/positions")
+
+    assert response.status_code == 200
+
+
+async def test_dashboard_routes_require_the_bearer_token_when_configured() -> None:
+    db = Database(Settings(database_url=None))
+    settings = Settings(admin_token="secret")  # noqa: S106 - test fixture, not a real credential
+    app = create_app(db, [], mcp=None, store=Store(db), settings=settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        unauthenticated = await client.get("/api/positions")
+        wrong_token = await client.get(
+            "/api/positions", headers={"Authorization": "Bearer nope"}
+        )
+        right_token = await client.get(
+            "/api/positions", headers={"Authorization": "Bearer secret"}
+        )
+
+    assert unauthenticated.status_code == 401
+    assert wrong_token.status_code == 401
+    assert right_token.status_code == 200
+
+
+async def test_the_pre_existing_status_route_stays_unauthenticated_even_with_a_token() -> None:
+    """The original /api/status contract must not change under this work."""
+    db = Database(Settings(database_url=None))
+    settings = Settings(admin_token="secret")  # noqa: S106 - test fixture, not a real credential
+    app = create_app(db, [], mcp=None, store=Store(db), settings=settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/status")
+
+    assert response.status_code == 200
+
+
+# ---- dashboard API: chat --------------------------------------------------
+
+
+async def test_chat_reports_when_the_llm_is_not_configured(client: httpx.AsyncClient) -> None:
+    """Featherless credentials are unset in the test fixture on purpose."""
+    response = await client.post("/api/chat", json={"question": "what's my equity?"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "llm_unconfigured" in body["warnings"]

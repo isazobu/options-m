@@ -150,6 +150,17 @@ def assert_paper_intent() -> None:
     raise LiveTradingRefused(msg)
 
 
+def _looks_like_not_found(message: str) -> bool:
+    """Whether a ToolError plainly means "no such position/order".
+
+    Deliberately conservative: only a matched substring reads as "not found".
+    Anything else propagates, which is the safe-by-construction direction to
+    be wrong in — a real outage can never be misread as flat.
+    """
+    lowered = message.lower()
+    return any(phrase in lowered for phrase in ("does not exist", "not found"))
+
+
 def finite_float(value: object) -> float | None:
     """Coerce a broker numeric to a float, or ``None`` when unusable.
 
@@ -529,6 +540,26 @@ class AlpacaMcp:
         """Account configuration, including the options trading level."""
         return self._expect_mapping("get_account_config", await self.call("get_account_config"))
 
+    async def get_portfolio_history(
+        self,
+        *,
+        period: str = "1M",
+        timeframe: str | None = None,
+        extended_hours: bool = False,
+    ) -> dict[str, Any]:
+        """Account equity/P&L over time, straight from Alpaca.
+
+        The source for the dashboard's headline equity curve — distinct from
+        our own ``equity_curve`` table, which only holds what our polling has
+        actually observed since this process started.
+        """
+        args: dict[str, Any] = {"period": period, "extended_hours": extended_hours}
+        if timeframe is not None:
+            args["timeframe"] = timeframe
+        return self._expect_mapping(
+            "get_portfolio_history", await self.call("get_portfolio_history", args)
+        )
+
     async def get_all_positions(self) -> list[dict[str, Any]]:
         return self._expect_sequence("get_all_positions", await self.call("get_all_positions"))
 
@@ -547,6 +578,221 @@ class AlpacaMcp:
 
     async def get_news(self, symbols: tuple[str, ...] | list[str], limit: int = 20) -> Any:
         return await self.call("get_news", {"symbols": ",".join(symbols), "limit": limit})
+
+    async def get_stock_bars(
+        self, symbol: str, *, timeframe: str = "1Day", limit: int = 60
+    ) -> list[dict[str, Any]]:
+        """Daily bars for one symbol, for indicator computation in evidence.py.
+
+        The tool takes a comma-separated ``symbols`` string (plural) and a
+        relative ``days`` lookback rather than an absolute date range; ``days``
+        is padded well past ``limit`` calendar days so weekends and holidays
+        never starve the requested number of trading-day bars.
+        """
+        payload = self._expect_mapping(
+            "get_stock_bars",
+            await self.call(
+                "get_stock_bars",
+                {
+                    "symbols": symbol,
+                    "timeframe": timeframe,
+                    "days": limit * 2 + 10,
+                    "limit": limit,
+                },
+            ),
+        )
+        bars = payload.get("bars")
+        if not isinstance(bars, dict):
+            msg = f"tool 'get_stock_bars' returned no 'bars' object for {symbol!r}"
+            raise McpProtocolError(msg)
+        symbol_bars = bars.get(symbol)
+        if symbol_bars is None:
+            return []
+        return self._expect_sequence("get_stock_bars", symbol_bars)
+
+    async def get_stock_snapshot(self, symbol: str) -> dict[str, Any]:
+        """Latest trade/quote/daily bar for one symbol.
+
+        The tool answers with ``{symbol: {...}}`` even for a single symbol —
+        unwrap it here so callers see the snapshot object directly.
+        """
+        payload = self._expect_mapping(
+            "get_stock_snapshot", await self.call("get_stock_snapshot", {"symbols": symbol})
+        )
+        snapshot = payload.get(symbol)
+        return self._expect_mapping("get_stock_snapshot", snapshot) if snapshot is not None else {}
+
+    async def get_option_contracts(
+        self,
+        symbol: str,
+        *,
+        expiration_date_gte: str,
+        expiration_date_lte: str,
+        option_type: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Contract metadata (strike, expiry, type, open interest) — no quotes.
+
+        ``expiration_date_lte`` defaults to "next weekend" server-side when
+        omitted, so callers must always pass both bounds explicitly to get a
+        real DTE window rather than silently only next week's contracts.
+        """
+        args: dict[str, Any] = {
+            "underlying_symbols": symbol,
+            "expiration_date_gte": expiration_date_gte,
+            "expiration_date_lte": expiration_date_lte,
+            "status": "active",
+            "limit": limit,
+        }
+        if option_type is not None:
+            args["type"] = option_type
+        payload = self._expect_mapping(
+            "get_option_contracts", await self.call("get_option_contracts", args)
+        )
+        return self._expect_sequence("get_option_contracts", payload.get("option_contracts"))
+
+    async def get_option_chain(
+        self,
+        symbol: str,
+        *,
+        expiration_date_gte: str | None = None,
+        expiration_date_lte: str | None = None,
+        option_type: str | None = None,
+        limit: int = 1000,
+    ) -> dict[str, dict[str, Any]]:
+        """Live quotes/greeks/IV, keyed by OCC symbol.
+
+        Carries no strike/expiry/open-interest — join on the OCC symbol key
+        against :meth:`get_option_contracts` for those. Returns the raw
+        ``snapshots`` mapping; per-contract normalization is
+        ``strategy_builder``'s job, not this method's.
+        """
+        args: dict[str, Any] = {"underlying_symbol": symbol, "limit": limit}
+        if expiration_date_gte:
+            args["expiration_date_gte"] = expiration_date_gte
+        if expiration_date_lte:
+            args["expiration_date_lte"] = expiration_date_lte
+        if option_type:
+            args["type"] = option_type
+        result = await self.call("get_option_chain", args)
+        payload = self._expect_mapping("get_option_chain", result)
+        snapshots = payload.get("snapshots")
+        if not isinstance(snapshots, dict):
+            msg = "tool 'get_option_chain' returned no 'snapshots' object"
+            raise McpProtocolError(msg)
+        return {key: value for key, value in snapshots.items() if isinstance(value, dict)}
+
+    async def get_option_snapshot(self, symbols: str | list[str]) -> dict[str, dict[str, Any]]:
+        """Greeks/IV/latest quote for one or more OCC option symbols, keyed by symbol.
+
+        Callers here typically want several open contracts at once (one row
+        per position), unlike :meth:`get_stock_snapshot` which is always
+        called with a single symbol and unwraps to one object.
+        """
+        joined = symbols if isinstance(symbols, str) else ",".join(symbols)
+        payload = self._expect_mapping(
+            "get_option_snapshot", await self.call("get_option_snapshot", {"symbols": joined})
+        )
+        # The wrapper key name is inferred by analogy to get_option_chain's
+        # "snapshots" key; fall back to the bare payload if it is absent so an
+        # unexpected-but-still-a-mapping shape does not raise for nothing.
+        snapshots = payload.get("snapshots", payload)
+        if not isinstance(snapshots, dict):
+            msg = "tool 'get_option_snapshot' returned no snapshots object"
+            raise McpProtocolError(msg)
+        return {key: value for key, value in snapshots.items() if isinstance(value, dict)}
+
+    async def get_open_position(self, symbol: str) -> dict[str, Any] | None:
+        """The strict path: a genuine "no position" is ``None``; an outage raises.
+
+        Only a message that plainly says the position does not exist may read
+        as flat. Anything else — a timeout, an auth failure, an unfamiliar
+        shape — propagates, because a broker outage must never look like flat.
+        """
+        try:
+            payload = await self.call("get_open_position", {"symbol_or_asset_id": symbol})
+        except ToolError as exc:
+            if _looks_like_not_found(str(exc)):
+                return None
+            raise
+        return self._expect_mapping("get_open_position", payload)
+
+    async def get_order_by_client_id(self, client_order_id: str) -> dict[str, Any] | None:
+        """The documented recovery for an ambiguous submission.
+
+        ``None`` only for a genuine "no such order" — see
+        :meth:`get_open_position` for why every other failure propagates.
+        """
+        try:
+            payload = await self.call(
+                "get_order_by_client_id", {"client_order_id": client_order_id}
+            )
+        except ToolError as exc:
+            if _looks_like_not_found(str(exc)):
+                return None
+            raise
+        return self._expect_mapping("get_order_by_client_id", payload)
+
+    async def close_position(
+        self, symbol: str, *, qty: str | None = None, percentage: str | None = None
+    ) -> dict[str, Any]:
+        """Typed wrapper for the already-whitelisted write tool.
+
+        Unused by this phase's ExecutionAgent (which only opens); added now,
+        while the pattern is fresh, for Phase 4's position manager.
+        """
+        args: dict[str, Any] = {"symbol_or_asset_id": symbol}
+        if qty is not None:
+            args["qty"] = qty
+        if percentage is not None:
+            args["percentage"] = percentage
+        return self._expect_mapping("close_position", await self.call("close_position", args))
+
+    async def place_option_order(
+        self,
+        *,
+        qty: str,
+        limit_price: str,
+        client_order_id: str,
+        time_in_force: str = "day",
+        order_type: str = "limit",
+        symbol: str | None = None,
+        side: str | None = None,
+        position_intent: str | None = None,
+        legs: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Place an options order. Built from the tool's own schema, never the
+        REST schema — the override reshapes the body and rejects extra fields.
+
+        Every numeric argument here must already be a string, built from
+        ``Decimal`` by the caller, never from a Python float repr.
+
+        Returns the unwrapped payload as-is, *including* a possible
+        ``{"error": ...}`` dict: the override validates locally and returns an
+        error object rather than raising, so callers must check for an
+        ``"error"`` key themselves — a returned dict is not proof of a
+        submitted order.
+        """
+        args: dict[str, Any] = {
+            "qty": qty,
+            "type": order_type,
+            "time_in_force": time_in_force,
+            "limit_price": limit_price,
+            "client_order_id": client_order_id,
+        }
+        if legs is not None:
+            args["legs"] = legs
+        else:
+            if symbol is None or side is None:
+                msg = "single-leg place_option_order requires symbol and side"
+                raise ValueError(msg)
+            args["symbol"] = symbol
+            args["side"] = side
+        if position_intent is not None:
+            args["position_intent"] = position_intent
+        return self._expect_mapping(
+            "place_option_order", await self.call("place_option_order", args)
+        )
 
     @staticmethod
     def _expect_mapping(tool: str, payload: Any) -> dict[str, Any]:
