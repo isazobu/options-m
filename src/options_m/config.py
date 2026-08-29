@@ -73,6 +73,10 @@ class Settings(BaseSettings):
     # every agent iteration across every agent.
     market_calendar_horizon_days: int = Field(default=400, gt=0)
     market_calendar_refresh_margin_days: int = Field(default=30, gt=0)
+    # How far back the cached window reaches. A cache that begins at today
+    # holds no session at all over a weekend, so "when did the market last
+    # trade" has no answer — which is exactly what replay_last_session needs.
+    market_calendar_lookback_days: int = Field(default=7, gt=0)
 
     # Trading universe and safety switches.
     universe: str = "SPY,QQQ,IWM,AAPL,MSFT,NVDA,AMD,TSLA,META,GOOGL"
@@ -81,6 +85,13 @@ class Settings(BaseSettings):
     dry_run: bool = True
     # Env-level halt. The kill_switch table is checked in addition to this.
     kill_switch: bool = False
+    # Testing only. Out of hours every agent short-circuits at its first
+    # market-open check, so the autonomous chain can never be exercised on a
+    # weekend or overnight. This replays the most recent *real* session from
+    # the market_calendar cache instead — it cannot invent one. The evidence it
+    # then reasons over is by construction last session's, so startup refuses
+    # to run it with dry_run disabled. See session.py.
+    replay_last_session: bool = False
 
     # How long to let in-flight work finish after SIGTERM.
     shutdown_grace_seconds: float = Field(default=20.0, gt=0)

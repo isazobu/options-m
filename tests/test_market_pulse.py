@@ -18,7 +18,7 @@ assertion.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -294,6 +294,55 @@ async def test_calendar_is_fetched_once_then_reused_within_the_margin() -> None:
     mcp = _FakeMcp()
     agent, _ = _agent(mcp)
 
+    await agent.step()
+    await agent.step()
+
+    assert mcp.called.count("get_calendar") == 1
+
+
+async def test_the_calendar_window_reaches_back_past_today() -> None:
+    """A window starting at today holds no session at all over a weekend."""
+    mcp = _FakeMcp()
+    requested: list[tuple[str, str]] = []
+    original = mcp.get_calendar
+
+    async def _capture(start: str, end: str) -> list[dict[str, Any]]:
+        requested.append((start, end))
+        return await original(start, end)
+
+    mcp.get_calendar = _capture  # type: ignore[method-assign]
+    agent, _ = _agent(mcp, market_calendar_lookback_days=7)
+
+    await agent.step()
+
+    start, _end = requested[0]
+    today = datetime.now(UTC).astimezone(_EXCHANGE_TZ).date()
+    assert date.fromisoformat(start) == today - timedelta(days=7)
+
+
+async def test_a_forward_only_cache_is_backfilled_but_only_once() -> None:
+    """An older build's cache starts at today; healing it must not loop.
+
+    The broker here returns nothing at or before today, so coverage can never
+    be satisfied by the data itself — exactly the case that would otherwise
+    refetch the calendar on every single tick.
+    """
+    mcp = _FakeMcp(is_open=False)
+    agent, store = _agent(mcp)
+    today = datetime.now(UTC).astimezone(_EXCHANGE_TZ).date()
+    await store.upsert_market_calendar(
+        [
+            {
+                "date": today + timedelta(days=offset),
+                "open": datetime.now(UTC) + timedelta(days=offset),
+                "close": datetime.now(UTC) + timedelta(days=offset, hours=6),
+                "session_type": "full",
+            }
+            for offset in (1, 200)
+        ]
+    )
+
+    await agent.step()
     await agent.step()
     await agent.step()
 

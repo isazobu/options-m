@@ -33,6 +33,7 @@ from datetime import time as _time
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from options_m import session
 from options_m.config import Settings
 from options_m.earnings import is_earnings_blackout
 from options_m.evidence.evidence import EvidenceCollector
@@ -58,6 +59,9 @@ class MarketPulseAgent:
         self._store = store
         self._universe = settings.universe_symbols
         self._evidence = EvidenceCollector(settings, mcp, store)
+        # Set once the calendar has been fetched with the backward window; see
+        # _ensure_calendar_fresh.
+        self._backfilled = False
 
     @property
     def name(self) -> str:
@@ -92,7 +96,8 @@ class MarketPulseAgent:
         calendar_refreshed = await self._ensure_calendar_fresh()
 
         now = datetime.now(UTC)
-        is_open = await self._store.market_is_open(now)
+        state = await session.current(self._store, self._settings, now)
+        is_open = state.is_open
 
         account = await self._mcp.get_account_info()
         account_config = await self._mcp.get_account_config()
@@ -121,6 +126,7 @@ class MarketPulseAgent:
 
         detail: dict[str, Any] = {
             "market_open": is_open,
+            "session_replayed": state.replayed,
             "calendar_refreshed": calendar_refreshed,
             "positions": positions_count,
             "equity": equity,
@@ -192,21 +198,40 @@ class MarketPulseAgent:
         return detail
 
     async def _ensure_calendar_fresh(self) -> bool:
-        """Populate or extend the local market_calendar cache."""
+        """Populate or extend the local market_calendar cache.
+
+        The window reaches backwards as well as forwards. The forward half is
+        what every market-open check reads; the backward half exists because a
+        cache that starts at today holds no session at all on a weekend, which
+        leaves "when did the market last trade" unanswerable — the question
+        REPLAY_LAST_SESSION asks, and a useful one for any later look-back.
+        """
         today = datetime.now(UTC).astimezone(_EXCHANGE_TZ).date()
+        start = today - timedelta(days=self._settings.market_calendar_lookback_days)
+        end = today + timedelta(days=self._settings.market_calendar_horizon_days)
+
         max_date = await self._store.calendar_max_date()
+        min_date = await self._store.calendar_min_date()
         margin = timedelta(days=self._settings.market_calendar_refresh_margin_days)
-        if max_date is not None and max_date - today > margin:
+        forward_covered = max_date is not None and max_date - today > margin
+        # A cache written by a forward-only build covers the future but starts
+        # at today, so it holds no past session; refetching heals it. The
+        # coverage test is "any session at or before today", not "a row at
+        # start" — start is a calendar day and may well not be a trading one.
+        # ``_backfilled`` then bounds this to one extra fetch per process, so a
+        # broker that returns nothing before today cannot turn the healing path
+        # into a per-tick refetch loop.
+        backward_covered = min_date is not None and (min_date <= today or self._backfilled)
+        if forward_covered and backward_covered:
             return False
 
-        horizon = timedelta(days=self._settings.market_calendar_horizon_days)
-        end = today + horizon
-        raw_rows = await self._mcp.get_calendar(today.isoformat(), end.isoformat())
+        raw_rows = await self._mcp.get_calendar(start.isoformat(), end.isoformat())
+        self._backfilled = True
         rows = [_parse_calendar_entry(entry) for entry in raw_rows]
         await self._store.upsert_market_calendar(rows)
         logger.info(
             "market calendar refreshed",
-            extra={"rows": len(rows), "through": end.isoformat()},
+            extra={"rows": len(rows), "from": start.isoformat(), "through": end.isoformat()},
         )
         return True
 
