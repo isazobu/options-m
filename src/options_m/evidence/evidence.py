@@ -28,6 +28,7 @@ from statistics import median
 from typing import Any
 
 from options_m.config import Settings
+from options_m.evidence.occ import parse_occ_symbol
 from options_m.indicators import (
     atr,
     distance_from_high_pct,
@@ -38,7 +39,6 @@ from options_m.indicators import (
     window_extremes,
 )
 from options_m.mcp_client import AlpacaMcp, finite_float
-from options_m.evidence.occ import parse_occ_symbol
 from options_m.store import Store
 from options_m.volatility import implied_vol, iv_percentile
 

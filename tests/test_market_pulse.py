@@ -28,7 +28,6 @@ from options_m.config import Settings
 from options_m.db import Database
 from options_m.store import Store
 
-
 # ---------------------------------------------------------------------------
 # Calendar helpers
 # ---------------------------------------------------------------------------

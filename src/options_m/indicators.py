@@ -18,6 +18,7 @@ Conventions:
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import Mapping, Sequence
 
@@ -61,7 +62,7 @@ def rsi(values: Sequence[float | None], period: int = 14) -> float | None:
 
     gains: list[float] = []
     losses: list[float] = []
-    for previous, current in zip(xs, xs[1:], strict=False):
+    for previous, current in itertools.pairwise(xs):
         change = current - previous
         gains.append(max(change, 0.0))
         losses.append(max(-change, 0.0))
@@ -85,7 +86,7 @@ def atr(bars: Sequence[Mapping[str, object]], period: int = 14) -> float | None:
         return None
 
     true_ranges: list[float] = []
-    for (_, _, prev_close), (high, low, _) in zip(rows, rows[1:], strict=False):
+    for (_, _, prev_close), (high, low, _) in itertools.pairwise(rows):
         true_ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
 
     value = sum(true_ranges[:period]) / period
@@ -110,7 +111,7 @@ def realised_volatility(
 
     tail = xs[-(window + 1) :]
     # tail[1:] is one shorter by construction — pairwise, not strict.
-    returns = [math.log(b / a) for a, b in zip(tail, tail[1:], strict=False)]
+    returns = [math.log(b / a) for a, b in itertools.pairwise(tail)]
     mean = sum(returns) / len(returns)
     variance = sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)
     return math.sqrt(variance) * math.sqrt(periods_per_year)

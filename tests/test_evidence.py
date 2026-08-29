@@ -26,7 +26,7 @@ _STRIKES = [440.0, 445.0, 450.0, 455.0, 460.0]
 
 
 def _occ(root: str, expiry: date, right: str, strike: float) -> str:
-    return f"{root}{expiry:%y%m%d}{right}{int(round(strike * 1000)):08d}"
+    return f"{root}{expiry:%y%m%d}{right}{round(strike * 1000):08d}"
 
 
 def _snapshot() -> dict[str, Any]:
