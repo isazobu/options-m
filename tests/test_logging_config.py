@@ -6,6 +6,7 @@ from collections.abc import Iterator
 
 import pytest
 
+from options_m import logging_config
 from options_m.logging_config import setup_logging
 
 
@@ -42,3 +43,79 @@ def test_level_filters_lower_records(capsys: pytest.CaptureFixture[str]) -> None
     setup_logging("WARNING", fmt="text")
     logging.getLogger("test").info("suppressed")
     assert capsys.readouterr().out == ""
+
+
+# ---------------------------------------------------------------------------
+# FastMCP null-payload noise filter
+# ---------------------------------------------------------------------------
+
+_NOISE = (
+    "[Client-82de] Error parsing structured content: 1 validation error for "
+    "dict[str,any]\n  Input should be a valid dictionary "
+    "[type=dict_type, input_value=None, input_type=NoneType]"
+)
+_REAL_MISMATCH = (
+    "[Client-82de] Error parsing structured content: 1 validation error for "
+    "dict[str,any]\n  Input should be a valid dictionary "
+    "[type=dict_type, input_value='oops', input_type=str]"
+)
+
+
+def _record(message: str) -> logging.LogRecord:
+    return logging.LogRecord(
+        name=logging_config._FASTMCP_TOOL_LOGGER,
+        level=logging.ERROR,
+        pathname="tools.py",
+        lineno=467,
+        msg=message,
+        args=None,
+        exc_info=None,
+    )
+
+
+def test_the_first_parse_error_is_never_suppressed() -> None:
+    """Nothing is hidden: the condition still announces itself, at ERROR."""
+    noise_filter = logging_config._RepeatedParseErrorFilter()
+
+    assert noise_filter.filter(_record(_NOISE)) is True
+
+
+def test_identical_repeats_are_dropped() -> None:
+    """One line says the condition exists; the ten-thousandth adds nothing."""
+    noise_filter = logging_config._RepeatedParseErrorFilter()
+    noise_filter.filter(_record(_NOISE))
+
+    assert noise_filter.filter(_record(_NOISE)) is False
+    assert noise_filter.filter(_record(_NOISE)) is False
+
+
+def test_a_different_parse_error_gets_its_own_first_occurrence() -> None:
+    """A real schema mismatch must not be swallowed by an unrelated repeat."""
+    noise_filter = logging_config._RepeatedParseErrorFilter()
+    noise_filter.filter(_record(_NOISE))
+
+    assert noise_filter.filter(_record(_REAL_MISMATCH)) is True
+
+
+def test_unrelated_messages_from_the_same_logger_are_never_deduplicated() -> None:
+    """Only parse errors are rate-limited; everything else passes every time."""
+    noise_filter = logging_config._RepeatedParseErrorFilter()
+    other = "connection to the tool server was lost"
+
+    assert noise_filter.filter(_record(other)) is True
+    assert noise_filter.filter(_record(other)) is True
+
+
+def test_installing_the_filter_twice_does_not_stack_it() -> None:
+    logger = logging.getLogger(logging_config._FASTMCP_TOOL_LOGGER)
+    logger.filters = [
+        f for f in logger.filters if not isinstance(f, logging_config._RepeatedParseErrorFilter)
+    ]
+
+    logging_config.install_mcp_noise_filter()
+    logging_config.install_mcp_noise_filter()
+
+    installed = [
+        f for f in logger.filters if isinstance(f, logging_config._RepeatedParseErrorFilter)
+    ]
+    assert len(installed) == 1

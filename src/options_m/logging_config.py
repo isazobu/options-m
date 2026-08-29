@@ -25,6 +25,59 @@ _RESERVED: Final[frozenset[str]] = frozenset(
 
 _TEXT_FORMAT: Final[str] = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
 
+# Every list-returning Alpaca tool logs one FastMCP ERROR per call, always.
+#
+# The tool's meta carries wrap_result=true, so the client looks for the payload
+# under a top-level "result" key. Alpaca's TrustBoundaryMiddleware has already
+# rewritten the structured content to {"_alpaca_mcp_security": ..., "data": ...},
+# which has no "result" key — so the lookup yields None, validating None against
+# the declared dict[str, Any] fails, and the client logs at ERROR. The middleware
+# and the wrap metadata simply disagree.
+#
+# It is structural, not incidental: it fires on every call to get_all_positions,
+# get_orders, get_calendar and friends, whether the list is empty or full. That
+# is several ERROR lines a minute forever, which buries real failures and trips
+# alerting.
+_FASTMCP_TOOL_LOGGER: Final[str] = "fastmcp.client.mixins.tools"
+_PARSE_ERROR_MARKER: Final[str] = "Error parsing structured content"
+
+
+class _RepeatedParseErrorFilter(logging.Filter):
+    """Let the first of each distinct parse error through, drop its repeats.
+
+    Suppressing this outright would be the wrong trade in a trading service:
+    a filter that deletes ERRORs is a filter that can hide a real one. So
+    nothing is hidden here — the first occurrence of each distinct message is
+    logged at ERROR exactly as before, and only *identical repeats* are
+    dropped. One line tells you the condition exists; the ten-thousandth adds
+    nothing.
+
+    A genuinely different parse failure carries a different message, so it gets
+    its own first-occurrence at ERROR. Only messages containing
+    ``Error parsing structured content`` are considered at all; everything else
+    from this logger passes untouched.
+
+    Why the dropped repeats cost nothing: ``AlpacaMcp._as_json`` reads
+    ``result.structured_content`` and unwraps the security envelope itself. It
+    never touches the ``data`` field this failed validation would have
+    populated — verified against get_clock, get_account_info,
+    get_account_config, get_all_positions and get_orders. **If a call site ever
+    starts reading ``CallToolResult.data``, revisit this.**
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._seen: set[str] = set()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if _PARSE_ERROR_MARKER not in message:
+            return True
+        if message in self._seen:
+            return False
+        self._seen.add(message)
+        return True
+
 
 class JsonFormatter(logging.Formatter):
     """Render log records as single-line JSON for log collectors."""
@@ -75,3 +128,12 @@ def setup_logging(level: str | None = None, *, fmt: str | None = None) -> None:
         }
     )
     logging.captureWarnings(capture=True)
+    install_mcp_noise_filter()
+
+
+def install_mcp_noise_filter() -> None:
+    """Attach the repeat filter, without stacking duplicates on re-setup."""
+    logger = logging.getLogger(_FASTMCP_TOOL_LOGGER)
+    if any(isinstance(existing, _RepeatedParseErrorFilter) for existing in logger.filters):
+        return
+    logger.addFilter(_RepeatedParseErrorFilter())
