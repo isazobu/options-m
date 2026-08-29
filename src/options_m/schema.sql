@@ -66,6 +66,19 @@ CREATE TABLE IF NOT EXISTS kill_switch (
 INSERT INTO kill_switch (id, engaged) VALUES (1, false)
     ON CONFLICT (id) DO NOTHING;
 
+-- One near-the-money implied-vol reading per underlying per pull. The evidence
+-- pack's iv_rank (phase 2) is a symbol's latest reading against its own recent
+-- history, so this table has to start filling before the strategist runs.
+-- iv_atm is a vol fraction (0.24 == 24%), kept numeric to stay off float.
+CREATE TABLE IF NOT EXISTS iv_history (
+    id      bigserial   PRIMARY KEY,
+    ts      timestamptz NOT NULL DEFAULT now(),
+    symbol  text        NOT NULL,
+    iv_atm  numeric     NOT NULL,
+    dte     integer,
+    spot    numeric,
+    payload jsonb
+
 -- One row per StrategyIntent considered. arguments/verdict stay null until
 -- phase 3 writes the bull/bear/vol/PM arguments there.
 CREATE TABLE IF NOT EXISTS proposals (

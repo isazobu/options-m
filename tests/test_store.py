@@ -90,6 +90,39 @@ async def test_saving_no_candidates_is_a_no_op() -> None:
     assert await store.recent_candidates() == []
 
 
+async def test_iv_history_is_per_symbol_and_newest_first() -> None:
+    store = _store()
+    for iv in (0.20, 0.25, 0.30):
+        await store.append_iv_snapshot("aapl", iv_atm=iv, dte=30)
+    await store.append_iv_snapshot("MSFT", iv_atm=0.5)
+
+    rows = await store.recent_iv("AAPL")
+
+    assert [row["iv_atm"] for row in rows] == [0.30, 0.25, 0.20]
+    assert all(row["symbol"] == "AAPL" for row in rows)
+
+
+async def test_iv_rank_for_ranks_the_latest_reading() -> None:
+    store = _store()
+    for iv in (0.10, 0.20, 0.30):  # ascending -> latest is the max -> rank 100
+        await store.append_iv_snapshot("SPY", iv_atm=iv)
+
+    assert await store.iv_rank_for("SPY") == 100.0
+
+
+async def test_iv_rank_for_is_none_until_two_readings() -> None:
+    store = _store()
+    assert await store.iv_rank_for("SPY") is None
+    await store.append_iv_snapshot("SPY", iv_atm=0.2)
+    assert await store.iv_rank_for("SPY") is None
+
+
+async def test_recent_lessons_is_empty_until_phase_four() -> None:
+    store = _store()
+    assert await store.recent_lessons("SPY") == []
+    assert await store.recent_lessons(None) == []
+
+
 async def test_kill_switch_round_trips() -> None:
     store = _store()
     assert await store.is_kill_switch_engaged() is False
