@@ -97,6 +97,37 @@ pack or the prompt.** Two consequences ripple through every phase doc:
   that internally reads trend + volatility regime with one LLM call and then runs a
   deterministic **Strategy Matrix** to pick the structure. See Phase 3.
 
+### Design change (2026-08-29 continued): who calls the evidence tool
+
+The five agents' responsibilities are now pinned precisely, because the first pass left one
+thing ambiguous — who actually calls `evidence.py`:
+
+- **`MarketPulseAgent` collects the evidence.** Every tick (60 s), for every symbol in the
+  fixed 10-symbol universe, it runs `evidence.py`'s technical computation (trend from
+  SMA/ADX/RSI, IV/RV volatility regime from the option chain, the earnings-blackout flag) and
+  writes the result to a local `evidence` cache — one row per symbol, overwritten each tick,
+  the same current-state-cache pattern as `account`/`positions`/`market_calendar`. This is a
+  deliberate decoupling: the expensive part (bars + chain fetches, technical computation) now
+  runs on the *fast, cheap, no-LLM* cadence, not gated behind the LLM's 5-15 minute loop.
+- **`StrategistAgent` builds strategies from what `MarketPulseAgent` already collected.** It
+  no longer calls `evidence.py` itself — it reads the freshest row per candidate from the
+  local `evidence` cache, then runs its one LLM call (thesis/regime narrative) and the
+  deterministic Strategy Matrix on that pre-computed data. See Phase 3.
+- **`ExecutionAgent` is the risk gate.** Every proposal `StrategistAgent` writes goes through
+  `risk.py` deterministically before an order is placed — this was always the design, restated
+  here because it is the one non-negotiable hop in the pipeline: an idea from `StrategistAgent`
+  reaches Alpaca only by passing `risk.py` first, never directly.
+- **`PositionManagerAgent` tracks positions and P/L continuously**, not just at exit time — it
+  owns the local `positions` cache (unchanged) and now explicitly also marks every open
+  position to market each tick (unrealized P/L), so "what is open and how is it doing" is
+  always a fresh local read for the dashboard and for `StrategistAgent`'s pre-filter, not
+  something computed only when an exit rule is being evaluated. See Phase 4.
+- **`ReflectionAgent`'s scope widens from "closed trades only" to "the pipeline's decisions."**
+  It still writes a lesson for every closed trade (unchanged), but it now also periodically
+  reviews recent `StrategistAgent` proposals that were never filled — a `hold` that turned out
+  to be a miss, or a proposal `risk.py` rejected that turned out to be a save — because both
+  are decisions worth learning from, not just realized P/L. See Phase 4.
+
 ### Layer 1 — Supervised loops (existing `Agent` protocol, registered in `build_agents()`)
 
 Each runs at its own cadence, isolated from the others. We deliberately **do not use
@@ -105,11 +136,11 @@ and adding that dependency this close to the deadline is pure risk.
 
 | Agent | Cadence | LLM | Responsibility |
 | --- | --- | --- | --- |
-| `MarketPulseAgent` | 60 s | ✗ | MCP `get_clock`/`get_calendar` once at startup → `market_calendar` table; `get_account_info`/`get_account_config` every tick → `account` table; writes `equity_curve` |
-| `StrategistAgent` | 5–15 min (only while market open, per local `market_calendar`) | ✓ (one call/iteration) | Filter candidates (position/proposal/earnings-blackout) → evidence pack (technical only) → LLM trend+regime+thesis read → deterministic **Strategy Matrix + Earnings Gate** → typed `StrategyIntent` into `proposals`, or `hold` |
-| `ExecutionAgent` | 30 s | ✗ | Pick up `pending` proposals → deterministic risk gates (reading `account`/`positions` locally) → size → MCP `place_option_order` → upsert `orders` |
-| `PositionManagerAgent` | 60 s | ✗ | `get_all_positions` → upsert local `positions` cache; P/L, DTE, profit-target / stop rules → `close_position` |
-| `ReflectionAgent` | hourly / after close | ✓ | Closed trades (read from local `orders`) → extract a lesson → `lessons` table → injected into the next `StrategistAgent` LLM call for that symbol |
+| `MarketPulseAgent` | 60 s | ✗ | MCP `get_clock`/`get_calendar` once at startup → `market_calendar` table; `get_account_info`/`get_account_config` every tick → `account` table; writes `equity_curve`; **runs `evidence.py` for every universe symbol → local `evidence` cache** |
+| `StrategistAgent` | 5–15 min (only while market open, per local `market_calendar`) | ✓ (one call/iteration) | Filter candidates (position/proposal/earnings-blackout) → **read the pre-computed evidence pack from the local `evidence` cache** → LLM trend+regime+thesis read → deterministic **Strategy Matrix + Earnings Gate** → typed `StrategyIntent` into `proposals`, or `hold` |
+| `ExecutionAgent` | 30 s | ✗ | Pick up `pending` proposals → **deterministic risk gate** (`risk.py`, reading `account`/`positions` locally) → size → MCP `place_option_order` → upsert `orders` |
+| `PositionManagerAgent` | 60 s | ✗ | `get_all_positions` → upsert local `positions` cache; **mark every open position to market every tick** (continuous unrealized P/L, not just at exit-check time); DTE, profit-target / stop rules → `close_position` |
+| `ReflectionAgent` | hourly / after close | ✓ | Evaluates decisions from **both** `StrategistAgent` and `ExecutionAgent`: closed trades (read from local `orders`) → lesson; **plus a periodic look-back over recent proposals that were held or rejected**, to learn from misses and saves, not only realized P/L → `lessons` table → injected into the next `StrategistAgent` LLM call for that symbol |
 
 `StrategistAgent` is **one agent, one process, one `step()`** — the trend read, the
 volatility-regime read, and the thesis/conviction narrative are internal sub-steps of a
@@ -217,14 +248,15 @@ dormant for this specific run and must not be deleted anyway.
 
 ## Local cache: what we still fetch live vs. what we read from Postgres
 
-Per an explicit design decision: **do not hit Alpaca for everything.** Four tables move from
+Per an explicit design decision: **do not hit Alpaca for everything.** Five tables move from
 "ask Alpaca live" to "read from a local cache that one agent owns and refreshes":
 
 | Table | Sole writer | Refresh | Who reads it locally | Accepted staleness risk |
 | --- | --- | --- | --- | --- |
 | `market_calendar` | `MarketPulseAgent` | Once at startup (`get_calendar`, ~1yr window), then daily | Every agent's "is the market open" check | Won't catch an unscheduled circuit-breaker halt — accepted for a run this short |
 | `account` | `MarketPulseAgent` | Every 60 s tick (piggybacked on the existing `get_account_info`/`get_account_config` call — no new Alpaca traffic) | `ExecutionAgent`'s buying-power / options-level checks | Up to ~60 s stale; fine on paper, would need tightening for real capital |
-| `positions` | `PositionManagerAgent` | Every 60 s tick (piggybacked on the existing `get_all_positions` call) | `StrategistAgent`'s "already positioned in this underlying" pre-filter | Up to ~60 s stale |
+| `evidence` | `MarketPulseAgent` | Every 60 s tick, one row per universe symbol, overwritten in place — this is the new home for `evidence.py`'s output (trend, IV/RV regime, earnings-blackout flag) | `StrategistAgent` reads the row for its chosen candidate instead of calling `evidence.py` itself | Up to ~60 s stale; `StrategistAgent` only runs every 5-15 min anyway, so this is never the limiting freshness |
+| `positions` | `PositionManagerAgent` | Every 60 s tick (piggybacked on the existing `get_all_positions` call), including a mark-to-market pass so unrealized P/L is always current | `StrategistAgent`'s "already positioned in this underlying" pre-filter; the dashboard | Up to ~60 s stale |
 | `orders` | `ExecutionAgent` | Upserted on submit and on every reconciliation pass | `ReflectionAgent` (never calls `get_orders` live) | None — write-through on every state change |
 
 `get_clock()` is **removed from the normal agent loop** — it was called by nearly every
@@ -271,7 +303,7 @@ Three consequences, all already folded into the phase docs:
 | `mcp_client.py` | `AlpacaMcp` facade. `fastmcp.Client` over `StdioTransport` running `alpaca-mcp-server` as a subprocess; long-lived session, reconnect, retry, timeout. **The only module that touches Alpaca.** Refuses write tools in `dry_run` |
 | `earnings.py` | Hand-maintained earnings-date dict for the fixed universe + `is_earnings_blackout()`. **Done** — see Phase 2/3 |
 | `llm.py` | Featherless client (`httpx` → `POST {base}/chat/completions`). **One tier now** (`model_deep` only — there is no separate fast-tier analyst crew to serve). Pydantic-validated structured output, one repair retry, then **fail-closed** (no trade) |
-| `evidence.py` | Evidence-pack collector (technical only — no news), compact JSON serialisation, `NO_DATA` sentinels |
+| `evidence.py` | Evidence-pack collector (technical only — no news), compact JSON serialisation, `NO_DATA` sentinels. **Called by `MarketPulseAgent`**, once per universe symbol per tick, writing into the local `evidence` cache — not called by `StrategistAgent`, which only reads that cache |
 | `strategist.py` (LLM read) + `matrix.py` (deterministic gate) | Trend/regime/thesis LLM call; Strategy Matrix + earnings gate lookup. See Phase 3 |
 | `strategy_builder.py` | `StrategyIntent` → contract selection from the live chain → `OrderPlan` (legs, qty, limit price, max loss) for all 9 supported structures |
 | `risk.py` | Deterministic guardrails, zero LLM |
@@ -320,9 +352,11 @@ Three consequences, all already folded into the phase docs:
 
 `agent_runs` (per-iteration telemetry), `market_snapshots`, `candidates`, `market_calendar`
 (local calendar cache, see above), `account` (local account/buying-power/options-level
-cache), `positions` (local open-positions cache), `proposals` (evidence + LLM regime read +
-matrix verdict as JSONB), `orders` (unique `client_order_id`), `fills`, `equity_curve`,
-`risk_events`, `iv_history`, `lessons`, `kill_switch`.
+cache), `evidence` (local per-symbol evidence cache, written by `MarketPulseAgent`, read by
+`StrategistAgent`), `positions` (local open-positions cache, including unrealized P/L),
+`proposals` (evidence + LLM regime read + matrix verdict as JSONB), `orders` (unique
+`client_order_id`), `fills`, `equity_curve`, `risk_events`, `iv_history`, `lessons`,
+`kill_switch`.
 
 ### Dashboard (`api.py` + `static/`)
 

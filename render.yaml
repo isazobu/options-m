@@ -53,9 +53,9 @@ services:
       # The MCP server runs as a child process of this one, so the free
       # instance holds two Python processes. Keep the toolset list tight.
       - key: ALPACA_TOOLSETS
-        value: account,trading,assets,options-data,stock-data,news
+        value: account,agents,assets,options-data,stock-data,news
       # Must stay exactly "true". The service refuses to start on any value
-      # that would select the live trading endpoint.
+      # that would select the live agents endpoint.
       - key: ALPACA_PAPER_TRADE
         value: "true"
       - key: MARKET_PULSE_INTERVAL_SECONDS

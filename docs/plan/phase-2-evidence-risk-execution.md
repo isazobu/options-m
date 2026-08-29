@@ -62,9 +62,18 @@ Small, do this first; everything else in this phase reads from what it creates.
        CHECK (id = 1)
    );
 
+   CREATE TABLE IF NOT EXISTS evidence (
+       symbol      text PRIMARY KEY,         -- underlying
+       payload     jsonb NOT NULL,           -- evidence.py's output, verbatim
+       updated_at  timestamptz NOT NULL DEFAULT now()
+   );
+
    CREATE TABLE IF NOT EXISTS positions (
        symbol         text PRIMARY KEY,      -- underlying, not the OCC option symbol
-       payload        jsonb NOT NULL,        -- full get_all_positions entry, verbatim
+       payload        jsonb NOT NULL,        -- {"legs": [...]} -- every open leg for this
+                                              -- underlying, each with its raw
+                                              -- get_all_positions fields plus a
+                                              -- PositionManagerAgent-computed unrealized P/L
        updated_at     timestamptz NOT NULL DEFAULT now()
    );
 
@@ -112,16 +121,18 @@ Small, do this first; everything else in this phase reads from what it creates.
        iv_rv_ratio numeric
    );
    ```
-   Money stays `numeric`. `positions` and `account` are **current-state caches** (upserted
-   in place), everything else is append-only, matching the header comment already in
-   `schema.sql` ("later phases add tables and columns; nothing here is ever rewritten" — the
-   two cache tables are the deliberate exception, and are called out as such).
+   Money stays `numeric`. `evidence`, `positions` and `account` are **current-state caches**
+   (upserted in place), everything else is append-only, matching the header comment already
+   in `schema.sql` ("later phases add tables and columns; nothing here is ever rewritten" —
+   the three cache tables are the deliberate exception, and are called out as such).
 3. **`store.py` additions:** `upsert_market_calendar(rows)`, `market_is_open(at: datetime) ->
    bool` (pure local read — the one function every other agent's market-hours check now
-   calls), `upsert_account(...)`, `get_cached_account()`, `upsert_position(symbol,
-   payload)`, `remove_position(symbol)` (called when a position closes), `get_cached_positions()`,
-   plus the Phase-1-planned `create_proposal`, `pending_proposals`, `record_order`,
-   `recent_lessons` (stub returning `[]` until Phase 4), and `save_risk_event`.
+   calls), `upsert_account(...)`, `get_cached_account()`, `upsert_evidence(symbol, payload)`,
+   `get_cached_evidence(symbol)` (the read `StrategistAgent` uses instead of calling
+   `evidence.py` itself — see 2.4), `upsert_position(symbol, payload)`, `remove_position(symbol)`
+   (called when a position closes), `get_cached_positions()`, plus the Phase-1-planned
+   `create_proposal`, `pending_proposals`, `record_order`, `recent_lessons` (stub returning
+   `[]` until Phase 4), and `save_risk_event`.
 
 **Test before moving on:** `test_store.py` — `market_is_open` returns the right answer for a
 timestamp inside/outside a seeded calendar row and for a missing date (must be conservative:
@@ -227,8 +238,19 @@ pure options structure, so there is no "covered" leg to build against.
 
 ### `evidence.py` — deterministic, technical only, no news
 
-Collect via `AlpacaMcp` for one underlying, returning a compact dict well under the model's
-context budget (target ≤ 4 KB of JSON):
+**Ownership (2026-08-29 design change): `MarketPulseAgent` calls this, not `StrategistAgent`.**
+Every 60 s tick, `MarketPulseAgent` runs `evidence.collect(symbol)` for **every symbol in the
+universe** (not just that tick's scored candidates — a quietly-trending name with no mover/
+active signal is still worth having fresh evidence for) and upserts the result into the local
+`evidence` cache (2.1's schema). `StrategistAgent` (Phase 3) never calls this function itself
+— it reads `store.get_cached_evidence(symbol)` for whichever candidate it picked. This is a
+deliberate decoupling: the expensive part (bars + chain fetches, indicator computation) now
+runs on the fast, no-LLM, no-per-candidate-filtering cadence, and `StrategistAgent`'s 5-15 min
+loop does zero Alpaca calls of its own for market data — only the local cache read plus its
+one LLM call.
+
+`collect(symbol) -> dict`, returning a compact dict well under the model's context budget
+(target ≤ 4 KB of JSON):
 
 - `get_stock_bars(symbol, timeframe="1Day", limit=60)` → compute **ourselves** (no
   `stockstats`/`pandas` dependency): SMA20, SMA50, ADX14, RSI14, ATR14, 20-day realized
@@ -250,123 +272,29 @@ context budget (target ≤ 4 KB of JSON):
   a plain boolean the matrix step reads directly; also checked by `risk.py` independently.
 - `store.get_cached_positions()` — current position in this underlying, if any (local read,
   not `get_open_position`).
-- `store.recent_lessons(symbol, n)` — Phase 4 fills this in; returns `[]` until then.
+- `store.recent_lessons(symbol, n)` — Phase 4 fills this in; returns `[]` until then. Read at
+  collection time (inside `MarketPulseAgent`'s loop) rather than by `StrategistAgent`, so a
+  lesson from an hour-old `ReflectionAgent` pass is already sitting in the cached pack by the
+  time `StrategistAgent` looks at it.
 
 **Missing-data discipline unchanged:** any field we could not fetch becomes the literal
 string `"NO_DATA_AVAILABLE"`, and the evidence pack carries a top-level note: `"Fields marked
 NO_DATA_AVAILABLE are genuinely unavailable. Do not estimate or fabricate values."` Borrowed
 from `TradingAgents/tradingagents/dataflows/interface.py:242`. This is what stops a model
-from inventing an IV number.
+from inventing an IV number. A single symbol's fetch failure inside `MarketPulseAgent`'s
+per-symbol loop must not abort the other symbols — catch per-symbol, log, and either skip
+that symbol's cache update (stale-but-present beats missing) or write a pack that is mostly
+`NO_DATA_AVAILABLE`; do not let one bad chain response take down the whole tick.
 
-Persist every pack into `proposals.evidence` (JSONB) so a judge can replay the decision.
-
-#### Pack shape
-
-`EvidenceCollector(settings, mcp, store).collect(symbol, dte_min=7, dte_max=45)` returns the
-dict below. Every leaf is a number/int/str **or** the literal `"NO_DATA_AVAILABLE"`; a whole
-section degrades to that string when its fetch fails, and the rest of the pack still returns
-(the collector never raises for a single failed sub-fetch). Helpers live in
-`src/options_m/occ.py` (`parse_occ_symbol` — read-only, no inverse) and
-`src/options_m/indicators.py` (SMA / Wilder RSI / Wilder ATR / realised-vol / 52-week
-distance, pure stdlib). IV-rank math stays in `options_m.volatility` via
-`Store.iv_rank_for`; the collector adds no second implementation.
-
-```
-symbol            str          uppercased
-as_of             str          UTC ISO-8601, "…Z"
-note              str          the NO_DATA_AVAILABLE instruction (verbatim)
-dte_window        [int, int]   [dte_min, dte_max]
-spot              dict | "NO_DATA_AVAILABLE"
-trend             dict | "NO_DATA_AVAILABLE"
-options           dict | "NO_DATA_AVAILABLE"
-position          list[dict] | null | "NO_DATA_AVAILABLE"   (null = confirmed flat,
-                                                             the string = read failed)
-lessons           list[str]                                 (always [] until Phase 4)
-```
-
-`spot` — from `get_stock_snapshot`:
-
-```
-bid / ask                     ← latestQuote.bp / .ap
-bid_size / ask_size           ← latestQuote.bs / .as
-mid  spread  spread_pct       derived
-last                          ← latestTrade.p
-day_open/high/low/close       ← dailyBar.o/h/l/c
-day_volume  day_vwap          ← dailyBar.v / .vw
-prev_close                    ← prevDailyBar.c
-change_from_prev_close_pct    derived
-quote_time                    ← latestQuote.t
-```
-
-`trend` — computed from ~252 daily bars (needed for a real 52-week range and a defined SMA50):
-
-```
-bars_used            int
-sma_20  sma_50
-rsi_14               Wilder
-atr_14               Wilder, price units
-atr_14_pct_of_spot
-realised_vol_20d     annualised vol fraction (0.24 == 24%)
-high_52w  low_52w
-pct_from_52w_high    <= 0
-pct_from_52w_low     >= 0
-trend_label          "yukarı" | "aşağı" | "yatay"
-```
-
-`options` — from `get_option_chain` filtered to the DTE window and a ±15% strike band,
-plus `get_option_contracts` joined by OCC symbol for open interest (the market-data chain
-carries none):
-
-```
-dte_window           [int, int]
-contracts_scanned    int
-expiries_scanned     list[str]  ISO dates
-near_expiry  near_dte
-far_expiry   far_dte
-iv_atm               mean of ATM call/put IV at the near expiry
-iv_atm_near  iv_atm_far
-iv_source            "chain" | "bsm_from_mid" | "NO_DATA_AVAILABLE"
-iv_rank              volatility.iv_rank over iv_history; "NO_DATA_AVAILABLE" until 2 readings
-iv_percentile        volatility.iv_percentile; same 2-reading guard
-realised_vol_20d     the trend block's RV, carried here for side-by-side comparison
-iv_rv_ratio          iv_atm / realised_vol_20d — vol regime: ≥1.40 çok pahalı, ≥1.10 pahalı, else ucuz
-iv_minus_rv          iv_atm - realised_vol_20d — vol risk premium (>0 rich, <0 cheap)
-put_call_skew        atm_put_iv - atm_call_iv
-term_structure       iv_atm_far - iv_atm_near
-median_spread_pct    across scanned contracts
-total_open_interest  int
-atm_call  atm_put    dict | "NO_DATA_AVAILABLE"
-```
-
-`atm_call` / `atm_put` (the contract nearest spot at the near expiry — a real OCC symbol
-taken from the chain, never constructed):
-
-```
-symbol  strike  expiry  dte
-bid  ask  mid  spread_pct
-iv
-delta  gamma  theta  vega
-open_interest
-```
-
-`position` — from local `positions` cache, filtered to this underlying:
-
-```
-option leg:  kind="option", symbol, option_type, strike, expiry,
-             side, qty, avg_entry_price, market_value, unrealized_pl, unrealized_plpc
-equity:      kind="equity", symbol, side, qty, avg_entry_price,
-             market_value, unrealized_pl, unrealized_plpc
-```
-
-`collect()` only reads and returns — it does not persist. Writing the pack into
-`proposals.evidence` is done by whichever component owns the `proposals` row (the Phase 3
-strategist, or `ExecutionAgent`). The one write `collect()` makes is the IV-history row
-(`append_iv_snapshot`), once per pull, right before the rank is read.
+`StrategistAgent` copies whatever cached pack it read into `proposals.evidence` (JSONB) at
+decision time, so a judge can still replay exactly what evidence a given decision was based
+on — persistence of the audit trail is unchanged, only *which agent* produces the pack moved.
 
 **Test:** `test_evidence.py` — a failed sub-fetch yields `NO_DATA_AVAILABLE`, never a made-up
 number; trend classification matches a hand-computed fixture; IV/RV classification hits all
 three tiers (ucuz / pahalı / çok pahalı) at the right thresholds; `is_earnings_blackout`
-correctly flows through from `earnings.py`.
+correctly flows through from `earnings.py`; a failure on one symbol does not prevent
+`MarketPulseAgent` from updating the cache for the rest of the universe that same tick.
 
 ---
 
@@ -663,3 +591,6 @@ nothing because all the logic already lives in modules.
   payload boundary, and unit-test the exact sign per structure family (see 2.5).
 - Calling `get_clock`, `get_account_info`, or `get_all_positions` from anywhere other than
   their one owning agent — that defeats the entire point of the local-cache design.
+- Calling `evidence.collect()` from `StrategistAgent`. That call belongs to `MarketPulseAgent`
+  now — `StrategistAgent` only reads `store.get_cached_evidence(symbol)`. Reintroducing a live
+  bars/chain fetch inside the LLM loop is exactly the coupling this design change removed.

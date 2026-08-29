@@ -11,7 +11,7 @@ from datetime import date
 
 import pytest
 
-from options_m.occ import parse_occ_symbol
+from options_m.evidence.occ import parse_occ_symbol
 
 
 def test_parses_a_standard_call() -> None:

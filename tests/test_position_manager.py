@@ -13,7 +13,7 @@ import pytest
 from options_m.config import Settings
 from options_m.db import Database
 from options_m.store import Store
-from options_m.trading.position_manager import PositionManagerAgent
+from options_m.agents.position_manager import PositionManagerAgent
 
 
 class _FakeMcp:

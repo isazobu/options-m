@@ -14,8 +14,8 @@ Two invariants matter more than anything else in this module:
 * **Write tools cannot reach Alpaca while ``DRY_RUN`` is true.** The guard lives
   in :meth:`AlpacaMcp.call`, not at the call sites, so a forgotten call site
   cannot place a real order.
-* **Live trading is unreachable, not merely discouraged.** Alpaca's own
-  paper-trading skill is explicit that unattended automation "must assert paper
+* **Live agents is unreachable, not merely discouraged.** Alpaca's own
+  paper-agents skill is explicit that unattended automation "must assert paper
   itself, at startup, and exit if it cannot — construct the client with
   ``paper=True`` as a literal rather than reading the endpoint from
   configuration". We do exactly that; see :func:`assert_paper_intent`.
@@ -58,7 +58,7 @@ WRITE_TOOLS = frozenset(
 )
 
 # Unscoped or irreversible tools, refused in every mode including live-armed
-# runs. Alpaca's paper-trading skill requires explicit human confirmation for
+# runs. Alpaca's paper-agents skill requires explicit human confirmation for
 # each of these because they act on holdings the caller may never have created.
 # An unattended service has nobody to ask, so the only correct answer is no.
 # Scoped exits (close_position) stay available — they are how positions close.
@@ -129,10 +129,10 @@ class ForbiddenToolError(RuntimeError):
 
 
 def assert_paper_intent() -> None:
-    """Refuse to start if anything in the environment selects live trading.
+    """Refuse to start if anything in the environment selects live agents.
 
-    The MCP server picks its trading endpoint from ``ALPACA_PAPER_TRADE`` alone
-    — there is no base-URL override for trading — so pinning that one variable
+    The MCP server picks its agents endpoint from ``ALPACA_PAPER_TRADE`` alone
+    — there is no base-URL override for agents — so pinning that one variable
     makes the live endpoint unreachable rather than merely unused.
 
     Raises:
@@ -142,7 +142,7 @@ def assert_paper_intent() -> None:
     if raw is None or raw.lower() in PAPER_VALUES:
         return
     msg = (
-        f"ALPACA_PAPER_TRADE={raw!r} selects LIVE trading. This service is "
+        f"ALPACA_PAPER_TRADE={raw!r} selects LIVE agents. This service is "
         f"paper-only: unset the variable or set it to one of "
         f"{sorted(PAPER_VALUES)}. Note the server does not strip whitespace, "
         f"so a trailing space also selects live."
@@ -267,7 +267,7 @@ class AlpacaMcp:
                 "ALPACA_API_KEY": self._api_key or "",
                 "ALPACA_SECRET_KEY": self._secret_key or "",
                 # Pinned literally. Configuration cannot select live: this is
-                # the server's only switch for the trading endpoint.
+                # the server's only switch for the agents endpoint.
                 "ALPACA_PAPER_TRADE": "true",
                 "ALPACA_TOOLSETS": self._toolsets,
             }
@@ -282,7 +282,7 @@ class AlpacaMcp:
         """Open the MCP session. No-op when credentials are unset.
 
         Raises:
-            LiveTradingRefused: The environment selects live trading.
+            LiveTradingRefused: The environment selects live agents.
         """
         # Before anything else, and whether or not credentials are configured:
         # a live-selecting environment is a misconfiguration to fix, not to
@@ -291,7 +291,7 @@ class AlpacaMcp:
         if not self._paper:
             msg = (
                 "alpaca_paper_trade is False. This service is paper-only and "
-                "cannot be configured into live trading."
+                "cannot be configured into live agents."
             )
             raise LiveTradingRefused(msg)
         if not self.is_enabled:
@@ -554,7 +554,7 @@ class AlpacaMcp:
         return self._expect_mapping("get_account_info", await self.call("get_account_info"))
 
     async def get_account_config(self) -> dict[str, Any]:
-        """Account configuration, including the options trading level."""
+        """Account configuration, including the options agents level."""
         return self._expect_mapping("get_account_config", await self.call("get_account_config"))
 
     async def get_portfolio_history(

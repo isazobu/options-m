@@ -15,7 +15,7 @@ import pytest
 
 from options_m.config import Settings
 from options_m.db import Database
-from options_m.evidence import MISSING, EvidenceCollector
+from options_m.evidence.evidence import MISSING, EvidenceCollector
 from options_m.store import Store
 
 _SPOT = 450.0

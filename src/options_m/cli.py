@@ -26,7 +26,7 @@ from options_m.migrate import apply as apply_migrations
 from options_m.models import Rejection, StrategyIntent
 from options_m.risk import RiskEngine, RiskLimits
 from options_m.store import Store
-from options_m.trading.execution import ExecutionAgent, build_portfolio_snapshot
+from options_m.agents.execution import ExecutionAgent, build_portfolio_snapshot
 
 _STRATEGIES = (
     "long_call",

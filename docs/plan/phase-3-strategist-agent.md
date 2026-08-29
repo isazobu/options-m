@@ -188,13 +188,18 @@ step():
        - symbols with an open position (local `positions` cache)
        - symbols with an in-flight proposal (per-underlying cap)
        - symbols inside earnings.is_earnings_blackout(symbol, today)   # cheap pre-filter,
-                                                                        # before spending an
-                                                                        # evidence pull or an
-                                                                        # LLM call on it
+                                                                        # before even looking
+                                                                        # at the cached pack
      if none: return early
-  4. pack = await evidence.collect(candidate)          # deterministic: trend, iv_regime,
-                                                         # earnings flag, positions, lessons
-  5. regime = await llm.complete_json(schema=RegimeRead, ...)   # the ONE LLM call
+  4. pack = store.get_cached_evidence(candidate)        # LOCAL READ ONLY. Written by
+                                                         # MarketPulseAgent every 60s -- this
+                                                         # agent never calls evidence.collect()
+                                                         # or any MCP tool for market data.
+     if pack is None or pack is stale (older than ~2x MarketPulseAgent's interval):
+       log and return early -- do not reason over data that was never actually collected
+  5. regime = await llm.complete_json(schema=RegimeRead, ...)   # the ONE LLM call, and the
+                                                                  # only I/O this step() does
+                                                                  # besides the local reads
   6. intent = matrix.decide(pack, regime)               # deterministic, see matrix.py above
   7. if intent == "hold":
        store.create_proposal(status='no_action', evidence=pack, llm_read=regime,
@@ -203,6 +208,13 @@ step():
   8. store.create_proposal(status='pending', intent=intent, evidence=pack,
                             llm_read=regime, matrix={"result": intent.strategy, ...})
 ```
+
+**This step makes zero MCP calls.** Every input (market-open check, candidate ranking,
+evidence pack) is a local Postgres read; the only outbound call in the whole iteration is the
+one LLM request. That is the concrete benefit of moving `evidence.py`'s ownership to
+`MarketPulseAgent` (see `00-MASTER.md`'s "who calls the evidence tool" section): the slow,
+data-heavy work runs on a fast, cheap, no-LLM cadence, and this loop — which can legitimately
+take 5-15 minutes between iterations — never blocks on a chain fetch.
 
 `ExecutionAgent` from Phase 2 picks up `pending` proposals unchanged — the two agents are
 decoupled through the `proposals` table, which is why the LLM can be slow or fail without
@@ -236,12 +248,15 @@ earlier draft of this plan — there is no fast tier and no debate round anymore
   holds every credit/condor/butterfly cell; a conviction below the floor forces `hold` even
   when the matrix would otherwise produce a structure.
 - `test_strategist.py` — closed market (via the local calendar cache) returns early with no
-  LLM call and no MCP call; an existing position in a symbol skips it (local cache, not a
-  live `get_open_position`); a symbol inside its earnings blackout is skipped **before** an
-  evidence pack is even collected (assert `evidence.collect` is never called for it); `hold`
-  writes a `no_action` proposal and never a pending one; an `LlmContractError` marks the
-  proposal `llm_failed` and does not raise out of `step()` more than the supervisor can
-  absorb.
+  LLM call and no MCP call at all (assert the fake `AlpacaMcp` records zero calls for the
+  whole test — this agent should never need one); an existing position in a symbol skips it
+  (local cache, not a live `get_open_position`); a symbol inside its earnings blackout is
+  skipped **before** its cached evidence row is even read (assert
+  `store.get_cached_evidence` is never called for it); a candidate with no cached evidence
+  row yet (or a stale one) is skipped rather than reasoned over with `NO_DATA_AVAILABLE`
+  everywhere; `hold` writes a `no_action` proposal and never a pending one; an
+  `LlmContractError` marks the proposal `llm_failed` and does not raise out of `step()` more
+  than the supervisor can absorb.
 - `test_prompts.py` — the single `strategist.md` template renders with the expected keys; the
   loader rejects a path-escaping name.
 
@@ -255,6 +270,9 @@ earlier draft of this plan — there is no fast tier and no debate round anymore
 - [ ] `ExecutionAgent` turns it into a real paper options order with no code change.
 - [ ] A deliberately malformed model reply results in `llm_failed`, never in an order.
 - [ ] A symbol inside its earnings blackout never reaches an LLM call.
+- [ ] `StrategistAgent.step()` makes zero MCP calls in every test — grep and a runtime
+      assertion both confirm it only reads the local `evidence`/`positions`/`market_calendar`
+      caches and calls the LLM.
 - [ ] `ruff check . && mypy && pytest` green.
 
 ---
@@ -266,9 +284,12 @@ earlier draft of this plan — there is no fast tier and no debate round anymore
 - Do not fall back to free text for a decision — fail closed.
 - Do not let the LLM re-derive trend or IV/RV from raw numbers — it only sees the
   already-classified facts, so there is nothing for it to get wrong there.
-- Do not call `evidence.collect` (which pulls bars and the option chain) before the
-  earnings-blackout pre-filter — that ordering is what keeps a blacked-out symbol cheap to
-  skip.
+- Do not call `evidence.collect()` from this agent at all — that call belongs to
+  `MarketPulseAgent` now. `StrategistAgent` only ever reads `store.get_cached_evidence()`.
+- Do not read the cached evidence row before the earnings-blackout pre-filter — that ordering
+  is what keeps a blacked-out symbol cheap to skip (a local read is cheap, but skipping it
+  entirely is still cheaper and keeps the contract simple: no reasoning happens on a symbol
+  that cannot trade regardless of what the evidence says).
 - Do not hardcode a Featherless model id in source; env only.
 - Do not resurrect the fast/deep two-tier split or a debate loop — there is one model call
   per iteration by design now.

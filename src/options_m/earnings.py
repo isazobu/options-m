@@ -1,4 +1,4 @@
-"""Earnings-date calendar for the fixed trading universe.
+"""Earnings-date calendar for the fixed agents universe.
 
 Neither Alpaca's Trading API nor its Market Data API exposes an earnings
 calendar. ``get_corporate_actions`` / ``get_corporate_action_announcements``

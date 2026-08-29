@@ -38,7 +38,7 @@ from options_m.indicators import (
     window_extremes,
 )
 from options_m.mcp_client import AlpacaMcp, finite_float
-from options_m.occ import parse_occ_symbol
+from options_m.evidence.occ import parse_occ_symbol
 from options_m.store import Store
 from options_m.volatility import implied_vol, iv_percentile
 
@@ -393,7 +393,7 @@ class EvidenceCollector:
         strike_gte: float | None,
         strike_lte: float | None,
     ) -> None:
-        """Open interest lives in the trading-API contract list, not the
+        """Open interest lives in the agents-API contract list, not the
         market-data chain. A failure here just leaves ``open_interest`` missing."""
         try:
             contracts = await self._mcp.get_option_contracts(

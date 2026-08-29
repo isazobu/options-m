@@ -448,7 +448,7 @@ async def _noop() -> None:
 
 # ---- paper-mode enforcement -------------------------------------------
 #
-# Alpaca's own paper-trading skill requires unattended automation to assert
+# Alpaca's own paper-agents skill requires unattended automation to assert
 # paper at startup and exit if it cannot, because a live account returns the
 # same response shape as a paper one — nothing later in the run would catch it.
 

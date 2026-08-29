@@ -33,8 +33,8 @@ from options_m.store import Store
 logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = (
-    "You are a read-only assistant for the options-m autonomous options-trading "
-    "dashboard. Answer questions about the paper trading account, its open "
+    "You are a read-only assistant for the options-m autonomous options-agents "
+    "dashboard. Answer questions about the paper agents account, its open "
     "positions, and the agent's recent decisions using only the tools you are "
     "given. Never state a number you were not given by a tool call. If a tool "
     "fails or has no data, say so plainly instead of guessing. You cannot place, "
@@ -100,7 +100,7 @@ class ChatSession:
                 [
                     _tool_schema(
                         "get_account_summary",
-                        "Current equity, cash, buying power, and options trading level.",
+                        "Current equity, cash, buying power, and options agents level.",
                         {},
                         [],
                     ),

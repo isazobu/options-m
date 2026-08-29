@@ -80,6 +80,14 @@ Position awareness and idempotency are what separate a demo from a toy.
 
 Cadence hourly, plus one run after the close. This is the "it learns" story and it is cheap.
 
+**Scope (2026-08-29 design change): this agent evaluates decisions from *both*
+`StrategistAgent` and `ExecutionAgent`, not only closed-trade outcomes.** A closed trade's
+realised P/L is the clearest signal, but it is not the only decision worth a lesson — a
+`hold` that would have worked, or a `risk.py` rejection that dodged a loser, are both
+information `StrategistAgent` should eventually see again. Two passes per iteration:
+
+**Pass A — closed trades (unchanged from the original design):**
+
 1. Find `trades` rows with `reflected = false`.
 2. For each, build a compact record: the original evidence highlights, the `StrategistAgent`
    thesis from `proposals.llm_read`, what actually happened (realised P/L, holding period,
@@ -90,11 +98,35 @@ Cadence hourly, plus one run after the close. This is the "it learns" story and 
    `TradingAgents` reflection prompt caps length for exactly this reason
    (`graph/reflection.py:20-29`): a lesson is only useful if it is cheap to re-inject.
 4. Write to `lessons(id, ts, symbol, trade_id, lesson, outcome_pct, tags)`.
-5. `store.recent_lessons(symbol, n)` returns same-symbol lessons first, then a couple of
-   cross-symbol ones — the `n_same=5, n_cross=3` shape from
-   `TradingAgents/.../utils/memory.py:70-95`. Phase 3's `StrategistAgent` already calls this
-   inside its evidence-collection step, so the lesson feeds the *next* regime read, not the
-   one that produced the closed trade.
+
+**Pass B — held and rejected proposals (new):**
+
+1. Find `proposals` rows with `status IN ('no_action', 'rejected')` older than a configurable
+   look-back window (e.g. 1-2 trading days — long enough for the underlying to have actually
+   moved) and not yet reflected on (`reflected` gains the same boolean on `proposals` as on
+   `trades`).
+2. For each, compare the thesis/regime read (or the risk rule that rejected it) against what
+   the underlying actually did afterward: did a `hold` on a marginal-conviction setup miss a
+   move that would have paid off, or correctly sidestep one that reversed? Did a `risk.py`
+   rejection (say, a credit spread that failed the 12% credit/width floor) save the account
+   from a structure that would have gone underwater, or was the rule needlessly conservative?
+3. One LLM call, same model tier, same length cap, writing a lesson tagged distinctly from a
+   closed-trade lesson (e.g. `tags: ["hold-review"]` or `["risk-reject-review"]`) so the
+   dashboard and `recent_lessons` can tell the two kinds apart.
+4. This pass is explicitly lower-priority than Pass A — if the LLM budget is tight, Pass A
+   (real trade outcomes) always runs first; Pass B is a nice-to-have that deepens the "it
+   learns" story but must never compete with reflecting on an actual closed trade.
+
+**Shared:**
+
+- `store.recent_lessons(symbol, n)` returns same-symbol lessons first, then a couple of
+  cross-symbol ones — the `n_same=5, n_cross=3` shape from
+  `TradingAgents/.../utils/memory.py:70-95`. Per Phase 2's design change, this is read by
+  `MarketPulseAgent` inside `evidence.collect()`, not by `StrategistAgent` directly — the
+  lesson ends up in the cached evidence pack `StrategistAgent` reads, feeding the *next*
+  regime read for that symbol.
+- Failure-isolate both passes independently: a Pass B failure must never block Pass A, and
+  neither pass may ever affect trading — see the existing rule below.
 
 **No vector store.** Plain SQL over a `lessons` table is simpler, human-auditable, has no
 embedding dependency or cost, and reads better on stage. `AlpacaTradingAgent` runs five
@@ -151,6 +183,12 @@ qty, realized_pnl numeric, exit_reason, reflected bool default false)`,
 `lessons(id, ts, symbol, trade_id, lesson, outcome_pct numeric, tags text[])`,
 `llm_calls(id, ts, role, model, prompt_tokens, completion_tokens, latency_ms, ok, error)` —
 `tier` is dropped from the original column list since there is only one model tier now.
+Also add `ALTER TABLE proposals ADD COLUMN IF NOT EXISTS reflected bool NOT NULL DEFAULT
+false` — Pass B (above) needs the same "have I looked at this yet" flag on `proposals` that
+`trades` already has. `lessons` gains a nullable `proposal_id bigint REFERENCES
+proposals(id)` alongside its existing (now also nullable) `trade_id`: a Pass A lesson sets
+`trade_id`, a Pass B lesson sets `proposal_id`, and exactly one of the two is ever set on a
+given row — never both, never neither.
 
 ### 5. `options-m flatten` — the wind-down CLI
 
@@ -183,9 +221,14 @@ answer to `00-MASTER.md`'s "Operational window & wind-down" section: the run onl
 - `test_position_manager.py` — each exit rule fires at its threshold and not before; rule
   precedence is deterministic; the kill switch does **not** block closes; a vertical closes
   as one multi-leg order; a broker read failure raises rather than reading as flat.
-- `test_reflection.py` — a closed trade produces exactly one lesson; a failing LLM call
-  leaves `reflected = false` and does not raise out of `step()`; `recent_lessons` ordering is
-  same-symbol first.
+- `test_reflection.py` — Pass A: a closed trade produces exactly one lesson with `trade_id`
+  set; a failing LLM call leaves `trades.reflected = false` and does not raise out of
+  `step()`. Pass B: a `no_action`/`rejected` proposal older than the look-back window
+  produces a lesson with `proposal_id` set and a distinct tag; a proposal younger than the
+  look-back window is left alone; Pass B never runs (or is skipped) when it would compete
+  with a pending Pass A lesson for a tight LLM budget; a Pass B failure does not block Pass A
+  in the same iteration. Shared: `recent_lessons` ordering is same-symbol first, and mixes
+  both lesson kinds correctly.
 - `test_api.py` (extend the existing file) — every `/api/*` endpoint returns valid JSON with
   an empty database; `/api/proposals/{id}` returns the full argument chain;
   `POST /api/kill-switch` requires the admin token; `/health` and `/ready` are unchanged.
@@ -200,7 +243,10 @@ answer to `00-MASTER.md`'s "Operational window & wind-down" section: the run onl
       directly (grep confirms it).
 - [ ] A closed trade produces a lesson, and the next proposal for that symbol shows the
       lesson inside `StrategistAgent`'s prompt (assert via the persisted prompt or a debug
-      field).
+      field) — reaching it through the cached evidence pack `MarketPulseAgent` builds, not a
+      direct `recent_lessons` call from `StrategistAgent`.
+- [ ] A `hold` or `risk.py`-rejected proposal older than the look-back window produces a
+      Pass B lesson distinguishable from a Pass A one.
 - [ ] The dashboard renders the full decision chain for a real proposal, end to end,
       including the regime read and the matrix verdict.
 - [ ] The kill switch blocks new orders while letting an exit through.

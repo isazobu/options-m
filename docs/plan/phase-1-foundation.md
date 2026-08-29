@@ -70,7 +70,7 @@ Add, keeping the existing `Field(...)` style and grouping comments:
 alpaca_api_key: str | None = None
 alpaca_secret_key: str | None = None
 alpaca_paper_trade: bool = True
-alpaca_toolsets: str = "account,trading,assets,options-data,stock-data,news"
+alpaca_toolsets: str = "account,agents,assets,options-data,stock-data,news"
 mcp_call_timeout_seconds: float = Field(default=30.0, gt=0)
 mcp_max_retries: int = Field(default=2, ge=0)
 
@@ -255,7 +255,7 @@ A `Store` class wrapping `Database`. All SQL in the codebase lives here.
   compute awake — the README already warns about this. One insert per agent iteration is
   fine; per-symbol inserts inside a loop are not.
 
-### 6. `src/options_m/trading/market_pulse.py` — first real agent
+### 6. `../../src/options_m/agents/market_pulse.py` — first real agent
 
 Implements the `Agent` protocol.
 
