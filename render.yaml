@@ -52,8 +52,11 @@ services:
 
       # The MCP server runs as a child process of this one, so the free
       # instance holds two Python processes. Keep the toolset list tight.
+      # `trading` carries positions, orders, place_option_order and
+      # close_position — without it the service starts healthy and cannot
+      # trade. `news` is gone with the technical-analysis-only design.
       - key: ALPACA_TOOLSETS
-        value: account,agents,assets,options-data,stock-data,news
+        value: account,trading,assets,options-data,stock-data
       # Must stay exactly "true". The service refuses to start on any value
       # that would select the live agents endpoint.
       - key: ALPACA_PAPER_TRADE
