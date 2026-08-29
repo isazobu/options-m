@@ -15,6 +15,7 @@ from options_m.api import create_app
 from options_m.config import Settings
 from options_m.db import Database
 from options_m.lifecycle import install_signal_handlers
+from options_m.llm import FeatherlessLlm
 from options_m.logging_config import setup_logging
 from options_m.mcp_client import AlpacaMcp, LiveTradingRefused, assert_paper_intent
 from options_m.server import build_server, serve
@@ -40,10 +41,18 @@ async def run(settings: Settings) -> None:
 
     # Both dependencies tolerate being unconfigured, so the process still boots
     # without credentials and reports the gap on /ready instead of crash-looping.
+    llm = FeatherlessLlm(
+        api_key=settings.featherless_api_key,
+        base_url=settings.featherless_base_url,
+        model=settings.featherless_model_deep,
+        timeout_seconds=settings.llm_timeout_seconds,
+        daily_token_budget=settings.llm_daily_token_budget,
+    )
+
     async with Database(settings) as db, AlpacaMcp(settings) as mcp:
         await migrate.apply(db)
         store = Store(db)
-        agents = build_agents(settings, mcp, store)
+        agents = build_agents(settings, mcp, store, llm)
         server = build_server(
             create_app(db, agents, mcp=mcp, store=store, settings=settings), settings
         )

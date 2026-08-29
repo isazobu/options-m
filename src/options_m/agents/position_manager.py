@@ -21,6 +21,7 @@ job until then.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import time
@@ -85,22 +86,52 @@ class PositionManagerAgent:
             underlying = _underlying_symbol(position)
             grouped.setdefault(underlying, []).append(position)
 
-        # {underlying: {"legs": [...]}} -- a list, not a single position dict,
-        # because one options structure opens as multiple legs (up to 4) that
-        # each show up as their own get_all_positions entry sharing an
-        # underlying. Grouping here is what lets Phase 2/3's "max one open
-        # structure per underlying" checks read a single row per symbol.
-        payload_by_symbol = {
+        # {underlying: {"legs": [...]}} — grouped so Phase 3's "max one open
+        # structure per underlying" reads a single row per symbol.
+        payload_by_symbol: dict[str, dict[str, Any]] = {
             underlying: {"legs": legs} for underlying, legs in grouped.items()
         }
+
+        # Mark to market: compute unrealized P&L across all legs right now,
+        # not just at exit-check time. This keeps "what is open and how is it
+        # doing" always a fresh local read for the dashboard and for
+        # StrategistAgent's pre-filter.
+        total_unrealized_pl = _total_unrealized_pl(positions)
+        total_market_value = _total_market_value(positions)
+        for underlying, legs in grouped.items():
+            payload_by_symbol[underlying]["unrealized_pl"] = _total_unrealized_pl(legs)
+            payload_by_symbol[underlying]["market_value"] = _total_market_value(legs)
+
         await self._store.replace_positions(payload_by_symbol)
 
         detail: dict[str, Any] = {
             "open_underlyings": len(grouped),
             "open_legs": len(positions),
+            "unrealized_pl": round(total_unrealized_pl, 2),
+            "market_value": round(total_market_value, 2),
         }
         logger.info("position pulse", extra=detail)
         return detail
+
+
+def _total_unrealized_pl(positions: list[dict[str, Any]]) -> float:
+    """Sum of unrealized_pl across all position entries (legs)."""
+    total = 0.0
+    for p in positions:
+        val = p.get("unrealized_pl")
+        with contextlib.suppress(TypeError, ValueError):
+            total += float(val)  # type: ignore[arg-type]
+    return total
+
+
+def _total_market_value(positions: list[dict[str, Any]]) -> float:
+    """Sum of absolute market_value across all position entries."""
+    total = 0.0
+    for p in positions:
+        val = p.get("market_value")
+        with contextlib.suppress(TypeError, ValueError):
+            total += abs(float(val))  # type: ignore[arg-type]
+    return total
 
 
 def _underlying_symbol(position: dict[str, Any]) -> str:

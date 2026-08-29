@@ -4,7 +4,8 @@
 --   * timestamps are timestamptz, defaulting to now()
 --   * money is numeric, never double precision — float rounding has no place
 --     anywhere near a P/L figure
---   * later phases add tables and columns; nothing here is ever rewritten
+--   * later phases add tables and columns; nothing here is ever rewritten;
+--     new columns on existing tables use ALTER TABLE ... ADD COLUMN IF NOT EXISTS
 
 CREATE TABLE IF NOT EXISTS agent_runs (
     id          bigserial PRIMARY KEY,
@@ -66,33 +67,45 @@ CREATE TABLE IF NOT EXISTS kill_switch (
 INSERT INTO kill_switch (id, engaged) VALUES (1, false)
     ON CONFLICT (id) DO NOTHING;
 
--- One near-the-money implied-vol reading per underlying per pull. The evidence
--- pack's iv_rank (phase 2) is a symbol's latest reading against its own recent
--- history, so this table has to start filling before the strategist runs.
--- iv_atm is a vol fraction (0.24 == 24%), kept numeric to stay off float.
+-- Per-symbol implied-vol snapshots written by EvidenceCollector via
+-- MarketPulseAgent. iv_atm is a vol fraction (0.24 == 24%), kept numeric to
+-- stay off float.
 CREATE TABLE IF NOT EXISTS iv_history (
-    id      bigserial   PRIMARY KEY,
-    ts      timestamptz NOT NULL DEFAULT now(),
-    symbol  text        NOT NULL,
-    iv_atm  numeric     NOT NULL,
-    dte     integer,
-    spot    numeric,
-    payload jsonb
-
--- One row per StrategyIntent considered. arguments/verdict stay null until
--- phase 3 writes the bull/bear/vol/PM arguments there.
-CREATE TABLE IF NOT EXISTS proposals (
-    id         bigserial PRIMARY KEY,
-    ts         timestamptz NOT NULL DEFAULT now(),
-    underlying text        NOT NULL,
-    status     text        NOT NULL DEFAULT 'pending',
-    intent     jsonb       NOT NULL,
-    evidence   jsonb,
-    arguments  jsonb,
-    verdict    jsonb,
-    plan       jsonb,
-    error      text
+    id                  bigserial   PRIMARY KEY,
+    ts                  timestamptz NOT NULL DEFAULT now(),
+    symbol              text        NOT NULL,
+    iv_atm              numeric,
+    dte                 integer,
+    spot                numeric,
+    payload             jsonb,
+    put_call_skew       numeric,
+    term_structure      numeric,
+    median_spread_pct   numeric,
+    total_open_interest bigint
 );
+
+CREATE INDEX IF NOT EXISTS iv_history_symbol_ts_idx ON iv_history (symbol, ts DESC);
+
+-- One row per StrategyIntent considered. llm_read and matrix_verdict are
+-- written by StrategistAgent (Phase 3); arguments/verdict/plan are written by
+-- ExecutionAgent; they live in separate columns so partial updates from
+-- different agents don't collide.
+CREATE TABLE IF NOT EXISTS proposals (
+    id             bigserial   PRIMARY KEY,
+    ts             timestamptz NOT NULL DEFAULT now(),
+    underlying     text        NOT NULL,
+    status         text        NOT NULL DEFAULT 'pending',
+    intent         jsonb       NOT NULL DEFAULT '{}',
+    evidence       jsonb,
+    arguments      jsonb,
+    verdict        jsonb,
+    plan           jsonb,
+    error          text
+);
+
+-- Phase 3 additions: LLM regime read + deterministic matrix verdict.
+ALTER TABLE proposals ADD COLUMN IF NOT EXISTS llm_read jsonb;
+ALTER TABLE proposals ADD COLUMN IF NOT EXISTS matrix_verdict jsonb;
 
 CREATE INDEX IF NOT EXISTS proposals_status_ts_idx ON proposals (status, ts);
 CREATE INDEX IF NOT EXISTS proposals_underlying_ts_idx ON proposals (underlying, ts DESC);
@@ -115,9 +128,7 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE INDEX IF NOT EXISTS orders_proposal_idx ON orders (proposal_id);
 CREATE INDEX IF NOT EXISTS orders_status_idx ON orders (status);
 
--- Every rejection, from either strategy_builder or risk.py. "The agent
--- declined 14 trades and why" is stronger judging material than the trades
--- it took. proposal_id is nullable: the kill-switch halt logs one with none.
+-- Every rejection, from either strategy_builder or risk.py.
 CREATE TABLE IF NOT EXISTS risk_events (
     id          bigserial PRIMARY KEY,
     ts          timestamptz NOT NULL DEFAULT now(),
@@ -129,27 +140,10 @@ CREATE TABLE IF NOT EXISTS risk_events (
 CREATE INDEX IF NOT EXISTS risk_events_ts_idx ON risk_events (ts DESC);
 CREATE INDEX IF NOT EXISTS risk_events_proposal_idx ON risk_events (proposal_id);
 
--- One row per symbol per evidence-collection run. Feeds iv_rank once a
--- couple of days of history accumulate; started in this phase deliberately.
-CREATE TABLE IF NOT EXISTS iv_history (
-    id                  bigserial PRIMARY KEY,
-    ts                  timestamptz NOT NULL DEFAULT now(),
-    symbol              text        NOT NULL,
-    iv_atm              numeric,
-    put_call_skew       numeric,
-    term_structure      numeric,
-    median_spread_pct   numeric,
-    total_open_interest bigint
-);
-
-CREATE INDEX IF NOT EXISTS iv_history_symbol_ts_idx ON iv_history (symbol, ts DESC);
-
--- Local cache of Alpaca's trading calendar (2026-08-29 design change). Populated
--- by MarketPulseAgent from get_calendar for a rolling forward window and
--- refreshed once the window shrinks under the configured margin. Every other
--- agent's "is the market open" check reads this table instead of calling
--- get_clock -- accepted risk: a once-a-day refresh will not catch an
--- unscheduled intraday circuit-breaker halt.
+-- Local cache of Alpaca's trading calendar. Populated by MarketPulseAgent from
+-- get_calendar for a rolling forward window and refreshed once the window
+-- shrinks under the configured margin. Every other agent's "is the market open"
+-- check reads this table instead of calling get_clock.
 CREATE TABLE IF NOT EXISTS market_calendar (
     date          date        PRIMARY KEY,
     open          timestamptz NOT NULL,
@@ -157,10 +151,8 @@ CREATE TABLE IF NOT EXISTS market_calendar (
     session_type  text        NOT NULL DEFAULT 'full'
 );
 
--- Single-row cache of account state, upserted by MarketPulseAgent on the same
--- per-tick get_account_info/get_account_config call that already feeds
--- equity_curve -- no extra Alpaca traffic. Other agents read this instead of
--- calling get_account_info themselves.
+-- Single-row cache of account state, upserted by MarketPulseAgent on every
+-- tick. Other agents read this instead of calling get_account_info themselves.
 CREATE TABLE IF NOT EXISTS account (
     id                     smallint    PRIMARY KEY DEFAULT 1,
     equity                 numeric,
@@ -171,13 +163,51 @@ CREATE TABLE IF NOT EXISTS account (
     CONSTRAINT account_singleton CHECK (id = 1)
 );
 
--- Current-state cache of open positions, keyed by underlying symbol. Sole
--- writer is PositionManagerAgent, piggybacked on its existing per-tick
--- get_all_positions call. Unlike every other table in this file this one is
--- overwritten in place rather than appended to -- it mirrors "what is open
--- right now", not history.
+-- Current-state cache of open positions. Sole writer: PositionManagerAgent,
+-- piggybacked on its per-tick get_all_positions call. Overwritten in place
+-- unlike the append-only tables above.
 CREATE TABLE IF NOT EXISTS positions (
     symbol      text        PRIMARY KEY,
     payload     jsonb       NOT NULL,
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
+
+-- Per-symbol evidence cache. Sole writer: MarketPulseAgent (every 60s, one row
+-- per universe symbol, overwritten in place). StrategistAgent reads from here
+-- instead of calling evidence.collect() itself.
+CREATE TABLE IF NOT EXISTS evidence (
+    symbol      text        PRIMARY KEY,
+    payload     jsonb       NOT NULL,
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+
+-- Post-trade lessons written by ReflectionAgent. Keyed on reflected_on so each
+-- order or proposal is reflected on at most once.
+CREATE TABLE IF NOT EXISTS lessons (
+    id            bigserial   PRIMARY KEY,
+    ts            timestamptz NOT NULL DEFAULT now(),
+    symbol        text,
+    lesson        text        NOT NULL,
+    source        text        NOT NULL,
+    reflected_on  text        NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS lessons_symbol_ts_idx ON lessons (symbol, ts DESC);
+CREATE INDEX IF NOT EXISTS lessons_ts_idx ON lessons (ts DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS lessons_reflected_on_idx ON lessons (reflected_on);
+
+-- LLM call log for token-budget tracking and the decision-timeline dashboard.
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id                bigserial   PRIMARY KEY,
+    ts                timestamptz NOT NULL DEFAULT now(),
+    agent             text        NOT NULL,
+    model             text        NOT NULL,
+    prompt_tokens     integer     NOT NULL DEFAULT 0,
+    completion_tokens integer     NOT NULL DEFAULT 0,
+    latency_ms        integer     NOT NULL DEFAULT 0,
+    ok                boolean     NOT NULL,
+    error             text
+);
+
+CREATE INDEX IF NOT EXISTS llm_calls_ts_idx ON llm_calls (ts DESC);
+CREATE INDEX IF NOT EXISTS llm_calls_agent_ts_idx ON llm_calls (agent, ts DESC);

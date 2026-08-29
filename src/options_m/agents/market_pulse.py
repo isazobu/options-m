@@ -1,0 +1,319 @@
+"""MarketPulseAgent -- the service's senses.
+
+Runs every minute. Three jobs, all performed without an LLM:
+
+1. Keep the local market_calendar cache current (get_calendar once, refresh
+   when the rolling window shrinks below the margin).
+2. Keep the account cache current (equity, cash, buying_power, options level)
+   and append one equity-curve point per tick.
+3. For every symbol in the fixed universe: collect the full evidence pack
+   (trend from daily bars, IV/RV regime from the option chain, earnings-
+   blackout flag), write it to the local evidence cache, and derive a
+   deterministic candidate score from those signals so StrategistAgent can
+   rank symbols without calling any MCP tool itself.
+
+``get_market_movers`` and ``get_most_active_stocks`` are gone. Candidate
+ranking is now driven entirely by technical evidence (IV/RV ratio, RSI
+extremity, realised volatility) — the same signals the Strategy Matrix uses.
+A symbol that appears "most active" but has no options edge is invisible to
+this system by design.
+
+Accepted risk, stated explicitly: a once-a-day calendar refresh will not
+catch an unscheduled intraday circuit-breaker halt. Acceptable for this
+project's short run; would need revisiting for a longer-lived or
+real-capital deployment.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from datetime import UTC, date, datetime, timedelta
+from datetime import time as _time
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from options_m.config import Settings
+from options_m.earnings import is_earnings_blackout
+from options_m.evidence.evidence import EvidenceCollector
+from options_m.mcp_client import AlpacaMcp, finite_float
+from options_m.store import Store
+
+logger = logging.getLogger(__name__)
+
+_EXCHANGE_TZ = ZoneInfo("America/New_York")
+
+# IV/RV thresholds for the candidate score (mirror matrix.py, but kept local
+# so this module has no import dependency on the reasoning layer).
+_IV_RV_EDGE_THRESHOLD = 1.05   # any premium above this scores positively
+_RSI_NEUTRAL = 50.0
+
+
+class MarketPulseAgent:
+    """Market-calendar + account telemetry + evidence-driven candidate ranking."""
+
+    def __init__(self, settings: Settings, mcp: AlpacaMcp, store: Store) -> None:
+        self._settings = settings
+        self._mcp = mcp
+        self._store = store
+        self._universe = settings.universe_symbols
+        self._evidence = EvidenceCollector(settings, mcp, store)
+
+    @property
+    def name(self) -> str:
+        return "market_pulse"
+
+    @property
+    def interval_seconds(self) -> float:
+        return self._settings.market_pulse_interval_seconds
+
+    async def step(self) -> None:
+        """One iteration. Raises on failure so the supervisor can back off."""
+        started = time.monotonic()
+        ok = True
+        error: str | None = None
+        detail: dict[str, Any] = {}
+        try:
+            detail = await self._run()
+        except Exception as exc:
+            ok = False
+            error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            await self._store.record_agent_run(
+                self.name,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                ok=ok,
+                error=error,
+                detail=detail or None,
+            )
+
+    async def _run(self) -> dict[str, Any]:
+        calendar_refreshed = await self._ensure_calendar_fresh()
+
+        now = datetime.now(UTC)
+        is_open = await self._store.market_is_open(now)
+
+        account = await self._mcp.get_account_info()
+        account_config = await self._mcp.get_account_config()
+        options_level = _parse_options_level(account_config)
+
+        equity = finite_float(account.get("equity"))
+        cash = finite_float(account.get("cash"))
+        buying_power = finite_float(account.get("buying_power"))
+
+        await self._store.upsert_account(
+            equity=equity,
+            cash=cash,
+            buying_power=buying_power,
+            options_trading_level=options_level,
+        )
+
+        cached_positions = await self._store.get_cached_positions()
+        positions_count = len(cached_positions)
+
+        await self._store.append_equity(
+            equity=equity,
+            cash=cash,
+            buying_power=buying_power,
+            positions_count=positions_count,
+        )
+
+        detail: dict[str, Any] = {
+            "market_open": is_open,
+            "calendar_refreshed": calendar_refreshed,
+            "positions": positions_count,
+            "equity": equity,
+            "options_trading_level": options_level,
+        }
+
+        if not is_open:
+            logger.info("market closed", extra=detail)
+            detail["candidates"] = 0
+            detail["evidence_written"] = 0
+            return detail
+
+        # Collect evidence for every universe symbol, derive scores, persist.
+        # Each symbol is independent: a failure on one does not stop the rest.
+        today = now.astimezone(_EXCHANGE_TZ).date()
+        candidates: list[dict[str, Any]] = []
+        evidence_written = 0
+
+        for symbol in self._universe:
+            try:
+                pack = await self._evidence.collect(
+                    symbol,
+                    dte_min=self._settings.risk_dte_min,
+                    dte_max=self._settings.risk_dte_max,
+                )
+                # Augment with fields StrategistAgent needs so it can classify
+                # trend + IV regime without reading the raw indicators itself.
+                pack["earnings_blackout"] = is_earnings_blackout(symbol, today)
+                if isinstance(options_level, int):
+                    pack["options_trading_level"] = options_level
+
+                # Only cache packs that have at least a trend block with real
+                # data. A pack where every section is MISSING is indistinguishable
+                # from a stale row and gives StrategistAgent nothing to reason
+                # from -- skipping it is safer than caching an empty shell.
+                if not isinstance(pack.get("trend"), dict):
+                    logger.warning(
+                        "evidence pack has no trend data, skipping cache write",
+                        extra={"symbol": symbol},
+                    )
+                    continue
+
+                await self._store.upsert_evidence_cache(symbol, pack)
+                evidence_written += 1
+
+                score, reason = _score_from_evidence(pack)
+                candidates.append(
+                    {
+                        "symbol": symbol,
+                        "score": score,
+                        "reason": reason,
+                        "payload": {},
+                    }
+                )
+            except Exception:
+                logger.warning(
+                    "evidence collection failed",
+                    extra={"symbol": symbol},
+                    exc_info=True,
+                )
+
+        candidates.sort(key=lambda r: float(r["score"]), reverse=True)
+        if candidates:
+            await self._store.save_candidates(candidates)
+
+        detail["candidates"] = len(candidates)
+        detail["evidence_written"] = evidence_written
+        logger.info("market pulse", extra=detail)
+        return detail
+
+    async def _ensure_calendar_fresh(self) -> bool:
+        """Populate or extend the local market_calendar cache."""
+        today = datetime.now(UTC).astimezone(_EXCHANGE_TZ).date()
+        max_date = await self._store.calendar_max_date()
+        margin = timedelta(days=self._settings.market_calendar_refresh_margin_days)
+        if max_date is not None and max_date - today > margin:
+            return False
+
+        horizon = timedelta(days=self._settings.market_calendar_horizon_days)
+        end = today + horizon
+        raw_rows = await self._mcp.get_calendar(today.isoformat(), end.isoformat())
+        rows = [_parse_calendar_entry(entry) for entry in raw_rows]
+        await self._store.upsert_market_calendar(rows)
+        logger.info(
+            "market calendar refreshed",
+            extra={"rows": len(rows), "through": end.isoformat()},
+        )
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Evidence-driven candidate scoring
+# ---------------------------------------------------------------------------
+
+def _score_from_evidence(pack: dict[str, Any]) -> tuple[float, str]:
+    """Derive a deterministic candidate score from the evidence pack.
+
+    Higher score = more interesting to StrategistAgent. The signals:
+
+    - IV/RV edge: how much implied vol exceeds realised vol. The further above
+      1.0, the more premium is available to collect (or the clearer the signal
+      that options are mispriced relative to historical move).
+    - RSI extremity: how far RSI14 is from neutral (50). A strong trend in
+      either direction is more actionable than a flat oscillation.
+    - Realised vol: a baseline measure of how much the underlying moves; higher
+      RV means options strategies have more room for premium or spread width.
+
+    Earnings-blacked-out symbols score 0.0 so they sink below every
+    tradeable symbol without being excluded from the evidence cache.
+    """
+    if pack.get("earnings_blackout"):
+        return 0.0, "earnings_blackout"
+
+    score = 0.0
+    reasons: list[str] = []
+
+    trend = pack.get("trend")
+    options = pack.get("options")
+
+    # RSI extremity component
+    if isinstance(trend, dict):
+        rsi = trend.get("rsi_14")
+        if isinstance(rsi, (int, float)):
+            extremity = abs(rsi - _RSI_NEUTRAL)
+            if extremity >= 10:
+                rsi_score = round(extremity / 10, 3)
+                score += rsi_score
+                reasons.append(f"rsi {rsi:.1f}")
+
+        rv = trend.get("realised_vol_20d")
+        if isinstance(rv, (int, float)) and rv > 0:
+            rv_score = round(min(rv * 2, 1.5), 3)
+            score += rv_score
+            reasons.append(f"rv {rv:.1%}")
+
+    # IV/RV edge component
+    if isinstance(options, dict) and isinstance(trend, dict):
+        iv_atm = options.get("iv_atm")
+        rv = trend.get("realised_vol_20d")
+        if (
+            isinstance(iv_atm, (int, float))
+            and isinstance(rv, (int, float))
+            and rv > 0
+        ):
+            ratio = iv_atm / rv
+            if ratio > _IV_RV_EDGE_THRESHOLD:
+                edge_score = round(min((ratio - 1.0) * 3, 3.0), 3)
+                score += edge_score
+                reasons.append(f"iv/rv {ratio:.2f}")
+
+    return round(score, 4), ", ".join(reasons)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _parse_options_level(account_config: dict[str, Any]) -> int | None:
+    """Effective options trading level, never the merely-approved one."""
+    for key in ("options_trading_level", "options_trading_level_effective"):
+        value = account_config.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _parse_calendar_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """Normalise one get_calendar row into {date, open, close, session_type}."""
+    date_str = entry.get("date")
+    open_str = entry.get("open")
+    close_str = entry.get("close")
+    if (
+        not isinstance(date_str, str)
+        or not isinstance(open_str, str)
+        or not isinstance(close_str, str)
+    ):
+        msg = f"calendar entry missing date/open/close: {entry!r}"
+        raise ValueError(msg)
+
+    day = date.fromisoformat(date_str)
+    open_dt = datetime.combine(day, _parse_hhmm(open_str), tzinfo=_EXCHANGE_TZ)
+    close_dt = datetime.combine(day, _parse_hhmm(close_str), tzinfo=_EXCHANGE_TZ)
+    return {
+        "date": day,
+        "open": open_dt.astimezone(UTC),
+        "close": close_dt.astimezone(UTC),
+        "session_type": "full",
+    }
+
+
+def _parse_hhmm(value: str) -> _time:
+    hour_str, _, minute_str = value.partition(":")
+    return _time(hour=int(hour_str), minute=int(minute_str))

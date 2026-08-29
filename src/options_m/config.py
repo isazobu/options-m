@@ -61,9 +61,9 @@ class Settings(BaseSettings):
     alpaca_secret_key: str | None = None
     # Paper-only by design, and not really a knob: the MCP transport pins
     # ALPACA_PAPER_TRADE="true" for the server regardless, and setting this
-    # False makes startup fail rather than arming live trading.
+    # False makes startup fail rather than arming live agents.
     alpaca_paper_trade: bool = True
-    alpaca_toolsets: str = "account,trading,assets,options-data,stock-data"
+    alpaca_toolsets: str = "account,agents,assets,options-data,stock-data"
     mcp_call_timeout_seconds: float = Field(default=30.0, gt=0)
     mcp_max_retries: int = Field(default=2, ge=0)
 
@@ -118,14 +118,41 @@ class Settings(BaseSettings):
     cors_allowed_origins: str = ""
 
     # Featherless, reached over plain HTTPS (OpenAI-compatible chat/completions).
-    # Used today only by the read-only dashboard chat; Phase 3's LLM crew will
-    # extend the same client rather than replace it.
     featherless_api_key: str | None = None
     featherless_base_url: str = "https://api.featherless.ai/v1"
     # Never hardcode a model id in source — it must be free to swap by env.
     featherless_chat_model: str = ""
+    # Phase 3: StrategistAgent uses a separate deep-tier model (one call per
+    # iteration). There is no fast-tier analyst crew — one model only.
+    featherless_model_deep: str = ""
     chat_max_tool_calls: int = Field(default=4, ge=0)
     chat_timeout_seconds: float = Field(default=30.0, gt=0)
+    llm_timeout_seconds: float = Field(default=30.0, gt=0)
+    llm_max_tokens: int = Field(default=1024, gt=0)
+    # Soft daily token ceiling — only halts StrategistAgent, never
+    # PositionManagerAgent (exits must always work).
+    llm_daily_token_budget: int = Field(default=100_000, gt=0)
+
+    # Phase 3 — StrategistAgent cadence and decision thresholds.
+    strategist_interval_seconds: float = Field(default=300.0, gt=0)
+    # Conviction below this floor forces "hold" even when the matrix would
+    # otherwise produce a structure.
+    conviction_floor: float = Field(default=0.55, ge=0.0, le=1.0)
+    # Effective options trading level override. Normally read from the account
+    # cache; this caps it (useful if the paper account auto-approves Level 3
+    # but you want to test Level-2 degradation).
+    options_level: int = Field(default=3, ge=1, le=3)
+
+    # Per-structure defaults consumed by matrix.py.
+    short_delta_default: float = Field(default=0.25, gt=0.0, lt=1.0)
+    spread_width_default: float = Field(default=5.0, gt=0.0)
+    # DTE window for new structures (distinct from risk_dte_min/max which are
+    # the hard account-wide bounds risk.py enforces regardless of intent).
+    dte_target_min: int = Field(default=21, gt=0)
+    dte_target_max: int = Field(default=38, gt=0)
+
+    # Phase 4 — ReflectionAgent.
+    reflection_interval_seconds: float = Field(default=3600.0, gt=0)
 
     @property
     def cors_origins(self) -> tuple[str, ...]:

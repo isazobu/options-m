@@ -25,8 +25,20 @@ class StrategyIntent(BaseModel):
 
     action: Literal["open", "hold", "close"]
     strategy: Literal[
+        # Single-leg directional (Level 2)
         "long_call",
         "long_put",
+        # Debit spreads (Level 3)
+        "call_debit_spread",
+        "put_debit_spread",
+        # Credit spreads (Level 3)
+        "put_credit_spread",
+        "call_credit_spread",
+        # Multi-leg neutral (Level 2 / Level 3)
+        "long_strangle",
+        "iron_condor",
+        "iron_butterfly",
+        # Legacy names kept for backward compatibility
         "debit_call_spread",
         "debit_put_spread",
         "covered_call",
@@ -121,3 +133,22 @@ class Rejection(BaseModel):
     proposal_id: int
     reason: str
     detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class RegimeRead(BaseModel):
+    """The one thing the LLM produces each StrategistAgent iteration.
+
+    Trend and IV regime are NOT re-decided here — they are already classified
+    deterministically in evidence.py and handed to the model as given facts.
+    The model produces only the qualitative judgment: why this setup, what
+    would invalidate it, and how confident it is.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    thesis: str
+    invalidation: str
+    # 0.0 (no conviction) to 1.0 (maximum conviction). A value below the
+    # configured floor forces "hold" in the matrix even when trend + IV regime
+    # would otherwise produce a structure.
+    conviction: float = Field(ge=0.0, le=1.0)

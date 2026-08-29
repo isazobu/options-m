@@ -30,7 +30,7 @@ _MEMORY_LIMIT = 2_000
 
 # The exchange's own calendar is expressed in its local time; every
 # open/close boundary check must happen in this zone, never in UTC directly,
-# or a late-evening UTC timestamp can resolve to the wrong trading day.
+# or a late-evening UTC timestamp can resolve to the wrong agents day.
 _EXCHANGE_TZ = ZoneInfo("America/New_York")
 
 
@@ -64,17 +64,23 @@ class Store:
         self._memory_equity: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
         self._memory_snapshots: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
         self._memory_candidates: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
-        self._memory_iv_history: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
+        # Per-symbol deques: _memory_iv_history[symbol] → deque of readings.
+        self._memory_iv_history: dict[str, deque[dict[str, Any]]] = {}
         self._memory_kill_switch: tuple[bool, str | None] = (False, None)
         self._memory_proposals: dict[int, dict[str, Any]] = {}
         self._memory_proposal_seq = 0
         self._memory_orders: dict[str, dict[str, Any]] = {}
         self._memory_order_seq = 0
         self._memory_risk_events: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
-        self._memory_iv_history: dict[str, deque[dict[str, Any]]] = {}
         self._memory_calendar: dict[date, dict[str, Any]] = {}
         self._memory_account: dict[str, Any] | None = None
         self._memory_positions: dict[str, dict[str, Any]] = {}
+        # Evidence cache: sole writer MarketPulseAgent, sole reader StrategistAgent.
+        self._memory_evidence: dict[str, dict[str, Any]] = {}
+        # Lessons written by ReflectionAgent.
+        self._memory_lessons: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
+        # LLM call log for token-budget tracking.
+        self._memory_llm_calls: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
         if not db.is_enabled:
             logger.warning(
                 "no database configured; the store is keeping the last %d rows per table "
@@ -207,7 +213,7 @@ class Store:
         """
         symbol = symbol.upper()
         if not self._db.is_enabled:
-            self._memory_iv_history.appendleft(
+            self._memory_iv_history.setdefault(symbol, deque(maxlen=_MEMORY_LIMIT)).appendleft(
                 {
                     "ts": _now(),
                     "symbol": symbol,
@@ -260,11 +266,10 @@ class Store:
         )
 
     async def recent_iv(self, symbol: str, limit: int = 252) -> list[dict[str, Any]]:
-        """This symbol's implied-vol readings, newest first."""
+        """This symbol's implied-vol readings (from append_iv_snapshot), newest first."""
         symbol = symbol.upper()
         if not self._db.is_enabled:
-            rows = [r for r in self._memory_iv_history if r["symbol"] == symbol]
-            return rows[:limit]
+            return list(self._memory_iv_history.get(symbol, ()))[:limit]
         return await self._fetch(
             "SELECT ts, symbol, iv_atm, dte, spot "
             "FROM iv_history WHERE symbol = %s ORDER BY ts DESC LIMIT %s",
@@ -283,11 +288,27 @@ class Store:
         return iv_rank(values)
 
     async def recent_lessons(self, symbol: str | None = None, n: int = 3) -> list[str]:
-        """Post-trade lessons for a symbol (or portfolio-wide when ``symbol`` is
-        ``None``). Phase 4's reflection agent fills this; until then it is
-        deliberately empty rather than absent, so callers can wire it now."""
-        del symbol, n
-        return []
+        """Most recent lessons for a symbol, or portfolio-wide when symbol is None.
+
+        ReflectionAgent writes these; until then returns an empty list so
+        evidence.py's shape is stable and callers can wire it now.
+        """
+        if not self._db.is_enabled:
+            rows = list(self._memory_lessons)
+            if symbol is not None:
+                rows = [r for r in rows if r.get("symbol") == symbol.upper()]
+            return [str(r["lesson"]) for r in rows[:n]]
+        if symbol is not None:
+            rows = await self._fetch(
+                "SELECT lesson FROM lessons WHERE symbol = %s ORDER BY ts DESC LIMIT %s",
+                (symbol.upper(), n),
+            )
+        else:
+            rows = await self._fetch(
+                "SELECT lesson FROM lessons ORDER BY ts DESC LIMIT %s",
+                (n,),
+            )
+        return [str(row["lesson"]) for row in rows]
 
     async def is_kill_switch_engaged(self) -> bool:
         if not self._db.is_enabled:
@@ -312,37 +333,6 @@ class Store:
             await conn.commit()
 
     # ---- Proposals -----------------------------------------------------
-
-    async def save_proposal(
-        self, *, underlying: str, intent: dict[str, Any], evidence: dict[str, Any]
-    ) -> int:
-        """Insert a new pending proposal. Returns its id."""
-        if not self._db.is_enabled:
-            self._memory_proposal_seq += 1
-            proposal_id = self._memory_proposal_seq
-            self._memory_proposals[proposal_id] = {
-                "id": proposal_id,
-                "ts": _now(),
-                "underlying": underlying,
-                "status": "pending",
-                "intent": intent,
-                "evidence": evidence,
-                "arguments": None,
-                "verdict": None,
-                "plan": None,
-                "error": None,
-            }
-            return proposal_id
-        async with self._db.connection() as conn, conn.cursor() as cur:
-            await cur.execute(
-                "INSERT INTO proposals (underlying, intent, evidence) "
-                "VALUES (%s, %s, %s) RETURNING id",
-                (underlying, json.dumps(intent), json.dumps(evidence)),
-            )
-            row = cast("tuple[Any, ...] | None", await cur.fetchone())
-            await conn.commit()
-            assert row is not None  # noqa: S101 - RETURNING always yields a row on success
-            return int(row[0])
 
     async def pending_proposals(self, limit: int = 5) -> list[dict[str, Any]]:
         """Proposals awaiting execution, oldest first — a fair queue."""
@@ -655,23 +645,6 @@ class Store:
             )
             await conn.commit()
 
-    async def recent_iv(self, symbol: str, n: int = 20) -> list[dict[str, Any]]:
-        if not self._db.is_enabled:
-            return list(self._memory_iv_history.get(symbol, ()))[:n]
-        return await self._fetch(
-            "SELECT ts, iv_atm, put_call_skew, term_structure, median_spread_pct, "
-            "total_open_interest FROM iv_history WHERE symbol = %s ORDER BY ts DESC LIMIT %s",
-            (symbol, n),
-        )
-
-    async def recent_lessons(self, symbol: str, n: int = 5) -> list[dict[str, Any]]:
-        """Phase 4 fills this in with a real ``lessons`` table.
-
-        Returns an empty list unconditionally so evidence.py's shape is stable
-        now and does not need to change again when Phase 4 lands.
-        """
-        return []
-
     # ---- Market calendar cache (2026-08-29 design change) --------------
     # Sole writer: MarketPulseAgent. Every other agent's "is the market open"
     # check goes through market_is_open() below -- never a live get_clock call.
@@ -834,6 +807,189 @@ class Store:
             await self.upsert_position(symbol, payload)
         for stale_symbol in existing - set(payload_by_symbol):
             await self.remove_position(stale_symbol)
+
+    # ---- Evidence cache (Phase 3) ----------------------------------------
+    # Sole writer: MarketPulseAgent (every 60s, per universe symbol, overwritten
+    # in place). StrategistAgent reads from here instead of calling
+    # evidence.collect() itself.
+
+    async def upsert_evidence_cache(self, symbol: str, payload: dict[str, Any]) -> None:
+        symbol = symbol.upper()
+        if not self._db.is_enabled:
+            self._memory_evidence[symbol] = {
+                "symbol": symbol,
+                "payload": payload,
+                "updated_at": _now(),
+            }
+            return
+        async with self._db.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO evidence (symbol, payload, updated_at) "
+                "VALUES (%s, %s, now()) "
+                "ON CONFLICT (symbol) DO UPDATE SET payload = EXCLUDED.payload, "
+                "updated_at = now()",
+                (symbol, json.dumps(payload)),
+            )
+            await conn.commit()
+
+    async def get_cached_evidence(self, symbol: str) -> dict[str, Any] | None:
+        """The latest evidence pack MarketPulseAgent wrote for this symbol.
+
+        Returns a row with keys ``symbol``, ``payload``, ``updated_at``, or
+        ``None`` if the symbol has never been collected. Never a live call.
+        """
+        symbol = symbol.upper()
+        if not self._db.is_enabled:
+            return self._memory_evidence.get(symbol)
+        rows = await self._fetch(
+            "SELECT symbol, payload, updated_at FROM evidence WHERE symbol = %s",
+            (symbol,),
+        )
+        return rows[0] if rows else None
+
+    # ---- Lessons (Phase 4 / ReflectionAgent) --------------------------------
+
+    async def save_lesson(
+        self,
+        *,
+        symbol: str | None,
+        lesson: str,
+        source: str,
+        reflected_on: str,
+    ) -> None:
+        """Write one post-trade lesson. ``reflected_on`` is the idempotency key
+        (e.g. ``order:42`` or ``proposal:17``) so an item is reflected on at
+        most once even if ReflectionAgent runs more than once."""
+        row = {
+            "ts": _now(),
+            "symbol": symbol.upper() if symbol else None,
+            "lesson": lesson,
+            "source": source,
+            "reflected_on": reflected_on,
+        }
+        if not self._db.is_enabled:
+            if not any(r["reflected_on"] == reflected_on for r in self._memory_lessons):
+                self._memory_lessons.appendleft(row)
+            return
+        async with self._db.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO lessons (symbol, lesson, source, reflected_on) "
+                "VALUES (%s, %s, %s, %s) ON CONFLICT (reflected_on) DO NOTHING",
+                (row["symbol"], lesson, source, reflected_on),
+            )
+            await conn.commit()
+
+    # ---- Proposal extensions (Phase 3) -------------------------------------
+
+    async def save_proposal(
+        self,
+        *,
+        underlying: str,
+        intent: dict[str, Any],
+        evidence: dict[str, Any],
+        status: str = "pending",
+        llm_read: dict[str, Any] | None = None,
+        matrix: dict[str, Any] | None = None,
+    ) -> int:
+        """Insert a new proposal. Returns its id."""
+        if not self._db.is_enabled:
+            self._memory_proposal_seq += 1
+            proposal_id = self._memory_proposal_seq
+            self._memory_proposals[proposal_id] = {
+                "id": proposal_id,
+                "ts": _now(),
+                "underlying": underlying,
+                "status": status,
+                "intent": intent,
+                "evidence": evidence,
+                "arguments": llm_read,
+                "verdict": None,
+                "plan": None,
+                "error": None,
+                "llm_read": llm_read,
+                "matrix_verdict": matrix,
+            }
+            return proposal_id
+        async with self._db.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO proposals (underlying, intent, evidence, status, "
+                "llm_read, matrix_verdict) "
+                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                (
+                    underlying,
+                    json.dumps(intent),
+                    json.dumps(evidence),
+                    status,
+                    json.dumps(llm_read) if llm_read is not None else None,
+                    json.dumps(matrix) if matrix is not None else None,
+                ),
+            )
+            row = cast("tuple[Any, ...] | None", await cur.fetchone())
+            await conn.commit()
+            assert row is not None  # noqa: S101
+            return int(row[0])
+
+    # ---- LLM call log (Phase 3) -------------------------------------------
+
+    async def record_llm_call(
+        self,
+        *,
+        agent: str,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        latency_ms: int,
+        ok: bool,
+        error: str | None = None,
+    ) -> None:
+        row = {
+            "ts": _now(),
+            "agent": agent,
+            "model": model,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "latency_ms": latency_ms,
+            "ok": ok,
+            "error": error,
+        }
+        if not self._db.is_enabled:
+            self._memory_llm_calls.appendleft(row)
+            return
+        async with self._db.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO llm_calls (agent, model, prompt_tokens, completion_tokens, "
+                "latency_ms, ok, error) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (agent, model, prompt_tokens, completion_tokens, latency_ms, ok, error),
+            )
+            await conn.commit()
+
+    # ---- Top-candidates helper (Phase 3) -----------------------------------
+
+    async def top_candidates(
+        self,
+        limit: int = 5,
+        max_age_seconds: float = 300.0,
+    ) -> list[dict[str, Any]]:
+        """Most recent unique-symbol candidates scored by the last batch,
+        filtered to those written within max_age_seconds, sorted by score
+        descending. Used by StrategistAgent to pick its work symbol.
+        """
+        all_recent = await self.recent_candidates(limit=limit * 4)
+        cutoff = _now().timestamp() - max_age_seconds
+        seen: set[str] = set()
+        result: list[dict[str, Any]] = []
+        for row in all_recent:
+            ts = row.get("ts")
+            if ts is not None:
+                ts_epoch = ts.timestamp() if hasattr(ts, "timestamp") else 0.0
+                if ts_epoch < cutoff:
+                    break
+            symbol = str(row.get("symbol", "")).upper()
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                result.append(row)
+        result.sort(key=lambda r: float(r.get("score") or 0), reverse=True)
+        return result[:limit]
 
     async def _fetch(self, sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
         async with self._db.connection() as conn, conn.cursor() as cur:

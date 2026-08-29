@@ -15,17 +15,17 @@ import logging
 import time
 from typing import Protocol, runtime_checkable
 
+from options_m.agents.execution import ExecutionAgent
+from options_m.agents.market_pulse import MarketPulseAgent
+from options_m.agents.position_manager import PositionManagerAgent
+from options_m.agents.reflection import ReflectionAgent
+from options_m.agents.strategist import StrategistAgent
 from options_m.config import Settings
 from options_m.lifecycle import sleep_unless_shutdown
 from options_m.llm import FeatherlessLlm
 from options_m.mcp_client import AlpacaMcp
 from options_m.risk import RiskEngine, RiskLimits
 from options_m.store import Store
-from options_m.agents.execution import ExecutionAgent
-from options_m.agents.market_pulse import MarketPulseAgent
-from options_m.agents.position_manager import PositionManagerAgent
-from options_m.agents.reflection import ReflectionAgent
-from options_m.agents.strategist import StrategistAgent
 
 logger = logging.getLogger(__name__)
 
