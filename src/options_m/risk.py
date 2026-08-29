@@ -9,6 +9,7 @@ records ``risk_events``, keeping every rule here a pure function of an
 
 from __future__ import annotations
 
+import math
 from datetime import date
 
 from pydantic import BaseModel, ConfigDict
@@ -161,7 +162,15 @@ class RiskEngine:
             if leg.bid is None or leg.ask is None or leg.bid <= 0 or leg.ask <= 0:
                 return f"missing_quote:{leg.symbol}"
             mid = (leg.bid + leg.ask) / 2
-            if mid > 0 and (leg.ask - leg.bid) / mid > self._limits.max_spread_pct:
+            if mid <= 0:
+                continue
+            spread_pct = (leg.ask - leg.bid) / mid
+            # A spread exactly at the limit must pass: bid/ask arithmetic in
+            # binary float can put it a sliver over (0.10000000000000009 for
+            # bid=1.9/ask=2.1), which a bare `>` would wrongly reject.
+            if spread_pct > self._limits.max_spread_pct and not math.isclose(
+                spread_pct, self._limits.max_spread_pct, rel_tol=1e-9, abs_tol=1e-12
+            ):
                 return f"wide_spread:{leg.symbol}"
         return None
 
