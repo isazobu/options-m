@@ -7,6 +7,8 @@ and that the fallback keeps the same contract as the persistent path.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from options_m.config import Settings
 from options_m.db import Database
 from options_m.store import Store
@@ -130,3 +132,81 @@ async def test_kill_switch_round_trips() -> None:
 
     await store.set_kill_switch(False)
     assert await store.is_kill_switch_engaged() is False
+
+
+async def test_recent_proposals_are_returned_newest_first_without_the_blobs() -> None:
+    store = _store()
+    for index, underlying in enumerate(("SPY", "QQQ", "AAPL")):
+        proposal_id = await store.save_proposal(
+            underlying=underlying, intent={"direction": "long"}, evidence={}
+        )
+        # Force distinct, ordered timestamps: three calls in one test can land
+        # on the same microsecond, which would otherwise make ordering flaky.
+        store._memory_proposals[proposal_id]["ts"] = datetime(2026, 1, index + 1, tzinfo=UTC)
+
+    rows = await store.recent_proposals()
+
+    assert [row["underlying"] for row in rows] == ["AAPL", "QQQ", "SPY"]
+    assert rows[0]["has_arguments"] is False
+    assert rows[0]["has_verdict"] is False
+    assert "evidence" not in rows[0]
+
+
+async def test_recent_proposals_filters_by_status() -> None:
+    store = _store()
+    approved_id = await store.save_proposal(underlying="SPY", intent={}, evidence={})
+    await store.update_proposal_status(approved_id, "approved")
+    await store.save_proposal(underlying="QQQ", intent={}, evidence={})
+
+    rows = await store.recent_proposals(status="approved")
+
+    assert [row["underlying"] for row in rows] == ["SPY"]
+
+
+async def test_recent_proposals_reflect_arguments_and_verdict_once_set() -> None:
+    store = _store()
+    proposal_id = await store.save_proposal(underlying="SPY", intent={}, evidence={})
+    await store.update_proposal_status(
+        proposal_id, "approved", arguments={"bull": "..."}, verdict={"action": "open"}
+    )
+
+    row = (await store.recent_proposals())[0]
+
+    assert row["has_arguments"] is True
+    assert row["has_verdict"] is True
+
+
+async def test_orders_for_proposal_returns_only_that_proposals_orders() -> None:
+    store = _store()
+    proposal_id = await store.save_proposal(underlying="SPY", intent={}, evidence={})
+    other_id = await store.save_proposal(underlying="QQQ", intent={}, evidence={})
+    await store.record_order(
+        proposal_id=proposal_id, client_order_id="om-1", status="submitted", request={}
+    )
+    await store.record_order(
+        proposal_id=other_id, client_order_id="om-2", status="submitted", request={}
+    )
+
+    orders = await store.orders_for_proposal(proposal_id)
+
+    assert [order["client_order_id"] for order in orders] == ["om-1"]
+
+
+async def test_recent_orders_are_returned_newest_first() -> None:
+    store = _store()
+    proposal_id = await store.save_proposal(underlying="SPY", intent={}, evidence={})
+    for index in range(2):
+        await store.record_order(
+            proposal_id=proposal_id,
+            client_order_id=f"om-{index}",
+            status="submitted",
+            request={},
+        )
+    # Force distinct, ordered timestamps: two calls in the same test can land
+    # on the same microsecond, which would otherwise make "newest first" flaky.
+    store._memory_orders["om-0"]["submitted_at"] = datetime(2026, 1, 1, tzinfo=UTC)
+    store._memory_orders["om-1"]["submitted_at"] = datetime(2026, 1, 2, tzinfo=UTC)
+
+    orders = await store.recent_orders()
+
+    assert [order["client_order_id"] for order in orders] == ["om-1", "om-0"]

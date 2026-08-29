@@ -1,3 +1,4 @@
+
 """Deterministic evidence collection for one underlying.
 
 This is the data-gathering step of the agent chain. It calls Alpaca (reads

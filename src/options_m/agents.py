@@ -18,7 +18,9 @@ from typing import Protocol, runtime_checkable
 from options_m.config import Settings
 from options_m.lifecycle import sleep_unless_shutdown
 from options_m.mcp_client import AlpacaMcp
+from options_m.risk import RiskEngine, RiskLimits
 from options_m.store import Store
+from options_m.trading.execution import ExecutionAgent
 from options_m.trading.market_pulse import MarketPulseAgent
 
 logger = logging.getLogger(__name__)
@@ -54,7 +56,11 @@ def build_agents(settings: Settings, mcp: AlpacaMcp, store: Store) -> list[Agent
 
     Register real agents here so they receive their dependencies explicitly.
     """
-    return [MarketPulseAgent(settings, mcp, store)]
+    risk_engine = RiskEngine(RiskLimits.from_settings(settings))
+    return [
+        MarketPulseAgent(settings, mcp, store),
+        ExecutionAgent(settings, mcp, store, risk_engine),
+    ]
 
 
 async def run_agent(agent: Agent, settings: Settings, shutdown: asyncio.Event) -> None:

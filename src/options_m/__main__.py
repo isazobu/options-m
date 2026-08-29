@@ -44,7 +44,9 @@ async def run(settings: Settings) -> None:
         await migrate.apply(db)
         store = Store(db)
         agents = build_agents(settings, mcp, store)
-        server = build_server(create_app(db, agents, mcp=mcp, store=store), settings)
+        server = build_server(
+            create_app(db, agents, mcp=mcp, store=store, settings=settings), settings
+        )
 
         async with asyncio.TaskGroup() as tg:
             tg.create_task(serve(server, shutdown, settings), name="http")

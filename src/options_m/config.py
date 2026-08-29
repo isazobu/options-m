@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     # Per-agent cadence. Agents that expose `interval_seconds` use their own
     # value; everything else falls back to agent_interval_seconds above.
     market_pulse_interval_seconds: float = Field(default=60.0, gt=0)
+    execution_agent_interval_seconds: float = Field(default=30.0, gt=0)
 
     # Alpaca, reached only through its official MCP server (spawned as a stdio
     # subprocess). Unset keys mean "run without a broker session", mirroring
@@ -75,6 +76,58 @@ class Settings(BaseSettings):
 
     # How long to let in-flight work finish after SIGTERM.
     shutdown_grace_seconds: float = Field(default=20.0, gt=0)
+
+    # Strategy construction.
+    risk_free_rate: float = Field(default=0.045, ge=0)  # Black-Scholes delta fallback
+    limit_price_spread_nudge_pct: float = Field(default=0.25, ge=0.0, le=1.0)
+    standard_monthly_expiry_preference: bool = True
+
+    # Risk limits. Single source of truth: strategy_builder's liquidity gate
+    # and risk.py's account-wide gate both read these fields.
+    max_premium_pct_per_trade: float = Field(default=0.02, gt=0.0, le=1.0)
+    max_total_premium_pct: float = Field(default=0.15, gt=0.0, le=1.0)
+    max_concurrent_positions: int = Field(default=5, ge=1)
+    max_positions_per_underlying: int = Field(default=1, ge=1)
+    # Deliberately distinct from StrategyIntent.dte_min/dte_max: the intent's
+    # window is what a proposal *requests*; these are the hard account-wide
+    # bounds risk.py enforces regardless of what was requested.
+    risk_dte_min: int = Field(default=7, ge=0)
+    risk_dte_max: int = Field(default=45, ge=1)
+    min_open_interest: int = Field(default=100, ge=0)
+    max_spread_pct: float = Field(default=0.10, gt=0.0, le=1.0)
+    daily_loss_halt_pct: float = Field(default=0.03, gt=0.0, le=1.0)
+    drawdown_halt_pct: float = Field(default=0.08, gt=0.0, le=1.0)
+    minutes_before_close_blackout: int = Field(default=15, ge=0)
+
+    # Dashboard access. A single shared secret, deliberately simpler than a
+    # real user-auth system: this guards a judge-facing demo, not a
+    # multi-tenant product. Unset means the guarded routes stay open, which
+    # only matters for local/dev use — it must be set wherever the API is
+    # reachable from the public internet.
+    admin_token: str | None = None
+    # Comma-separated browser origins allowed to call the guarded /api/*
+    # routes (the separate Next.js dashboard's dev and deployed URLs).
+    cors_allowed_origins: str = ""
+
+    # Featherless, reached over plain HTTPS (OpenAI-compatible chat/completions).
+    # Used today only by the read-only dashboard chat; Phase 3's LLM crew will
+    # extend the same client rather than replace it.
+    featherless_api_key: str | None = None
+    featherless_base_url: str = "https://api.featherless.ai/v1"
+    # Never hardcode a model id in source — it must be free to swap by env.
+    featherless_chat_model: str = ""
+    chat_max_tool_calls: int = Field(default=4, ge=0)
+    chat_timeout_seconds: float = Field(default=30.0, gt=0)
+
+    @property
+    def cors_origins(self) -> tuple[str, ...]:
+        """The configured CORS origins, de-duplicated and order-preserving."""
+        seen: dict[str, None] = {}
+        for raw in self.cors_allowed_origins.split(","):
+            origin = raw.strip()
+            if origin:
+                seen[origin] = None
+        return tuple(seen)
 
     @property
     def universe_symbols(self) -> tuple[str, ...]:

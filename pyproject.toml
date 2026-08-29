@@ -31,7 +31,11 @@ dev = [
 ]
 
 [project.scripts]
-options-m = "options_m.__main__:main"
+# The container/Render entrypoint runs `python -m options_m` directly and
+# never touches this console script — it exists for local/judge CLI use
+# (`options-m plan ...`, `options-m status`, etc.), a second independent
+# piece of evidence that this service drives the Alpaca Trading API.
+options-m = "options_m.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/options_m"]

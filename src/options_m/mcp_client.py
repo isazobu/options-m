@@ -150,6 +150,17 @@ def assert_paper_intent() -> None:
     raise LiveTradingRefused(msg)
 
 
+def _looks_like_not_found(message: str) -> bool:
+    """Whether a ToolError plainly means "no such position/order".
+
+    Deliberately conservative: only a matched substring reads as "not found".
+    Anything else propagates, which is the safe-by-construction direction to
+    be wrong in — a real outage can never be misread as flat.
+    """
+    lowered = message.lower()
+    return any(phrase in lowered for phrase in ("does not exist", "not found"))
+
+
 def finite_float(value: object) -> float | None:
     """Coerce a broker numeric to a float, or ``None`` when unusable.
 
@@ -528,6 +539,26 @@ class AlpacaMcp:
     async def get_account_config(self) -> dict[str, Any]:
         """Account configuration, including the options trading level."""
         return self._expect_mapping("get_account_config", await self.call("get_account_config"))
+
+    async def get_portfolio_history(
+        self,
+        *,
+        period: str = "1M",
+        timeframe: str | None = None,
+        extended_hours: bool = False,
+    ) -> dict[str, Any]:
+        """Account equity/P&L over time, straight from Alpaca.
+
+        The source for the dashboard's headline equity curve — distinct from
+        our own ``equity_curve`` table, which only holds what our polling has
+        actually observed since this process started.
+        """
+        args: dict[str, Any] = {"period": period, "extended_hours": extended_hours}
+        if timeframe is not None:
+            args["timeframe"] = timeframe
+        return self._expect_mapping(
+            "get_portfolio_history", await self.call("get_portfolio_history", args)
+        )
 
     async def get_all_positions(self) -> list[dict[str, Any]]:
         return self._expect_sequence("get_all_positions", await self.call("get_all_positions"))
