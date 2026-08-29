@@ -50,6 +50,28 @@ services:
       - key: SHUTDOWN_GRACE_SECONDS
         value: "20"
 
+      # The MCP server runs as a child process of this one, so the free
+      # instance holds two Python processes. Keep the toolset list tight.
+      - key: ALPACA_TOOLSETS
+        value: account,trading,assets,options-data,stock-data,news
+      # Must stay exactly "true". The service refuses to start on any value
+      # that would select the live trading endpoint.
+      - key: ALPACA_PAPER_TRADE
+        value: "true"
+      - key: MARKET_PULSE_INTERVAL_SECONDS
+        value: "60"
+
+      # Safety defaults. Flip DRY_RUN to false only once the risk engine and
+      # the execution agent are in place and tested.
+      - key: DRY_RUN
+        value: "true"
+      - key: KILL_SWITCH
+        value: "false"
+
       # Set in the Render dashboard — never committed.
       - key: DATABASE_URL
+        sync: false
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_SECRET_KEY
         sync: false
