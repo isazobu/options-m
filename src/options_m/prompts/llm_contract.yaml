@@ -1,0 +1,17 @@
+description: >
+  Generic structured-output plumbing for FeatherlessLlm.complete_json: the
+  schema instruction appended to every structured call, and the one repair
+  turn shown to the model after an unparseable response.
+
+templates:
+  schema_suffix: |
+    {user}
+
+    Output only valid JSON matching this schema:
+    {schema_json}
+
+  repair: |
+    Your previous output could not be parsed. Error: {error}
+    Raw output: {raw_text}
+
+    Try again. Output only valid JSON matching the schema.

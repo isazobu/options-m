@@ -158,8 +158,9 @@ class StrategistAgent:
             return detail
 
         # 5. One LLM call — the only outbound I/O in step().
-        user_prompt = prompt_loader.load(
-            "strategist",
+        prompt = prompt_loader.load("strategist")
+        user_prompt = prompt.render(
+            "user",
             symbol=symbol,
             evidence_json=json.dumps(pack, default=str, indent=2),
         )
@@ -167,13 +168,10 @@ class StrategistAgent:
         try:
             regime: RegimeRead = await self._llm.complete_json(
                 schema=RegimeRead,
-                system=(
-                    "You are a quantitative options strategist. "
-                    "Output only valid JSON as instructed."
-                ),
+                system=prompt.render("system"),
                 user=user_prompt,
                 max_tokens=self._settings.llm_max_tokens,
-                temperature=0.2,
+                temperature=prompt.params.get("temperature", 0.2),
             )
         except LlmContractError:
             proposal_id = await self._store.save_proposal(

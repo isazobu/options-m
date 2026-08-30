@@ -151,7 +151,7 @@ StrategistAgent._run()
 │                    ┌──────────────────────────────────────┐
 │                    │  ONE LLM call (Featherless)          │
 ├── llm.complete_json(schema=RegimeRead)│                   │
-│   system: strategist.md template      │  RegimeRead:      │
+│   system+user: strategist.yaml        │  RegimeRead:      │
 │   user:   evidence pack as JSON       │    thesis: str    │
 │                                       │    invalidation: str
 │   JSON extraction + 1 repair retry    │    conviction: float
@@ -441,8 +441,11 @@ src/options_m/
 │   └── occ.py               OCC option-symbol parser
 │
 ├── prompts/
-│   ├── loader.py            path-escape-guarded template loader
-│   └── strategist.md        StrategistAgent LLM prompt template
+│   ├── loader.py            path-escape-guarded YAML prompt loader (Prompt.render)
+│   ├── strategist.yaml      StrategistAgent regime-read (system + user) + trace
+│   ├── chat.yaml            read-only dashboard Q&A (system + untrusted-text warning)
+│   ├── reflection.yaml      ReflectionAgent post-mortems (trade + proposal lessons)
+│   └── llm_contract.yaml    complete_json schema suffix + repair-retry message
 │
 ├── matrix.py                deterministic Strategy Matrix + earnings gate
 ├── llm.py                   FeatherlessLlm (chat_completion + complete_json)

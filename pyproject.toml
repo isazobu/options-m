@@ -19,6 +19,8 @@ dependencies = [
     "fastmcp>=3.1",
     "alpaca-mcp-server>=2.3",
     "httpx>=0.27",
+    # LLM prompts live as YAML under options_m/prompts/ and are read at runtime.
+    "pyyaml>=6",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +30,7 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6",
     "mypy>=1.11",
+    "types-PyYAML>=6",
 ]
 
 [project.scripts]
@@ -39,8 +42,9 @@ options-m = "options_m.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/options_m"]
-# schema.sql is loaded at runtime via importlib.resources, so it must ship.
-artifacts = ["src/options_m/schema.sql"]
+# schema.sql and the prompt YAML files are loaded at runtime from the package
+# directory, so they must ship in the wheel.
+artifacts = ["src/options_m/schema.sql", "src/options_m/prompts/*.yaml"]
 
 [tool.ruff]
 line-length = 100

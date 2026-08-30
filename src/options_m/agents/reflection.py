@@ -33,11 +33,16 @@ from typing import Any
 
 from options_m.config import Settings
 from options_m.llm import FeatherlessLlm, LlmError
+from options_m.prompts import loader as prompt_loader
 from options_m.store import Store
 
 logger = logging.getLogger(__name__)
 
 _PASS_B_LOOKBACK_PROPOSALS = 20
+
+_PROMPT = prompt_loader.load("reflection")
+_MAX_TOKENS = int(_PROMPT.params.get("max_tokens", 120))
+_TEMPERATURE = float(_PROMPT.params.get("temperature", 0.3))
 
 
 class ReflectionAgent:
@@ -186,23 +191,20 @@ class ReflectionAgent:
                 [
                     {
                         "role": "system",
-                        "content": (
-                            "You are a trading post-mortem analyst. "
-                            "Write one concise lesson (1-2 sentences) from a filled options trade. "
-                            "Focus on what the outcome suggests about the setup quality or timing."
-                        ),
+                        "content": _PROMPT.render("trade_lesson_system"),
                     },
                     {
                         "role": "user",
-                        "content": (
-                            f"Order filled: qty={filled_qty}, avg_price={filled_price}, "
-                            f"legs={request.get('legs') or request.get('symbol')}. "
-                            "Write the lesson."
+                        "content": _PROMPT.render(
+                            "trade_lesson_user",
+                            filled_qty=filled_qty,
+                            filled_price=filled_price,
+                            legs=request.get("legs") or request.get("symbol"),
                         ),
                     },
                 ],
-                max_tokens=120,
-                temperature=0.3,
+                max_tokens=_MAX_TOKENS,
+                temperature=_TEMPERATURE,
             )
         except LlmError as exc:
             logger.warning("reflection: pass-A LLM call failed: %s", exc)
@@ -217,32 +219,30 @@ class ReflectionAgent:
         llm_read = proposal.get("llm_read") or proposal.get("arguments") or {}
         thesis = llm_read.get("thesis", "") if isinstance(llm_read, dict) else ""
         conviction = llm_read.get("conviction", "") if isinstance(llm_read, dict) else ""
+        decision_kind = "held (no trade taken)" if status == "no_action" else "rejected"
         try:
             result = await self._llm.chat_completion(
                 [
                     {
                         "role": "system",
-                        "content": (
-                            "You are a trading post-mortem analyst. "
-                            "Write one concise lesson (1-2 sentences) from a proposal that was "
-                            f"{'held (no trade taken)' if status == 'no_action' else 'rejected'}. "
-                            "Focus on whether the decision looks correct in retrospect."
+                        "content": _PROMPT.render(
+                            "proposal_lesson_system", decision_kind=decision_kind
                         ),
                     },
                     {
                         "role": "user",
-                        "content": (
-                            f"Underlying: {underlying}\n"
-                            f"Status: {status}\n"
-                            f"Original thesis: {thesis}\n"
-                            f"Conviction: {conviction}\n"
-                            f"Rejection reason: {error or 'N/A'}\n"
-                            "Write the lesson."
+                        "content": _PROMPT.render(
+                            "proposal_lesson_user",
+                            underlying=underlying,
+                            status=status,
+                            thesis=thesis,
+                            conviction=conviction,
+                            rejection_reason=error or "N/A",
                         ),
                     },
                 ],
-                max_tokens=120,
-                temperature=0.3,
+                max_tokens=_MAX_TOKENS,
+                temperature=_TEMPERATURE,
             )
         except LlmError as exc:
             logger.warning("reflection: pass-B LLM call failed: %s", exc)

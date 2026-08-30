@@ -174,7 +174,7 @@ StrategistAgent._run()
 │   │  llm.complete_json(                                    │
 │   │    schema  = RegimeRead,                               │
 │   │    system  = "quantitative options strategist",        │
-│   │    user    = strategist.md.format(evidence_json=pack), │
+│   │    user    = strategist.yaml:user (evidence_json=pack),│
 │   │    max_tokens   = settings.llm_max_tokens,             │
 │   │    temperature  = 0.2,                                 │
 │   │  )                                                     │
@@ -495,8 +495,11 @@ src/options_m/
 │   └── occ.py               OCC opsiyonu sembol parser'ı
 │
 ├── prompts/
-│   ├── loader.py            Path-escape korumalı template yükleyici
-│   └── strategist.md        StrategistAgent LLM prompt şablonu
+│   ├── loader.py            Path-escape korumalı YAML prompt yükleyici (Prompt.render)
+│   ├── strategist.yaml      StrategistAgent regime-read (system + user) + trace
+│   ├── chat.yaml            Salt-okunur dashboard Q&A (system + untrusted-text uyarısı)
+│   ├── reflection.yaml      ReflectionAgent post-mortem'leri (trade + proposal dersleri)
+│   └── llm_contract.yaml    complete_json şema eki + repair-retry mesajı
 │
 ├── matrix.py                Deterministik Strateji Matrisi + earnings gate
 ├── llm.py                   FeatherlessLlm — chat_completion + complete_json

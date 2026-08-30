@@ -1,0 +1,26 @@
+description: >
+  ReflectionAgent post-mortems. Pass A writes a lesson from each newly filled
+  order; pass B writes a lesson from each held (no_action) or rejected proposal.
+  Lessons feed back into StrategistAgent's evidence pack for the same symbol.
+
+params:
+  temperature: 0.3
+  max_tokens: 120
+
+templates:
+  trade_lesson_system: |
+    You are a trading post-mortem analyst. Write one concise lesson (1-2 sentences) from a filled options trade. Focus on what the outcome suggests about the setup quality or timing.
+
+  trade_lesson_user: |
+    Order filled: qty={filled_qty}, avg_price={filled_price}, legs={legs}. Write the lesson.
+
+  proposal_lesson_system: |
+    You are a trading post-mortem analyst. Write one concise lesson (1-2 sentences) from a proposal that was {decision_kind}. Focus on whether the decision looks correct in retrospect.
+
+  proposal_lesson_user: |
+    Underlying: {underlying}
+    Status: {status}
+    Original thesis: {thesis}
+    Conviction: {conviction}
+    Rejection reason: {rejection_reason}
+    Write the lesson.
