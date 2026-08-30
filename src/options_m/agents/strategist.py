@@ -162,21 +162,21 @@ class StrategistAgent:
             detail["skipped"] = "empty_evidence"
             return detail
 
-        # One LLM call — the only outbound I/O in step().
-        prompt = prompt_loader.load(
-            "strategist",
+        # 5. One LLM call — the only outbound I/O in step().
+        prompt = prompt_loader.load("strategist")
+        user_prompt = prompt.render(
+            "user",
             symbol=symbol,
             evidence_json=json.dumps(pack, default=str, indent=2),
-            conviction_floor=f"{self._settings.conviction_floor:.2f}",
         )
         t0 = time.monotonic()
         try:
             regime: RegimeRead = await self._llm.complete_json(
                 schema=RegimeRead,
-                system=prompt.require_system(),
-                user=prompt.user,
+                system=prompt.render("system"),
+                user=user_prompt,
                 max_tokens=self._settings.llm_max_tokens,
-                temperature=prompt.require_temperature(),
+                temperature=prompt.params.get("temperature", 0.2),
             )
         except LlmContractError:
             proposal_id = await self._store.save_proposal(

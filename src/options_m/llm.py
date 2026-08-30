@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_CONTRACT_PROMPT = prompt_loader.load("llm_contract")
+
 T = TypeVar("T", bound=BaseModel)
 
 
@@ -158,18 +160,16 @@ class FeatherlessLlm:
         the trade, never fall back to free text.
         """
         schema_json = json.dumps(schema.model_json_schema(), indent=2)
-        full_user = prompt_loader.load(
-            "llm_json_schema_suffix", user=user, schema_json=schema_json
-        ).user
+        full_user = _CONTRACT_PROMPT.render("schema_suffix", user=user, schema_json=schema_json)
 
         last_error: Exception | None = None
         raw_text: str | None = None
         for attempt in range(2):
             if attempt == 1 and raw_text is not None:
                 # Repair attempt: show the model its own bad output + the error.
-                repair_user = prompt_loader.load(
-                    "llm_json_repair", last_error=last_error, raw_text=raw_text
-                ).user
+                repair_user = _CONTRACT_PROMPT.render(
+                    "repair", error=last_error, raw_text=raw_text
+                )
                 messages = [
                     {"role": "system", "content": system},
                     {"role": "user", "content": full_user},

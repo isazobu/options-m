@@ -29,10 +29,9 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Final
+from typing import Any
 
 from options_m.config import Settings
-from options_m.evidence.evidence import MISSING
 from options_m.llm import FeatherlessLlm, LlmError
 from options_m.prompts import loader as prompt_loader
 from options_m.store import Store
@@ -41,15 +40,9 @@ logger = logging.getLogger(__name__)
 
 _PASS_B_LOOKBACK_PROPOSALS = 20
 
-# proposals.status -> the English the post-mortem prompt uses for it. Pass B only
-# ever queries no_action and rejected (see _pass_b_held_rejected), but the mapping
-# is explicit so widening that query can never silently tell the model a proposal
-# was "rejected" when it was not — which is what the old inline if/else did.
-_STATUS_PHRASES: Final[dict[str, str]] = {
-    "no_action": "held (no trade taken)",
-    "rejected": "rejected",
-}
-_STATUS_PHRASE_FALLBACK: Final = "not acted on"
+_PROMPT = prompt_loader.load("reflection")
+_MAX_TOKENS = int(_PROMPT.params.get("max_tokens", 120))
+_TEMPERATURE = float(_PROMPT.params.get("temperature", 0.3))
 
 
 class ReflectionAgent:
@@ -190,24 +183,28 @@ class ReflectionAgent:
 
     async def _generate_trade_lesson(self, order: dict[str, Any]) -> str | None:
         """Ask the LLM for a 1-2 sentence lesson about a filled order."""
+        filled_qty = order.get("filled_qty")
+        filled_price = order.get("filled_avg_price")
         request = order.get("request") or {}
-        prompt = prompt_loader.load(
-            "reflection_trade_lesson",
-            filled_qty=order.get("filled_qty"),
-            filled_price=order.get("filled_avg_price"),
-            # The old f-string rendered a missing leg list as the literal
-            # "legs=None"; MISSING is the sentinel the prompts already teach the
-            # model to read as "genuinely unavailable, do not fabricate".
-            legs=request.get("legs") or request.get("symbol") or MISSING,
-        )
         try:
             result = await self._llm.chat_completion(
                 [
-                    {"role": "system", "content": prompt.require_system()},
-                    {"role": "user", "content": prompt.user},
+                    {
+                        "role": "system",
+                        "content": _PROMPT.render("trade_lesson_system"),
+                    },
+                    {
+                        "role": "user",
+                        "content": _PROMPT.render(
+                            "trade_lesson_user",
+                            filled_qty=filled_qty,
+                            filled_price=filled_price,
+                            legs=request.get("legs") or request.get("symbol"),
+                        ),
+                    },
                 ],
-                max_tokens=prompt.require_max_tokens(),
-                temperature=prompt.require_temperature(),
+                max_tokens=_MAX_TOKENS,
+                temperature=_TEMPERATURE,
             )
         except LlmError as exc:
             logger.warning("reflection: pass-A LLM call failed: %s", exc)
@@ -216,26 +213,36 @@ class ReflectionAgent:
 
     async def _generate_proposal_lesson(self, proposal: dict[str, Any]) -> str | None:
         """Ask the LLM for a lesson about a held or rejected proposal."""
-        status = str(proposal.get("status", ""))
-        raw_read = proposal.get("llm_read") or proposal.get("arguments") or {}
-        read: dict[str, Any] = raw_read if isinstance(raw_read, dict) else {}
-        prompt = prompt_loader.load(
-            "reflection_proposal_lesson",
-            underlying=proposal.get("underlying", ""),
-            status=status,
-            status_phrase=_STATUS_PHRASES.get(status, _STATUS_PHRASE_FALLBACK),
-            thesis=read.get("thesis", ""),
-            conviction=read.get("conviction", ""),
-            rejection_reason=proposal.get("error") or "N/A",
-        )
+        underlying = proposal.get("underlying", "")
+        status = proposal.get("status", "")
+        error = proposal.get("error", "")
+        llm_read = proposal.get("llm_read") or proposal.get("arguments") or {}
+        thesis = llm_read.get("thesis", "") if isinstance(llm_read, dict) else ""
+        conviction = llm_read.get("conviction", "") if isinstance(llm_read, dict) else ""
+        decision_kind = "held (no trade taken)" if status == "no_action" else "rejected"
         try:
             result = await self._llm.chat_completion(
                 [
-                    {"role": "system", "content": prompt.require_system()},
-                    {"role": "user", "content": prompt.user},
+                    {
+                        "role": "system",
+                        "content": _PROMPT.render(
+                            "proposal_lesson_system", decision_kind=decision_kind
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": _PROMPT.render(
+                            "proposal_lesson_user",
+                            underlying=underlying,
+                            status=status,
+                            thesis=thesis,
+                            conviction=conviction,
+                            rejection_reason=error or "N/A",
+                        ),
+                    },
                 ],
-                max_tokens=prompt.require_max_tokens(),
-                temperature=prompt.require_temperature(),
+                max_tokens=_MAX_TOKENS,
+                temperature=_TEMPERATURE,
             )
         except LlmError as exc:
             logger.warning("reflection: pass-B LLM call failed: %s", exc)

@@ -33,12 +33,11 @@ from options_m.store import Store
 
 logger = logging.getLogger(__name__)
 
-
-# The same bytes the strategist prompt places ahead of the evidence pack. The
-# fence used to live here only, which left the read-only chat path guarded and
-# the trade-deciding path — reading the very same headlines out of the evidence
-# pack — with nothing at all.
-_EXTERNAL_TEXT_WARNING = prompt_loader.fragment("external_text_fence")
+_PROMPT = prompt_loader.load("chat")
+_SYSTEM_PROMPT = _PROMPT.render("system")
+_EXTERNAL_TEXT_WARNING = _PROMPT.render("external_text_warning")
+_MAX_TOKENS = int(_PROMPT.params.get("max_tokens", 800))
+_TEMPERATURE = float(_PROMPT.params.get("temperature", 0.2))
 
 
 class ChatToolError(RuntimeError):
@@ -328,10 +327,9 @@ async def answer_question(
 
     session = ChatSession(mcp=mcp, store=store)
     tools = session.tools()
-    prompt = prompt_loader.load("chat_system", question=question)
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": prompt.require_system()},
-        {"role": "user", "content": prompt.user},
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": question},
     ]
     tool_call_records: list[ChatToolCallRecord] = []
     warnings: list[str] = []
@@ -340,10 +338,7 @@ async def answer_question(
     while calls_made < max_tool_calls:
         try:
             result = await llm.chat_completion(
-                messages,
-                tools=tools,
-                max_tokens=prompt.require_max_tokens(),
-                temperature=prompt.require_temperature(),
+                messages, tools=tools, max_tokens=_MAX_TOKENS, temperature=_TEMPERATURE
             )
         except LlmError as exc:
             logger.warning("chat llm call failed", exc_info=True)
@@ -382,10 +377,7 @@ async def answer_question(
     # the model must conclude from what it has gathered so far.
     try:
         final = await llm.chat_completion(
-            messages,
-            tools=None,
-            max_tokens=prompt.require_max_tokens(),
-            temperature=prompt.require_temperature(),
+            messages, tools=None, max_tokens=_MAX_TOKENS, temperature=_TEMPERATURE
         )
     except LlmError as exc:
         return ChatAnswer(

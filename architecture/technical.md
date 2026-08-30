@@ -145,7 +145,7 @@ StrategistAgent._run()
 ├── llm.complete_json(schema=RegimeRead)    │             │
 │   system: "quantitative options           │ RegimeRead: │
 │            strategist"                    │  thesis     │
-│   user:   strategist.md + evidence JSON   │  invalidation
+│   user:   strategist.yaml + evidence JSON │  invalidation
 │   JSON extraction + 1 repair retry        │  conviction │
 │   fail → LlmContractError                 │  (0–1)      │
 │        → proposals.status='llm_failed'    └─────────────┘
@@ -449,8 +449,11 @@ src/options_m/
 │   └── occ.py               OCC option-symbol parser
 │
 ├── prompts/
-│   ├── loader.py            Path-escape-guarded template loader
-│   └── strategist.md        StrategistAgent LLM prompt template
+│   ├── loader.py            Path-escape-guarded YAML prompt loader (Prompt.render)
+│   ├── strategist.yaml      StrategistAgent regime-read (system + user) + trace
+│   ├── chat.yaml            Read-only dashboard Q&A (system + untrusted-text warning)
+│   ├── reflection.yaml      ReflectionAgent post-mortems (trade + proposal lessons)
+│   └── llm_contract.yaml    complete_json schema suffix + repair-retry message
 │
 ├── matrix.py                Deterministic Strategy Matrix + earnings gate
 ├── llm.py                   FeatherlessLlm — chat_completion + complete_json

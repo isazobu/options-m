@@ -578,9 +578,9 @@ class EvidenceCollector:
 
         The MCP server classes ``get_news`` output as ``external_text`` — text we
         did not author and cannot vouch for. It goes under a clearly named
-        ``untrusted_news`` key, and ``prompts/external_text_fence.md`` is stated
-        ahead of this pack in the strategist prompt — the same fragment the chat
-        path prepends to a news tool result.
+        ``untrusted_news`` key; ``prompts/strategist.yaml`` fences it as
+        adversarial third-party input, and the chat path prepends its own
+        warning to a news tool result.
         """
         try:
             raw = await self._mcp.get_news([symbol], limit=NEWS_LIMIT)

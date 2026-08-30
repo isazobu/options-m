@@ -153,19 +153,17 @@ async def run(
             stopped_here=True,
         )
         return trace
-    prompt = prompt_loader.load(
-        "strategist",
-        symbol=symbol,
-        evidence_json=json.dumps(pack, default=str, indent=2),
-        conviction_floor=f"{settings.conviction_floor:.2f}",
+    prompt = prompt_loader.load("strategist")
+    user_prompt = prompt.render(
+        "user", symbol=symbol, evidence_json=json.dumps(pack, default=str, indent=2)
     )
     try:
         regime: RegimeRead = await llm.complete_json(
             schema=RegimeRead,
-            system=prompt.require_system(),
-            user=prompt.user,
+            system=prompt.render("system"),
+            user=user_prompt,
             max_tokens=settings.llm_max_tokens,
-            temperature=prompt.require_temperature(),
+            temperature=prompt.params.get("temperature", 0.2),
         )
     except LlmContractError as exc:
         trace.add("LLM regime read", ok=False, error=str(exc), stopped_here=True)
@@ -190,7 +188,7 @@ async def run(
             stopped_here=True,
         )
         return trace
-    assert isinstance(decision, StrategyIntent)
+    assert isinstance(decision, StrategyIntent)  # noqa: S101 - decide returns one of the two
     intent = decision
     trace.add(
         "strategy matrix",
