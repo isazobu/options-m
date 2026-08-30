@@ -109,6 +109,11 @@ class Settings(BaseSettings):
     risk_dte_max: int = Field(default=45, ge=1)
     min_open_interest: int = Field(default=100, ge=0)
     max_spread_pct: float = Field(default=0.10, gt=0.0, le=1.0)
+    # A relative spread cap alone disqualifies every cheap wing: a 0.10/0.15
+    # quote is 40% wide but costs five cents to cross, and those wings are
+    # exactly what makes an iron condor defined-risk. A leg is refused only
+    # when it is wide in *both* senses — percentage and absolute.
+    max_spread_abs: float = Field(default=0.05, ge=0.0)
     daily_loss_halt_pct: float = Field(default=0.03, gt=0.0, le=1.0)
     drawdown_halt_pct: float = Field(default=0.08, gt=0.0, le=1.0)
     minutes_before_close_blackout: int = Field(default=15, ge=0)
@@ -151,7 +156,48 @@ class Settings(BaseSettings):
 
     # Per-structure defaults consumed by matrix.py.
     short_delta_default: float = Field(default=0.25, gt=0.0, lt=1.0)
+    # Wing distance as a multiple of the expected move over the option's life
+    # (spot x IV x sqrt(dte/365)). A flat dollar width is only ever right for
+    # one underlying at one vol level: $5 wings are a fifth of the expected
+    # move on SPY at 769 — which is what made a 5-wide at-the-money iron
+    # butterfly collect 95.7% of its width and read as an almost certain max
+    # loss — and several times the expected move on a $30 name. Set to 0 to
+    # disable scaling and fall back to spread_width_default.
+    # Measured on real SPY and NVDA chains at 21-38 DTE: at 0.40-0.50 the
+    # credit verticals land at 15-19% of width and the iron condor at 33%,
+    # comfortably inside the credit band, on both underlyings. Above ~1.0 they
+    # fall through the thin-credit floor.
+    spread_width_expected_move_mult: float = Field(default=0.45, ge=0.0)
+    # An at-the-money short collects far more premium than a 0.25-delta one,
+    # so an iron butterfly needs much wider wings to leave a profit zone at
+    # all: the same measurement put a 1-expected-move butterfly at 60-65% of
+    # width and a 1.25 one at 53-57%, while anything under 0.75 was refused as
+    # credit_too_rich. One multiplier cannot serve both families.
+    spread_width_expected_move_mult_atm: float = Field(default=1.25, ge=0.0)
+    # Only used when the scaling above is disabled, or when a caller pins a
+    # width explicitly (the CLI's --spread-width).
     spread_width_default: float = Field(default=5.0, gt=0.0)
+    # Structure quality floors, enforced in strategy_builder when the plan is
+    # assembled. Measured credit/width by short delta, on a 38-day chain —
+    # width barely moves this ratio, short delta is the lever:
+    #   0.15 -> ~10%   0.20 -> ~14%   0.25 -> ~18%   0.30 -> ~21%   0.35 -> ~27%
+    # The floor is 12%, not 15%: at 15% the calibrated 0.20-delta setup is
+    # unreachable. For a fatter credit raise short_delta_default, not the wing.
+    min_credit_width_pct: float = Field(default=0.12, gt=0.0, le=1.0)
+    # ...and the ceiling, which catches the opposite failure. Credit/width is
+    # roughly the risk-neutral probability of being breached, so a structure
+    # collecting most of its width has almost no profit zone left: measured on
+    # a real SPY chain, a 5-wide at-the-money iron butterfly collected 95.7% of
+    # width, leaving a $21.75 max loss and a profit zone of spot ±$0.22 — an
+    # almost certain max-loss trade that position sizing then scaled to 91
+    # contracts precisely *because* the loss per contract looked tiny. Every
+    # legitimate structure sits far below this: credit verticals reach 27% at
+    # 0.35 delta, and an iron condor roughly doubles that over one width.
+    max_credit_width_pct: float = Field(default=0.70, gt=0.0, le=1.0)
+    # Debit verticals: never pay more than this share of the width, and never
+    # take a structure whose best case does not at least match its worst.
+    max_debit_width_pct: float = Field(default=0.45, gt=0.0, le=1.0)
+    min_reward_risk: float = Field(default=1.0, ge=0.0)
     # DTE window for new structures (distinct from risk_dte_min/max which are
     # the hard account-wide bounds risk.py enforces regardless of intent).
     dte_target_min: int = Field(default=21, gt=0)

@@ -25,6 +25,7 @@ from pydantic import ValidationError
 
 from options_m import strategy_builder
 from options_m.config import Settings
+from options_m.evidence.occ import parse_occ_symbol
 from options_m.mcp_client import AlpacaMcp, finite_float
 from options_m.models import OrderPlan, Rejection, StrategyIntent
 from options_m.risk import PortfolioSnapshot, RiskEngine, RiskVerdict
@@ -144,6 +145,27 @@ async def fetch_chain_window(
     return contracts, snapshots
 
 
+def _group_into_structures(option_positions: list[dict[str, Any]]) -> set[tuple[str, date]]:
+    """Collapse individual option legs into the structures they belong to.
+
+    Alpaca reports one position per leg, so an iron condor reads as four. The
+    position limits are written in structures — "at most one open trade per
+    underlying", "at most five open trades" — and counting legs against them
+    would let a single condor consume the entire portfolio budget.
+
+    Legs of one structure share an underlying and an expiry, which is what the
+    key is. A symbol that will not parse as OCC counts as a structure of its
+    own: the limits exist to cap exposure, so an unrecognised position must
+    never make the count smaller.
+    """
+    structures: set[tuple[str, date]] = set()
+    for position in option_positions:
+        symbol = str(position.get("symbol", ""))
+        occ = parse_occ_symbol(symbol)
+        structures.add((occ.underlying, occ.expiry) if occ is not None else (symbol, date.min))
+    return structures
+
+
 async def build_portfolio_snapshot(
     underlying: str,
     client_order_id: str,
@@ -163,16 +185,16 @@ async def build_portfolio_snapshot(
         e for row in equity_history if (e := finite_float(row.get("equity"))) is not None
     ]
 
+    structures = _group_into_structures(option_positions)
+
     return PortfolioSnapshot(
         equity=finite_float(account.get("equity")),
         # last_equity is Alpaca's own "equity as of previous close" field —
         # exactly the daily-loss baseline, with no timezone-boundary guessing.
         start_of_day_equity=finite_float(account.get("last_equity")),
         high_water_mark=max(finite_equities) if finite_equities else None,
-        concurrent_option_positions=len(option_positions),
-        positions_in_underlying=sum(
-            1 for p in option_positions if str(p.get("symbol", "")).startswith(underlying)
-        ),
+        concurrent_option_positions=len(structures),
+        positions_in_underlying=sum(1 for root, _expiry in structures if root == underlying),
         total_open_option_premium=sum(
             abs(finite_float(p.get("market_value")) or 0.0) for p in option_positions
         ),

@@ -18,6 +18,23 @@ from options_m.config import Settings
 from options_m.mcp_client import finite_float
 from options_m.models import OrderPlan
 
+# Structures whose every short leg is covered by a long leg of the same option
+# type, submitted in the same multi-leg order. Kept here rather than imported
+# from strategy_builder on purpose: this module must stay independent of the
+# construction layer, so that a mistake there cannot quietly widen what the
+# risk gate accepts. A name absent from this set and carrying a short leg is
+# refused, which is the safe direction for anything new.
+_WING_PROTECTED_STRATEGIES = frozenset(
+    {
+        "debit_call_spread",
+        "debit_put_spread",
+        "put_credit_spread",
+        "call_credit_spread",
+        "iron_condor",
+        "iron_butterfly",
+    }
+)
+
 
 class RiskLimits(BaseModel):
     """The account-wide hard bounds, read once from :class:`Settings`."""
@@ -32,6 +49,7 @@ class RiskLimits(BaseModel):
     dte_max: int
     min_open_interest: int
     max_spread_pct: float
+    max_spread_abs: float
     daily_loss_halt_pct: float
     drawdown_halt_pct: float
     minutes_before_close_blackout: int
@@ -47,6 +65,7 @@ class RiskLimits(BaseModel):
             dte_max=settings.risk_dte_max,
             min_open_interest=settings.min_open_interest,
             max_spread_pct=settings.max_spread_pct,
+            max_spread_abs=settings.max_spread_abs,
             daily_loss_halt_pct=settings.daily_loss_halt_pct,
             drawdown_halt_pct=settings.drawdown_halt_pct,
             minutes_before_close_blackout=settings.minutes_before_close_blackout,
@@ -131,12 +150,21 @@ class RiskEngine:
         short_legs = [leg for leg in plan.legs if leg.side == "sell"]
         if not short_legs:
             return None
-        if plan.strategy in {"debit_call_spread", "debit_put_spread"}:
-            option_type = short_legs[0].option_type
-            long_legs = [
-                leg for leg in plan.legs if leg.side == "buy" and leg.option_type == option_type
-            ]
-            return None if len(long_legs) >= len(short_legs) else "naked_short_leg"
+        if plan.strategy in _WING_PROTECTED_STRATEGIES:
+            # Per option type, not in aggregate: an iron condor's put wing does
+            # nothing for its short call. A long option of the same type caps
+            # its short's loss at the strike distance whatever the strikes are,
+            # so matching the counts side by side is what defines the risk.
+            for option_type in ("call", "put"):
+                shorts = [leg for leg in short_legs if leg.option_type == option_type]
+                longs = [
+                    leg
+                    for leg in plan.legs
+                    if leg.side == "buy" and leg.option_type == option_type
+                ]
+                if len(longs) < len(shorts):
+                    return "naked_short_leg"
+            return None
         if plan.strategy in {"covered_call", "cash_secured_put"}:
             # Covered by shares / cash by construction — verified upstream in
             # strategy_builder before a plan for these ever exists.
@@ -164,13 +192,22 @@ class RiskEngine:
             mid = (leg.bid + leg.ask) / 2
             if mid <= 0:
                 continue
-            spread_pct = (leg.ask - leg.bid) / mid
+            spread_abs = leg.ask - leg.bid
+            spread_pct = spread_abs / mid
             # A spread exactly at the limit must pass: bid/ask arithmetic in
             # binary float can put it a sliver over (0.10000000000000009 for
             # bid=1.9/ask=2.1), which a bare `>` would wrongly reject.
-            if spread_pct > self._limits.max_spread_pct and not math.isclose(
+            over_pct = spread_pct > self._limits.max_spread_pct and not math.isclose(
                 spread_pct, self._limits.max_spread_pct, rel_tol=1e-9, abs_tol=1e-12
-            ):
+            )
+            # Wide in percentage terms alone is not enough. A protective wing
+            # quoted 0.10/0.15 is 40% wide but five cents to cross, and it is
+            # the leg that makes an iron structure defined-risk in the first
+            # place — refusing it here would forbid the whole family.
+            over_abs = spread_abs > self._limits.max_spread_abs and not math.isclose(
+                spread_abs, self._limits.max_spread_abs, rel_tol=1e-9, abs_tol=1e-12
+            )
+            if over_pct and over_abs:
                 return f"wide_spread:{leg.symbol}"
         return None
 

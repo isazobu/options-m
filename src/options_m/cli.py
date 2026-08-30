@@ -39,6 +39,10 @@ _STRATEGIES = (
     "covered_call",
     "cash_secured_put",
     "long_strangle",
+    "put_credit_spread",
+    "call_credit_spread",
+    "iron_condor",
+    "iron_butterfly",
 )
 
 

@@ -22,6 +22,7 @@ _LIMITS = RiskLimits(
     dte_max=45,
     min_open_interest=100,
     max_spread_pct=0.10,
+    max_spread_abs=0.05,
     daily_loss_halt_pct=0.03,
     drawdown_halt_pct=0.08,
     minutes_before_close_blackout=15,
@@ -136,6 +137,59 @@ def test_a_debit_spread_missing_its_long_leg_is_naked() -> None:
     verdict = _engine().evaluate(plan, _portfolio())
 
     assert "naked_short_leg" in verdict.reasons
+
+
+def _condor_legs() -> list[Leg]:
+    """A well-formed four-leg iron condor: both shorts covered by own-type wings."""
+    return [
+        _leg(side="sell", option_type="put", strike=95.0, symbol="SPY250321P00095000"),
+        _leg(side="buy", option_type="put", strike=90.0, symbol="SPY250321P00090000"),
+        _leg(side="sell", option_type="call", strike=105.0, symbol="SPY250321C00105000"),
+        _leg(side="buy", option_type="call", strike=110.0, symbol="SPY250321C00110000"),
+    ]
+
+
+def test_credit_structures_with_their_wings_are_defined_risk() -> None:
+    for strategy, legs in (
+        ("put_credit_spread", _condor_legs()[:2]),
+        ("call_credit_spread", _condor_legs()[2:]),
+        ("iron_condor", _condor_legs()),
+        ("iron_butterfly", _condor_legs()),
+    ):
+        verdict = _engine().evaluate(_plan(strategy=strategy, legs=legs), _portfolio())
+
+        assert "naked_short_leg" not in verdict.reasons, strategy
+
+
+def test_an_iron_condor_missing_one_wing_is_naked_on_that_side_alone() -> None:
+    """Counting legs in aggregate would pass this: three legs, two of them long.
+
+    A put wing does nothing for a short call, so the match has to be made per
+    option type — which is exactly what this plan violates.
+    """
+    legs = [leg for leg in _condor_legs() if leg.option_type != "call" or leg.side != "buy"]
+
+    verdict = _engine().evaluate(_plan(strategy="iron_condor", legs=legs), _portfolio())
+
+    assert "naked_short_leg" in verdict.reasons
+
+
+def test_an_unrecognised_strategy_with_a_short_leg_is_still_refused() -> None:
+    """The gate is a whitelist: anything new is naked until it is listed."""
+    plan = _plan(strategy="ratio_backspread", legs=_condor_legs())
+
+    verdict = _engine().evaluate(plan, _portfolio())
+
+    assert "naked_short_leg" in verdict.reasons
+
+
+def test_a_cheap_wing_wide_only_in_percentage_terms_is_not_rejected() -> None:
+    """0.10/0.15 is 40% wide and five cents to cross — the leg that defines the risk."""
+    plan = _plan(legs=[_leg(bid=0.10, ask=0.15)])
+
+    verdict = _engine().evaluate(plan, _portfolio())
+
+    assert not any(r.startswith("wide_spread") for r in verdict.reasons)
 
 
 def test_dte_outside_the_window_is_rejected() -> None:

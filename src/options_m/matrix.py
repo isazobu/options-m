@@ -161,7 +161,16 @@ def decide(
     # 7. Assemble StrategyIntent.
     spread_width: float | None = None
     if strategy not in {"long_call", "long_put", "long_strangle"}:
-        spread_width = settings.spread_width_default
+        # Left unset when the builder is allowed to size the wings itself: it
+        # holds the real contracts and their implied vols, so it can set the
+        # width from the expected move over the option's life. A fixed dollar
+        # width is only ever right for one underlying at one vol level.
+        mult = (
+            settings.spread_width_expected_move_mult_atm
+            if strategy == "iron_butterfly"
+            else settings.spread_width_expected_move_mult
+        )
+        spread_width = None if mult > 0 else settings.spread_width_default
 
     return StrategyIntent(
         action="open",
