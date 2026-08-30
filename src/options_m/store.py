@@ -1034,6 +1034,25 @@ class Store:
         result.sort(key=lambda r: float(r.get("score") or 0), reverse=True)
         return result[:limit]
 
+    async def get_all_orders(self) -> list[dict[str, Any]]:
+        """All orders in the store, for position-to-proposal matching.
+
+        Returns the same shape as :meth:`recent_orders` but without a limit so
+        PositionManagerAgent can match any position regardless of age.
+        """
+        if not self._db.is_enabled:
+            return sorted(
+                self._memory_orders.values(),
+                key=lambda row: row["submitted_at"],
+                reverse=True,
+            )
+        return await self._fetch(
+            "SELECT id, proposal_id, client_order_id, submitted_at, status, request, "
+            "response, filled_qty, filled_avg_price, error FROM orders "
+            "ORDER BY submitted_at DESC",
+            (),
+        )
+
     async def _fetch(self, sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.execute(sql, params)

@@ -50,6 +50,28 @@ def _decimal_str(value: float, places: int = 2) -> str:
     return str(Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_EVEN))
 
 
+_OCC_RE = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
+
+
+def _build_closing_legs(option_legs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return legs with sides inverted for a sell_to_close order.
+
+    Alpaca position sides are ``"long"``/``"short"``; order sides are
+    ``"buy"``/``"sell"``. Long → sell to close, short → buy to close.
+    """
+    result = []
+    for leg in option_legs:
+        occ = str(leg.get("symbol", "")).upper()
+        try:
+            qty_int = max(1, abs(int(float(str(leg.get("qty", "1"))))))
+        except (TypeError, ValueError):
+            qty_int = 1
+        entry_side = str(leg.get("side", "long")).lower()
+        close_side = "sell" if entry_side == "long" else "buy"
+        result.append({"symbol": occ, "side": close_side, "ratio_qty": str(qty_int)})
+    return result
+
+
 def _build_order_request(plan: OrderPlan) -> dict[str, Any]:
     """Build the exact kwargs ``AlpacaMcp.place_option_order`` expects.
 
@@ -287,6 +309,10 @@ class ExecutionAgent:
             detail["rejected"] += 1
             return
 
+        if intent.action == "close":
+            await self._execute_close(proposal_id, intent, detail)
+            return
+
         if intent.action != "open":
             status = "held" if intent.action == "hold" else "deferred_close"
             await self._store.update_proposal_status(proposal_id, status)
@@ -356,6 +382,122 @@ class ExecutionAgent:
             return
 
         await self._submit(proposal_id, plan, verdict, detail)
+
+    async def _execute_close(
+        self, proposal_id: int, intent: StrategyIntent, detail: dict[str, Any]
+    ) -> None:
+        """Execute a close proposal: build sell-to-close order from the positions
+        cache and submit it via place_option_order. No chain/snapshot fetch needed
+        — the positions cache already has the open legs and the mark price."""
+        positions = await self._store.get_cached_positions()
+        position_row = next(
+            (r for r in positions if r["symbol"] == intent.underlying), None
+        )
+        if position_row is None:
+            # Position was already closed externally between proposal creation and now.
+            await self._store.update_proposal_status(
+                proposal_id, "close_missed", error="position_not_found_in_cache"
+            )
+            return
+
+        payload = position_row.get("payload") or {}
+        legs: list[dict[str, Any]] = payload.get("legs", [])
+        option_legs = [
+            leg for leg in legs
+            if re.match(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$", str(leg.get("symbol", "")).upper())
+        ]
+        if not option_legs:
+            await self._store.update_proposal_status(
+                proposal_id, "rejected", error="no_option_legs_in_position"
+            )
+            detail["rejected"] += 1
+            return
+
+        closing_legs = _build_closing_legs(option_legs)
+
+        # Limit price from the position mark: market_value / struct_qty / 100.
+        market_value = abs(float(payload.get("market_value") or 0))
+        try:
+            struct_qty = max(1, abs(int(float(str(option_legs[0].get("qty", "1"))))))
+        except (TypeError, ValueError):
+            struct_qty = 1
+        raw_price = market_value / (struct_qty * 100) if market_value > 0 else 0.01
+        limit_price = _decimal_str(max(0.01, raw_price))
+
+        client_order_id = f"omc-{proposal_id}"
+        close_request: dict[str, Any] = {
+            "action": "close",
+            "underlying": intent.underlying,
+            "legs": closing_legs,
+            "exit_reason": intent.thesis,
+        }
+
+        if self._settings.dry_run:
+            await self._store.update_proposal_status(
+                proposal_id, "dry_run_approved", plan=close_request
+            )
+            return
+
+        if len(closing_legs) == 1:
+            leg = closing_legs[0]
+            kwargs: dict[str, Any] = {
+                "qty": str(struct_qty),
+                "limit_price": limit_price,
+                "client_order_id": client_order_id,
+                "position_intent": "sell_to_close",
+                "symbol": leg["symbol"],
+                "side": leg["side"],
+            }
+        else:
+            kwargs = {
+                "qty": str(struct_qty),
+                "limit_price": limit_price,
+                "client_order_id": client_order_id,
+                "position_intent": "sell_to_close",
+                "legs": closing_legs,
+            }
+
+        try:
+            response = await self._mcp.place_option_order(**kwargs)
+        except Exception as exc:
+            await self._store.record_order(
+                proposal_id=proposal_id,
+                client_order_id=client_order_id,
+                status="failed",
+                request=close_request,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            await self._store.update_proposal_status(proposal_id, "failed", error=str(exc))
+            detail["failed"] += 1
+            return
+
+        if isinstance(response, dict) and "error" in response:
+            error_text = str(response["error"])
+            await self._store.record_order(
+                proposal_id=proposal_id,
+                client_order_id=client_order_id,
+                status="failed",
+                request=close_request,
+                response=response,
+                error=error_text,
+            )
+            await self._store.update_proposal_status(proposal_id, "failed", error=error_text)
+            detail["failed"] += 1
+            return
+
+        await self._store.record_order(
+            proposal_id=proposal_id,
+            client_order_id=client_order_id,
+            status="close_submitted",
+            request=close_request,
+            response=response,
+        )
+        await self._store.update_proposal_status(proposal_id, "close_submitted")
+        detail["submitted"] += 1
+        logger.info(
+            "execution: close submitted",
+            extra={"underlying": intent.underlying, "client_order_id": client_order_id},
+        )
 
     async def _reject(self, proposal_id: int, rejection: Rejection) -> None:
         await self._store.update_proposal_status(proposal_id, "rejected", error=rejection.reason)

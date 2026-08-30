@@ -24,6 +24,7 @@ PositionManagerAgent from running normally.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import time
@@ -96,8 +97,13 @@ class StrategistAgent:
     async def _run(self) -> dict[str, Any]:
         detail: dict[str, Any] = {"skipped": None}
 
-        # 1. Market-open check (local cache, no MCP call).
+        # Close evaluation runs unconditionally — not gated by kill switch or
+        # LLM budget, because exits must work even when new entries are frozen.
         now = datetime.now(UTC)
+        close_detail = await self._evaluate_close_proposals()
+        detail.update(close_detail)
+
+        # 1. Market-open check (local cache, no MCP call).
         state = await session.current(self._store, self._settings, now)
         if not state.is_open:
             detail["skipped"] = "market_closed"
@@ -237,6 +243,69 @@ class StrategistAgent:
 
         return detail
 
+    async def _evaluate_close_proposals(self) -> dict[str, Any]:
+        """Check every open position for exit conditions; write a close proposal
+        when one is met. Deterministic — no LLM call, no MCP call."""
+        positions = await self._store.get_cached_positions()
+        if not positions:
+            return {}
+
+        # Collect underlyings that already have a pending close proposal so we
+        # don't create duplicates within the same cycle.
+        pending = await self._store.recent_proposals(limit=50, status="pending")
+        pending_close = {
+            str(p.get("underlying", "")).upper()
+            for p in pending
+            if isinstance(p.get("intent"), dict) and p["intent"].get("action") == "close"
+        }
+
+        close_count = 0
+        for row in positions:
+            underlying: str = row["symbol"]
+            if underlying in pending_close:
+                continue
+
+            payload: dict[str, Any] = row.get("payload") or {}
+            reason = _close_reason(payload, self._settings)
+            if reason is None:
+                continue
+
+            pnl_pct: float | None = payload.get("pnl_pct")
+            thesis = (
+                f"{reason}: {pnl_pct:+.1%} unrealized" if pnl_pct is not None else reason
+            )
+
+            # strategy from enrichment — fall back to a valid placeholder so the
+            # StrategyIntent validates; ExecutionAgent reads actual legs from cache.
+            raw_strategy = payload.get("strategy") or ""
+            strategy = raw_strategy if raw_strategy in _VALID_STRATEGIES else "long_call"
+
+            intent = StrategyIntent(
+                action="close",
+                strategy=strategy,  # type: ignore[arg-type]
+                underlying=underlying,
+                target_delta=0.5,
+                dte_min=0,
+                dte_max=365,
+                conviction=1.0,
+                thesis=thesis,
+                invalidation="",
+            )
+            await self._store.save_proposal(
+                underlying=underlying,
+                intent=intent.model_dump(mode="json"),
+                evidence=payload,
+                status="pending",
+            )
+            pending_close.add(underlying)
+            close_count += 1
+            logger.info(
+                "strategist: close proposal",
+                extra={"underlying": underlying, "reason": reason},
+            )
+
+        return {"close_proposals": close_count} if close_count else {}
+
     async def _pick_candidate(self, now: datetime) -> dict[str, Any] | None:
         """Return the top candidate that passes all pre-filters, or None."""
         today = now.date()
@@ -266,6 +335,38 @@ class StrategistAgent:
                 continue
             return candidate
         return None
+
+
+# All valid literal values for StrategyIntent.strategy (duplicated here to
+# avoid importing the Literal type annotation at runtime).
+_VALID_STRATEGIES: frozenset[str] = frozenset(
+    StrategyIntent.model_fields["strategy"].annotation.__args__  # type: ignore[union-attr]
+)
+
+
+def _close_reason(payload: dict[str, Any], settings: Settings) -> str | None:
+    """Return a close reason string if any exit condition is met, else None."""
+    pnl_pct = payload.get("pnl_pct")
+    if isinstance(pnl_pct, float):
+        if pnl_pct >= settings.exit_profit_target_pct:
+            return "profit_target"
+        if pnl_pct <= -settings.exit_stop_loss_pct:
+            return "stop_loss"
+
+    opened_at_raw = payload.get("opened_at")
+    if opened_at_raw is not None:
+        opened_at: datetime | None = None
+        if isinstance(opened_at_raw, datetime):
+            opened_at = opened_at_raw
+        elif isinstance(opened_at_raw, str):
+            with contextlib.suppress(ValueError):
+                opened_at = datetime.fromisoformat(opened_at_raw)
+        if opened_at is not None:
+            utc_opened = opened_at if opened_at.tzinfo else opened_at.replace(tzinfo=UTC)
+            if (datetime.now(UTC) - utc_opened).days >= settings.exit_time_stop_days:
+                return "time_stop"
+
+    return None
 
 
 def _trend_label(pack: dict[str, Any]) -> str:
