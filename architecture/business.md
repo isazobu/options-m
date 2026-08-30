@@ -13,19 +13,6 @@ reasoning, so any outcome can be traced back step by step.
 
 ---
 
-## What are options? (Quick primer)
-
-An option is a contract that gives the right to buy or sell a stock at a
-specific price before a specific date. Instead of buying a stock for $100,
-you might pay $5 for the *option* to buy it at $100 within the next 30 days.
-
-options-m trades **multi-leg structures** — combinations of two or four option
-contracts designed so that the maximum possible loss is defined upfront before
-the trade is placed. The system never places a trade where the loss is
-theoretically unlimited.
-
----
-
 ## The 10 stocks it watches
 
 ```
@@ -42,103 +29,285 @@ evaluates all 10 every minute and picks the best-looking opportunity each cycle.
 The system is built from five specialised workers ("agents") that run
 simultaneously. Think of them as team members with distinct roles.
 
+A note on **AI vs. deterministic logic**: only two agents use AI at all, and
+even then only for a narrow, bounded task. Everything else — data collection,
+ranking, contract selection, risk checks, exit conditions — is pure rule-based
+code that produces the same output given the same input, every time.
+
+---
+
 ### 1. Market Watcher (MarketPulseAgent)
-**Runs every 60 seconds. Never trades.**
+**Cadence: every 60 seconds. Never trades. 100% deterministic — no AI.**
 
-Collects data on every stock in the universe:
-- What is the stock's price and recent trend?
-- Is implied volatility (the option market's fear gauge) expensive or cheap
-  relative to how much the stock has actually been moving?
-- Is there an earnings report coming up? (If so, that stock is off-limits.)
-- What is the account's current cash position?
+#### What it does
+Collects fresh data on every stock in the universe and computes a
+"tradeability score" for each one. Saves the ranked list and the full data
+package so the Strategist can read it without going to the broker itself.
 
-Ranks all 10 stocks by "how tradeable does this look right now" and saves
-that ranking for the Strategist.
+#### Conditions — when it does full work
+- The market is open (NYSE trading hours, checked against a local calendar cache).
+
+#### Conditions — when it skips the data collection step
+- The market is closed: it still updates the account snapshot (equity, cash,
+  buying power) but does not collect options data or rank candidates.
+
+#### Scoring formula (deterministic)
+Each stock gets a score from three signals — all pure arithmetic, no AI:
+
+| Signal | How it's measured |
+|---|---|
+| RSI extremity | How far the 14-day RSI is from neutral (50). A stock at RSI 70 scores higher than one at RSI 52. |
+| Realised volatility | How much the stock has actually been moving over the last 20 days. More movement = more premium available to trade. |
+| IV/RV edge | How much the options market's implied volatility exceeds the stock's recent actual volatility. The bigger the gap, the more "expensive" options are. |
+
+Stocks with upcoming earnings are automatically scored 0 and sink to the
+bottom of the list regardless of other signals.
+
+---
 
 ### 2. Position Tracker (PositionManagerAgent)
-**Runs every 60 seconds. Never trades.**
+**Cadence: every 60 seconds. Never opens trades. 100% deterministic — no AI.**
 
-Watches all open positions in the brokerage account and updates their
-current profit/loss every minute. Acts as the source of truth for "what do
-we currently own and what is it worth right now?"
+#### What it does
+Fetches all open positions from the broker, groups option legs by the
+underlying stock they belong to, and saves a current snapshot of each
+position including live profit/loss.
 
-Also watches for exit conditions and creates a close request when a position
-hits its profit target, stop loss, or has been held too long.
+Also evaluates every open position against exit rules and creates a "close
+this position" instruction when one is triggered.
+
+#### Conditions — when it runs normally
+- Always — this agent is never gated by market hours or kill switch, because
+  monitoring positions must work even when new trades are blocked.
+
+#### Exit conditions it checks (deterministic)
+| Condition | Threshold | What happens |
+|---|---|---|
+| Profit target reached | Position is up 50% from entry | Creates a close instruction |
+| Stop loss hit | Position is down 50% from entry | Creates a close instruction |
+| Time stop | Position has been open 30+ days | Creates a close instruction |
+
+When any condition is met, a close instruction is written to the database.
+The Trader picks it up and submits the actual closing order to the broker.
+
+---
 
 ### 3. Strategist (StrategistAgent)
-**Runs every 5 minutes. Makes decisions but does not touch the broker.**
+**Cadence: every 5 minutes. Makes decisions but never touches the broker.**
+**Uses AI for one narrow task; everything else is deterministic.**
 
-The decision-maker. Every 5 minutes it:
-1. Picks the highest-ranked stock from the Market Watcher's list.
-2. Reads the full data package for that stock.
-3. Asks an AI (via a structured prompt) to read the market regime and state
-   its conviction level.
-4. Runs a deterministic decision table ("if the trend is up and options are
-   expensive, sell a put credit spread") to pick a strategy.
-5. Records the decision as a "proposal" — either a trade to execute or a
-   reasoned hold.
+#### What it does
+The decision-maker. Picks the best-ranked stock, reads its data, asks the AI
+to assess the market regime, then runs a rule table to pick a strategy.
 
-The AI's job is narrow: assess the regime and express conviction. The actual
-strategy selection is rule-based code, not an AI free-form output.
+#### Conditions — when it skips the entire cycle
+The Strategist checks these in order and stops immediately if any is true:
+
+| Condition | What it records |
+|---|---|
+| Market is closed | `skipped: market_closed` |
+| Kill switch is on | `skipped: kill_switch` |
+| AI is not configured (no API key) | `skipped: llm_not_configured` |
+| Daily AI budget is exhausted | `skipped: llm_budget_exhausted` |
+| No stock passes the candidate filters (see below) | `skipped: no_candidate` |
+| No fresh data exists for the selected stock | `skipped: no_evidence_cache` |
+| Data for the selected stock is stale (>2 min old) | `skipped: stale_evidence` |
+
+> **Important:** the kill switch only blocks new trade proposals. The close
+> evaluation (checking whether open positions need to exit) runs regardless —
+> exits must work even when new entries are frozen.
+
+#### Candidate filtering (deterministic)
+Before selecting a stock to evaluate, the Strategist silently skips any stock that:
+- Already has an open position in the account
+- Already has a pending trade proposal waiting to be executed
+- Is inside its earnings blackout window
+
+#### The AI step — what it is and is not
+The Strategist makes **one AI call per cycle**, with a structured prompt that
+includes the stock's data package. The AI is asked to return three things only:
+
+- **Thesis**: why does this setup look tradeable?
+- **Invalidation**: what would make this thesis wrong?
+- **Conviction**: a number from 0 to 1
+
+The AI does **not** pick the strategy. It does **not** select contracts. It
+does **not** decide the size. Its only operational role is the conviction
+number — if that number is below 0.55, the Strategist records a hold and stops.
+
+#### Strategy selection (deterministic)
+Once conviction passes the threshold, a fixed rule table picks the strategy
+based on two signals derived from the data (not from the AI):
+
+| Market trend | Options expensive (IV > realized vol) | Options cheap |
+|---|---|---|
+| Trending up | Sell a put spread | Buy a call spread |
+| Going sideways | Sell an iron condor / butterfly | Buy a strangle |
+| Trending down | Sell a call spread | Buy a put spread |
+
+If the account's options trading level is below 3, credit structures are
+downgraded to simple long calls or long puts. If no level-appropriate
+structure exists, the Strategist records a hold.
+
+The outcome is either a **pending proposal** (a specific strategy to execute)
+or a **no-action record** (a hold, with the reason stored).
+
+---
 
 ### 4. Trader (ExecutionAgent)
-**Runs every 30 seconds. The only agent that touches the broker.**
+**Cadence: every 30 seconds. The only agent that touches the broker.**
+**100% deterministic — no AI.**
 
-Takes approved proposals from the Strategist, does the work to turn them into
-real orders:
-1. Gets the current stock price.
-2. Pulls the live options chain (all available contracts and their prices).
-3. Selects the specific contracts that best match the strategy's target
-   (e.g. "find the put closest to a 25% delta expiring in 21–38 days").
-4. Calculates the entry price and worst-case loss.
-5. Runs a risk check (see Safety Nets below).
-6. If everything passes: places the order with the broker.
+#### What it does
+Picks up pending proposals and turns them into real broker orders. Also
+continuously checks the status of submitted orders and updates the record
+when the broker fills, rejects, or cancels them.
 
-It also periodically checks the status of submitted orders and updates the
-record when they are filled, rejected, or cancelled by the broker.
+#### Conditions — when it skips entirely
+- Kill switch is on: stops immediately and records the event.
+
+#### Per-proposal conditions — what can block a trade
+For each pending proposal, the Trader works through these steps in order.
+A failure at any step rejects the proposal with a recorded reason:
+
+| Step | What can go wrong | Result |
+|---|---|---|
+| Parse the strategy intent | Malformed proposal from database | `rejected: invalid_intent` |
+| Get current stock price | Price unavailable from broker | `rejected: no_spot_price` |
+| Build the order (select contracts) | No contracts in target date/delta range | `rejected: no_contracts_in_window` |
+| Build the order | Selected contracts have too-wide bid/ask spread | `rejected: wide_spread` |
+| Build the order | Not enough premium to justify the risk | `rejected: thin_credit` |
+| Build the order | Position would collect too much of the spread width | `rejected: credit_too_rich` |
+| Risk check | Trade would use more than 2% of account equity | `rejected: max_premium_exceeded` |
+| Risk check | Total open exposure would exceed 15% of equity | `rejected: total_premium_exceeded` |
+| Risk check | Already have 5 open positions | `rejected: max_concurrent_positions` |
+| Risk check | Already have a position in this stock | `rejected: max_positions_per_underlying` |
+| Risk check | Account lost more than 3% today | `rejected: daily_loss_halt` |
+| Risk check | Account is down more than 8% from peak | `rejected: drawdown_halt` |
+| Risk check | Less than 15 minutes to market close | `rejected: end_of_day_blackout` |
+| Risk check | Dry run mode is on | Proposal marked `dry_run_approved`, no order sent |
+
+If all checks pass, the order is sent to the broker.
+
+#### After submission — order tracking
+Every 30 seconds, the Trader also polls any submitted orders that haven't
+settled yet. If the broker marks an order as rejected or cancelled, the
+Trader records the broker's reason and marks the original proposal as
+`broker_rejected`.
+
+---
 
 ### 5. Reviewer (ReflectionAgent)
-**Runs every 60 minutes. Never trades.**
+**Cadence: every 60 minutes. Never trades.**
+**Uses AI — one call per filled trade or unreviewed hold/rejection.**
 
-Looks back at completed trades and past hold/reject decisions and asks the AI:
-- "That trade closed. What can we learn from what happened vs. what we expected?"
-- "We held on that stock. Was that the right call in hindsight?"
+#### What it does
+Looks back at two things: trades that filled, and proposals where the system
+decided to hold or got rejected. Asks the AI to write a 1–2 sentence lesson
+for each.
 
-Saves those lessons so the Strategist can factor them in the next time it
-evaluates the same stock.
+#### Conditions — when it runs
+- Always — not gated by market hours or kill switch.
+
+#### What the AI is asked (two separate passes)
+
+**Pass A — closed trades:**
+For each filled order not yet reviewed, the AI receives: what contracts were
+traded, at what price, and what the outcome was. It is asked: "What can we
+learn from this?"
+
+**Pass B — holds and rejections:**
+For each recent hold or rejection not yet reviewed, the AI receives: the
+stock, the thesis, the conviction level, and why it was held or rejected. It
+is asked: "Was this the right call? Was it a miss or a save?"
+
+The lesson is stored and automatically included in the data package the next
+time the Strategist evaluates the same stock. This is the only feedback loop
+from past decisions back into future ones.
+
+If the AI call fails for any reason, that entry is skipped and tried again
+next hour. An AI failure here never stops any other agent.
 
 ---
 
 ## How a Trade Gets Born: End-to-End
 
 ```
-Every 60 s: Market Watcher scans all 10 stocks
-            → ranks them by tradeable signal
-            → saves ranking + data to database
+Every 60 s  Market Watcher
+            [deterministic]
+            ├── market open?
+            │     NO  → update account snapshot only, stop
+            │     YES → collect data for all 10 stocks
+            │           score each one (RSI + volatility + IV edge)
+            │           earnings coming up? → score = 0
+            └──────────► save ranked list to database
 
-Every 5 m:  Strategist picks the top-ranked stock
-            → reads its data package
-            → calls AI: "What regime are we in? How confident are you?"
-            → runs strategy table: (trend + IV regime) → strategy name
-            → if conviction ≥ 55%: saves a PENDING proposal
-            → if conviction < 55% or no clear signal: saves a NO_ACTION record
+Every 5 m   Strategist
+            ├── market open?          NO  → stop (record: market_closed)
+            ├── kill switch on?       YES → stop (record: kill_switch)
+            ├── AI configured?        NO  → stop (record: llm_not_configured)
+            ├── AI budget left?       NO  → stop (record: llm_budget_exhausted)
+            ├── any valid candidate?  NO  → stop (record: no_candidate)
+            │     (skips: already have position, already pending, earnings blackout)
+            ├── fresh data exists?    NO  → stop (record: no_evidence_cache / stale)
+            │
+            ├── [AI] ask: "What regime? How confident?"
+            │     AI returns: thesis, invalidation, conviction (0–1)
+            │     AI fails? → stop (record: llm_failed), no crash
+            │
+            ├── conviction ≥ 55%?     NO  → stop (record: no_action / hold)
+            │
+            ├── [deterministic] run strategy table → pick structure
+            │     account level too low for that structure? → downgrade or hold
+            │
+            └──────────► save PENDING proposal to database
 
-Every 30 s: Trader checks for PENDING proposals
-            → fetches live options chain from broker
-            → finds the best-fit contracts
-            → computes price and max loss
-            → runs safety checks (see below)
-            → if all pass: places order → proposal becomes SUBMITTED
-            → if any check fails: proposal becomes REJECTED (reason recorded)
+Every 30 s  Trader
+            ├── kill switch on? → stop
+            │
+            ├── for each PENDING proposal:
+            │     ├── parse valid?              NO  → rejected: invalid_intent
+            │     ├── action = close?           YES → build close order from positions cache
+            │     ├── get live stock price      FAIL → rejected: no_spot_price
+            │     ├── fetch options chain from broker
+            │     ├── select best-fit contracts
+            │     │     no contracts in range?  → rejected: no_contracts_in_window
+            │     │     spread too wide?        → rejected: wide_spread
+            │     │     credit too thin?        → rejected: thin_credit
+            │     │     credit too rich?        → rejected: credit_too_rich
+            │     ├── risk checks [deterministic]
+            │     │     trade > 2% of equity?   → rejected: max_premium_exceeded
+            │     │     total > 15% of equity?  → rejected: total_premium_exceeded
+            │     │     5 positions already?    → rejected: max_concurrent_positions
+            │     │     already in this stock?  → rejected: max_positions_per_underlying
+            │     │     down 3% today?          → rejected: daily_loss_halt
+            │     │     down 8% from peak?      → rejected: drawdown_halt
+            │     │     <15 min to close?       → rejected: end_of_day_blackout
+            │     ├── dry run on?               YES → dry_run_approved (no order sent)
+            │     └──────────► place order with broker → SUBMITTED
+            │
+            └── check submitted orders with broker
+                  broker rejected/cancelled? → record reason as broker_rejected
 
-Every 60 s: Position Tracker checks open trades
-            → profit target hit? → creates a close proposal
-            → stop loss hit? → creates a close proposal
-            → held too long? → creates a close proposal
+Every 60 s  Position Tracker [deterministic, always runs]
+            └── for each open position:
+                  up 50%?       → create close proposal
+                  down 50%?     → create close proposal
+                  open 30+ days? → create close proposal
+                  (Trader picks up the close proposal on its next cycle)
+
+Every 60 m  Reviewer
+            ├── [AI] for each filled order not yet reviewed:
+            │         "What can we learn from this trade?"
+            │         → save lesson, linked to this stock
+            └── [AI] for each hold/rejection not yet reviewed:
+                      "Was this the right call — miss or save?"
+                      → save lesson, linked to this stock
+                      (lesson appears in Strategist's data package next time)
 ```
 
-Every step is recorded in the database. You can trace any trade — or any
-decision *not* to trade — back through each stage.
+Every step is recorded in the database with its outcome and reason. You can
+trace any trade — or any decision *not* to trade — back through each stage.
 
 ---
 
