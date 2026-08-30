@@ -160,6 +160,17 @@ class Settings(BaseSettings):
     # Conviction below this floor forces "hold" even when the matrix would
     # otherwise produce a structure.
     conviction_floor: float = Field(default=0.55, ge=0.0, le=1.0)
+    # A symbol that produced any proposal (any status) within this window is
+    # skipped by candidate selection, so the highest-scoring name is not
+    # re-proposed on every strategist tick. Set well above
+    # strategist_interval_seconds.
+    proposal_cooldown_seconds: float = Field(default=3600.0, gt=0)
+    # Hard ceilings on proposal volume over a rolling 24h window — a backstop
+    # for the cooldown, and until the token budget is enforced the only real
+    # cap on LLM spend. A symbol at its per-symbol cap, or the whole run at the
+    # global cap, is recorded as skipped="proposal_cap".
+    max_proposals_per_symbol_per_day: int = Field(default=3, ge=1)
+    max_proposals_per_day: int = Field(default=40, ge=1)
     # Effective options trading level override. Normally read from the account
     # cache; this caps it (useful if the paper account auto-approves Level 3
     # but you want to test Level-2 degradation).
