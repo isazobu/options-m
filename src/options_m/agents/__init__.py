@@ -20,10 +20,12 @@ from options_m.agents.market_pulse import MarketPulseAgent
 from options_m.agents.position_manager import PositionManagerAgent
 from options_m.agents.reflection import ReflectionAgent
 from options_m.agents.strategist import StrategistAgent
+from options_m.agents.telegram_reporter import TelegramReporterAgent
 from options_m.config import Settings
 from options_m.lifecycle import sleep_unless_shutdown
 from options_m.llm import FeatherlessLlm
 from options_m.mcp_client import AlpacaMcp
+from options_m.notify import Notifier, NullNotifier
 from options_m.risk import RiskEngine, RiskLimits
 from options_m.store import Store
 
@@ -60,15 +62,20 @@ def build_agents(
     mcp: AlpacaMcp,
     store: Store,
     llm: FeatherlessLlm | None = None,
+    notifier: Notifier | None = None,
 ) -> list[Agent]:
     """Construct the agents this process should run.
 
     Register real agents here so they receive their dependencies explicitly.
     ``llm`` is optional so callers without Featherless credentials still boot;
     StrategistAgent and ReflectionAgent check ``llm.is_enabled`` and skip
-    gracefully when the model is not configured.
+    gracefully when the model is not configured. ``notifier`` is optional for
+    the same reason: without Telegram credentials the process runs with a
+    :class:`~options_m.notify.NullNotifier` and the reporter agent is not
+    registered at all, so it costs nothing.
     """
     risk_engine = RiskEngine(RiskLimits.from_settings(settings))
+    _notifier = notifier or NullNotifier()
     _llm = llm or FeatherlessLlm(
         api_key=settings.featherless_api_key,
         base_url=settings.featherless_base_url,
@@ -76,13 +83,16 @@ def build_agents(
         timeout_seconds=settings.llm_timeout_seconds,
         daily_token_budget=settings.llm_daily_token_budget,
     )
-    return [
+    agents: list[Agent] = [
         MarketPulseAgent(settings, mcp, store),
         PositionManagerAgent(settings, mcp, store),
-        ExecutionAgent(settings, mcp, store, risk_engine),
-        StrategistAgent(settings, store, _llm),
+        ExecutionAgent(settings, mcp, store, risk_engine, notifier=_notifier),
+        StrategistAgent(settings, store, _llm, notifier=_notifier),
         ReflectionAgent(settings, store, _llm),
     ]
+    if not isinstance(_notifier, NullNotifier):
+        agents.append(TelegramReporterAgent(settings, store, _notifier))
+    return agents
 
 
 async def run_agent(agent: Agent, settings: Settings, shutdown: asyncio.Event) -> None:
