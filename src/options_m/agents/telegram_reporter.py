@@ -73,9 +73,9 @@ class TelegramReporterAgent:
         if not state.is_open:
             if not was_open:
                 return {"skipped": "market_closed"}
-            title = "Seans kapanış özeti"
+            title = "Session close snapshot"
         else:
-            title = "Pozisyon özeti"
+            title = "Portfolio snapshot"
 
         positions = await self._store.get_cached_positions()
         account = await self._store.get_cached_account()

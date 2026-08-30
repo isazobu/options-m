@@ -61,15 +61,6 @@ select = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101"]
-# Operator-facing Telegram messages are written in Turkish, so RUF001-003
-# ("ambiguous unicode character") fire on every dotless i and every non-ASCII
-# letter in a message string. The rule guards against homoglyph confusion in
-# identifiers and code; here the non-ASCII characters are the point.
-"src/options_m/notify.py" = ["RUF001", "RUF002", "RUF003"]
-"src/options_m/agents/telegram_reporter.py" = ["RUF001", "RUF002", "RUF003"]
-"src/options_m/__main__.py" = ["RUF001"]
-"tests/test_notify.py" = ["S101", "RUF001", "RUF002", "RUF003"]
-"tests/test_telegram_reporter.py" = ["S101", "RUF001", "RUF002", "RUF003"]
 
 [tool.mypy]
 python_version = "3.12"

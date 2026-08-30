@@ -64,7 +64,7 @@ def test_truncate_is_a_noop_under_the_limit() -> None:
 def test_truncate_clamps_to_the_telegram_limit() -> None:
     out = truncate("x" * (MESSAGE_LIMIT * 2))
     assert len(out) <= MESSAGE_LIMIT
-    assert out.endswith("(kısaltıldı)")
+    assert out.endswith("(truncated)")
 
 
 def test_truncate_never_leaves_a_dangling_escape() -> None:
@@ -72,10 +72,10 @@ def test_truncate_never_leaves_a_dangling_escape() -> None:
     # make Telegram reject the whole message as malformed MarkdownV2.
     # Sized so the cut lands mid-escape: an odd number of backslashes survives
     # into the head unless truncate() trims the dangling one.
-    head_len = MESSAGE_LIMIT - len("\n…(kısaltıldı)")
+    head_len = MESSAGE_LIMIT - len("\n…(truncated)")
     text = "a" * (head_len - 1) + "\\" * 40
     out = truncate(text)
-    body = out[: -len("\n…(kısaltıldı)")]
+    body = out[: -len("\n…(truncated)")]
     trailing = len(body) - len(body.rstrip("\\"))
     assert trailing % 2 == 0
 
@@ -136,7 +136,7 @@ def test_format_order_reports_legs_and_status() -> None:
 
 def test_format_order_labels_a_close() -> None:
     text = format_order(action="close", underlying="SPY", status="close_submitted", dry_run=False)
-    assert "Kapanış" in text
+    assert "Exit order" in text
 
 
 def test_format_order_includes_the_error_text() -> None:
@@ -148,7 +148,7 @@ def test_format_order_includes_the_error_text() -> None:
 
 def test_format_summary_without_positions() -> None:
     text = format_summary(positions=[], account={"equity": 100000}, dry_run=False)
-    assert "Açık pozisyon yok" in text
+    assert "No open positions" in text
 
 
 def test_format_summary_totals_unrealized_pl() -> None:
