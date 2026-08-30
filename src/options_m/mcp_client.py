@@ -519,16 +519,14 @@ class AlpacaMcp:
         return payload[PAYLOAD_KEY]
 
     # ---- Typed convenience methods ------------------------------------
-    # Added as phases need them, so every broker interaction stays greppable.
 
     async def get_clock(self) -> dict[str, Any]:
         """Market state, straight from the broker.
 
-        Kept for an optional startup sanity-check against the local
-        ``market_calendar`` cache. Per the 2026-08-29 design change, the normal
-        agent loops no longer call this every iteration -- they read the cache
-        (populated from :meth:`get_calendar`) instead. Do not add a new call site
-        for this outside ``market_pulse.py`` and tests.
+        Used for an optional startup sanity-check against the local
+        ``market_calendar`` cache. Agent loops read the cache instead of
+        calling this every tick. Do not add new call sites outside
+        ``market_pulse.py`` and tests.
         """
         return self._expect_mapping("get_clock", await self.call("get_clock"))
 
@@ -688,7 +686,7 @@ class AlpacaMcp:
             "place_option_order", await self.call("place_option_order", args)
         )
 
-    # ---- Read tools for the evidence pack (phase 2) ------------------
+    # ---- Read tools for the evidence pack -----------------------------
 
     async def get_stock_snapshot(self, symbol: str) -> dict[str, Any]:
         """Latest trade, quote, minute bar, daily bar and previous daily bar.

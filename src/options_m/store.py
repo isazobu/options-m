@@ -651,7 +651,7 @@ class Store:
             )
             await conn.commit()
 
-    # ---- Market calendar cache (2026-08-29 design change) --------------
+    # ---- Market calendar cache ------------------------------------------
     # Sole writer: MarketPulseAgent. Every other agent's "is the market open"
     # check goes through market_is_open() below -- never a live get_clock call.
 
@@ -749,7 +749,7 @@ class Store:
         close = rows[0]["close"]
         return close if isinstance(close, datetime) else None
 
-    # ---- Account cache (2026-08-29 design change) -----------------------
+    # ---- Account cache --------------------------------------------------
     # Sole writer: MarketPulseAgent, piggybacked on the get_account_info /
     # get_account_config call it already makes every tick for equity_curve.
 
@@ -797,7 +797,7 @@ class Store:
         )
         return rows[0] if rows else None
 
-    # ---- Positions cache (2026-08-29 design change) ----------------------
+    # ---- Positions cache ------------------------------------------------
     # Sole writer: PositionManagerAgent, piggybacked on its existing per-tick
     # get_all_positions call. Keyed by underlying symbol, current state only --
     # this table is overwritten in place, unlike the append-only tables above.
@@ -851,7 +851,7 @@ class Store:
         for stale_symbol in existing - set(payload_by_symbol):
             await self.remove_position(stale_symbol)
 
-    # ---- Evidence cache (Phase 3) ----------------------------------------
+    # ---- Evidence cache -------------------------------------------------
     # Sole writer: MarketPulseAgent (every 60s, per universe symbol, overwritten
     # in place). StrategistAgent reads from here instead of calling
     # evidence.collect() itself.
@@ -890,7 +890,7 @@ class Store:
         )
         return rows[0] if rows else None
 
-    # ---- Lessons (Phase 4 / ReflectionAgent) --------------------------------
+    # ---- Lessons --------------------------------------------------------
 
     async def save_lesson(
         self,
@@ -922,7 +922,7 @@ class Store:
             )
             await conn.commit()
 
-    # ---- Proposal extensions (Phase 3) -------------------------------------
+    # ---- Proposals ------------------------------------------------------
 
     async def save_proposal(
         self,
@@ -972,7 +972,7 @@ class Store:
             assert row is not None
             return int(row[0])
 
-    # ---- LLM call log (Phase 3) -------------------------------------------
+    # ---- LLM call log ---------------------------------------------------
 
     async def record_llm_call(
         self,
@@ -1006,7 +1006,7 @@ class Store:
             )
             await conn.commit()
 
-    # ---- Top-candidates helper (Phase 3) -----------------------------------
+    # ---- Top-candidates helper ------------------------------------------
 
     async def top_candidates(
         self,

@@ -1,21 +1,9 @@
 """StrategistAgent — one LLM call per iteration, zero MCP calls.
 
-Design:
-
-  step():
-    1. Market-open check (local market_calendar cache — no MCP call).
-    2. Kill switch + LLM-budget check.
-    3. Candidate selection: top candidate by score that is not:
-         - already open (local positions cache)
-         - already in-flight as a pending proposal
-         - inside its earnings blackout window (cheap in-process check)
-    4. Evidence read: get the pre-computed pack from the local evidence cache
-       (written by MarketPulseAgent every 60s). Skip if missing or stale.
-    5. LLM call: one ``complete_json(schema=RegimeRead)`` call — the ONLY
-       outbound I/O in the whole step.
-    6. Matrix decision: deterministic, no LLM.
-    7. Persist: a ``pending`` proposal (actionable) or a ``no_action`` proposal
-       (matrix returned "hold").
+Each step: market-open check → kill-switch/budget → candidate selection
+(top score, not open/in-flight/earnings-blackout) → evidence cache read
+→ one LLM call (the ONLY outbound I/O) → deterministic matrix decision
+→ persist a pending or no_action proposal.
 
 ``LlmContractError`` is caught here and recorded as ``llm_failed`` — it does
 not propagate to the supervisor and does not stop ExecutionAgent or
@@ -103,14 +91,13 @@ class StrategistAgent:
         close_detail = await self._evaluate_close_proposals()
         detail.update(close_detail)
 
-        # 1. Market-open check (local cache, no MCP call).
+        # Local cache read — no MCP call.
         state = await session.current(self._store, self._settings, now)
         if not state.is_open:
             detail["skipped"] = "market_closed"
             return detail
         detail["session_replayed"] = state.replayed
 
-        # 2. Kill switch + LLM budget.
         if self._settings.kill_switch or await self._store.is_kill_switch_engaged():
             detail["skipped"] = "kill_switch"
             return detail
@@ -121,7 +108,6 @@ class StrategistAgent:
             detail["skipped"] = "llm_budget_exhausted"
             return detail
 
-        # 3. Candidate selection.
         candidate = await self._pick_candidate(now)
         if candidate is None:
             detail["skipped"] = "no_candidate"
@@ -129,7 +115,7 @@ class StrategistAgent:
         symbol = str(candidate.get("symbol", "")).upper()
         detail["symbol"] = symbol
 
-        # 4. Evidence cache read (local only — no MCP call ever).
+        # Evidence cache — local only, no MCP call ever.
         stale_threshold = timedelta(
             seconds=self._settings.market_pulse_interval_seconds * _EVIDENCE_STALENESS_FACTOR
         )
@@ -157,7 +143,7 @@ class StrategistAgent:
             detail["skipped"] = "empty_evidence"
             return detail
 
-        # 5. One LLM call — the only outbound I/O in step().
+        # One LLM call — the only outbound I/O in step().
         user_prompt = prompt_loader.load(
             "strategist",
             symbol=symbol,
@@ -195,10 +181,8 @@ class StrategistAgent:
                 ok="status" not in detail or detail.get("status") != "llm_failed",
             )
 
-        # 6. Deterministic matrix decision.
         decision = matrix.decide(pack, regime, settings=self._settings, as_of=now.date())
 
-        # 7. Persist proposal.
         matrix_payload: dict[str, Any] = {
             "trend_classified": _trend_label(pack),
             "iv_regime_classified": _iv_regime_label(pack),
