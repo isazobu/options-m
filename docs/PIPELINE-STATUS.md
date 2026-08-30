@@ -162,11 +162,21 @@ because the `trades` table they were specified against does not exist yet.
 
 ### D. The 250-row cap truncates the chain — and corrupts the volatility read
 
-**This is the most consequential gap on the list.** Both
-`get_option_contracts` and `get_option_chain` are capped at 250 rows, and both
-`evidence.py` and the builder hit that cap. In the builder it merely narrows
-the choice set. In `evidence.py` it changes what the system believes about
-volatility.
+**Fixed (30 August 2026).** `get_option_chain` and `get_option_contracts` now
+follow the server's `next_page_token` to the end of the band (page size 1000,
+a 25-page ceiling that logs if it is ever hit), so a wide chain is read whole
+instead of stopping at the first two expiries. And `evidence.py` no longer
+reads ATM IV from `min(dte)`: it picks the expiry closest to the trading
+tenor (`iv_dte_min..iv_dte_max`, default 21–38, wired from
+`Settings.dte_target_*`), records it as `atm_expiry` / `atm_dte` in the pack,
+and stores the IV-rank history keyed to that tenor. `iv_atm`, `iv_minus_rv`,
+`put_call_skew` and the persisted history are now measured at the tenor the
+structure is actually traded at. The description below is kept for context.
+
+**Original finding.** Both `get_option_contracts` and `get_option_chain` were
+capped at 250 rows, and both `evidence.py` and the builder hit that cap. In
+the builder it merely narrows the choice set. In `evidence.py` it changes what
+the system believes about volatility.
 
 `EvidenceCollector` scans a 7–45 DTE window with a ±15% strike band. On SPY at
 769 that band spans ~230 one-dollar strikes, so a *single* expiry already
@@ -213,17 +223,19 @@ while SPY's $1.00 spacing does not.
 
 Fix, in order:
 
-- **Paginate on `next_page_token`** rather than tightening the band. A band
-  narrow enough to fit under the cap is a band that can exclude the strike the
-  intent actually wants.
-- **Pick the ATM expiry nearest the trading tenor** (`dte_target_min..max`,
-  21–38) instead of the nearest expiry overall. This alone makes IV/RV
-  meaningful again.
-- **Match the realised-vol window to the implied tenor**, or state the mismatch
-  explicitly in the pack so the comparison is not read as like-for-like.
+- ~~**Paginate on `next_page_token`**~~ — done. `get_option_chain` /
+  `get_option_contracts` loop on the token; the band no longer has to be
+  narrowed to fit under a cap.
+- ~~**Pick the ATM expiry nearest the trading tenor**~~ — done.
+  `evidence.collect(..., iv_dte_min, iv_dte_max)` selects the expiry closest to
+  the `[iv_dte_min, iv_dte_max]` band (default 21–38) and reports it as
+  `atm_dte` / `atm_expiry`.
+- **Match the realised-vol window to the implied tenor.** Still open, but much
+  smaller: `iv_atm` is now a ~30-day read against a 20-day RV, and `atm_dte` in
+  the pack states the residual mismatch instead of leaving it implicit.
 
-Until the first two are done, adding the missing credit structures (gap A) will
-not change behaviour: the matrix will still never select them.
+The credit structures (gap A) can now be added on top of a volatility read
+taken at the tenor the matrix trades.
 
 ### E. Replayed sessions trip liquidity gates
 
@@ -259,11 +271,11 @@ should arrive with its own pricing and max-loss tests.
 
 ## Suggested order of work
 
-1. **Chain pagination + ATM tenor** (gap D) — must come first. Until the
-   volatility read is measured at the trading tenor, the matrix cannot select a
-   short-premium structure no matter how many builders exist.
+1. ~~**Chain pagination + ATM tenor** (gap D)~~ — done (30 Aug 2026). The
+   volatility read is now taken at the trading tenor, so the matrix can reach
+   its short-premium cells.
 2. **Credit spreads** (gap A, first half) — unlocks four matrix cells and the
-   short-premium thesis the project is built on. Only useful after D.
+   short-premium thesis the project is built on. Now unblocked by D.
 3. **Exit rules** (gap B) — without them nothing ever closes, which is the
    difference between a demo and a system.
 4. **Close the reflection loop** (gap C) — one call in `evidence.collect()`.

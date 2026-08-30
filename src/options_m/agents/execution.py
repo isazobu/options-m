@@ -113,12 +113,12 @@ async def fetch_chain_window(
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Pull the contracts and snapshots for exactly the window ``intent`` wants.
 
-    Both calls are capped (250 rows) and Alpaca returns nearest expiry first,
-    so asking "from today" spends the entire budget on 2-6 DTE contracts and
-    never reaches a 21-38 DTE target — every proposal then died in the builder
-    as ``no_contracts_in_window``. Starting the window at ``dte_min`` is the
-    fix; the strike band keeps the same cap from truncating *inside* the
-    window on a wide chain.
+    Alpaca returns nearest expiry first, so asking "from today" spends the
+    early pages on 2-6 DTE contracts and, before the client paginated, never
+    reached a 21-38 DTE target — every proposal then died in the builder as
+    ``no_contracts_in_window``. Starting the window at ``dte_min`` narrows it
+    to what the intent actually needs; the client now follows
+    ``next_page_token``, so a wide chain is read in full rather than truncated.
 
     Shared with ``cli.py``'s ``plan`` and ``trace`` so the manual diagnostic
     path and the running agent cannot drift into fetching different data.

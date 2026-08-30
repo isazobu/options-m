@@ -210,11 +210,41 @@ async def test_options_block_summarises_the_chain_with_real_symbols() -> None:
     assert options["atm_call"]["symbol"] in _chain()
     assert options["atm_put"]["symbol"] in _chain()
     assert options["atm_call"]["strike"] == 450.0
-    # Put IV (0.22) sits above call IV (0.20) in the fixture.
+    # Skew is read at the ATM tenor: far put 0.27 over far call 0.25.
     assert options["put_call_skew"] == pytest.approx(0.02, abs=1e-6)
-    # Far IV (0.25) above near IV (0.20).
+    # Term structure = far ATM IV (0.26) minus near ATM IV (0.21).
     assert options["term_structure"] == pytest.approx(0.05, abs=1e-6)
     assert options["total_open_interest"] == 500 * len(_chain())
+
+
+async def test_iv_atm_is_read_at_the_trading_tenor_not_the_nearest_expiry() -> None:
+    collector, _store = _collector(_FakeMcp())
+
+    options = (await collector.collect("SPY"))["options"]
+
+    # Fixture expiries: near at 14 DTE (ATM IV ~0.21), far at 35 DTE (~0.26).
+    # The default IV tenor band is 21-38 DTE, so iv_atm must come from the far
+    # expiry even though the near one is closer to today.
+    assert options["atm_dte"] == 35
+    assert options["atm_expiry"] == _FAR.isoformat()
+    assert options["iv_dte_window"] == [21, 38]
+    assert options["iv_atm"] == pytest.approx(0.26, abs=1e-6)
+    assert options["iv_atm_near"] == pytest.approx(0.21, abs=1e-6)
+    assert options["iv_atm_far"] == pytest.approx(0.26, abs=1e-6)
+    assert options["atm_call"]["expiry"] == _FAR.isoformat()
+
+
+async def test_iv_tenor_window_argument_steers_which_expiry_is_used() -> None:
+    collector, _store = _collector(_FakeMcp())
+
+    # Narrow the band around the near expiry: now iv_atm is the 14-DTE reading.
+    options = (
+        await collector.collect("SPY", iv_dte_min=10, iv_dte_max=16)
+    )["options"]
+
+    assert options["atm_dte"] == 14
+    assert options["atm_expiry"] == _NEAR.isoformat()
+    assert options["iv_atm"] == pytest.approx(0.21, abs=1e-6)
 
 
 async def test_options_block_carries_realised_vol_and_the_iv_minus_rv_premium() -> None:

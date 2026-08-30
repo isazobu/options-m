@@ -54,12 +54,22 @@ NOTE = (
 
 DEFAULT_DTE_MIN = 7
 DEFAULT_DTE_MAX = 45
+# The tenor the ATM IV read aims at. The structures this pack feeds ask for
+# roughly this many days to expiry, so the vol that selects them is measured
+# there rather than at whatever the nearest expiry happens to be — a 10-day IV
+# over a 20-day realised vol is a tenor mismatch that biases every ratio down.
+# Mirrors Settings.dte_target_min / dte_target_max.
+DEFAULT_IV_DTE_MIN = 21
+DEFAULT_IV_DTE_MAX = 38
 # Daily bars pulled for the trend block. Enough for a real 52-week range and for
 # SMA50 to be defined from the tail.
 BARS_LOOKBACK = 252
 # Strike band around spot for the chain/contract pulls, as a fraction of spot.
 STRIKE_BAND = 0.15
-CHAIN_LIMIT = 250
+# Per-page size for the paginated chain/contract pulls (Alpaca's max). The
+# client follows next_page_token, so this only sets how many round trips it
+# takes to read the whole band, not how much of the band is read.
+CHAIN_LIMIT = 1000
 NEWS_LIMIT = 5
 NEWS_HEADLINE_CHARS = 200
 NEWS_SUMMARY_CHARS = 320
@@ -109,8 +119,13 @@ class EvidenceCollector:
         *,
         dte_min: int = DEFAULT_DTE_MIN,
         dte_max: int = DEFAULT_DTE_MAX,
+        iv_dte_min: int = DEFAULT_IV_DTE_MIN,
+        iv_dte_max: int = DEFAULT_IV_DTE_MAX,
     ) -> dict[str, Any]:
         """Build the evidence pack for ``symbol``.
+
+        ``dte_min``/``dte_max`` bound the chain scan; ``iv_dte_min``/
+        ``iv_dte_max`` are the narrower tenor the ATM IV read targets within it.
 
         Never raises for a single failed sub-fetch — that section degrades to
         ``NO_DATA_AVAILABLE`` and the rest of the pack is still returned.
@@ -126,7 +141,14 @@ class EvidenceCollector:
         if not isinstance(realised_vol, float):
             realised_vol = None
         options_block = await self._options(
-            symbol, spot_price, dte_min, dte_max, now, realised_vol
+            symbol,
+            spot_price,
+            dte_min,
+            dte_max,
+            now,
+            realised_vol,
+            iv_dte_min=iv_dte_min,
+            iv_dte_max=iv_dte_max,
         )
 
         return {
@@ -239,11 +261,19 @@ class EvidenceCollector:
         dte_max: int,
         now: datetime,
         realised_vol: float | None = None,
+        *,
+        iv_dte_min: int = DEFAULT_IV_DTE_MIN,
+        iv_dte_max: int = DEFAULT_IV_DTE_MAX,
     ) -> dict[str, Any] | str:
         """Chain summary: ATM IV, IV rank/percentile, skew, term structure,
         median spread, total open interest, the two ATM contracts, and — since
         ``realised_vol`` (20-day, from the trend block) is passed in — the
-        IV-minus-RV vol risk premium a judge reads as "options rich vs cheap"."""
+        IV-minus-RV vol risk premium a judge reads as "options rich vs cheap".
+
+        ``iv_dte_min``/``iv_dte_max`` are the tenor band the ATM IV is read at:
+        the expiry closest to that band is used, not the nearest expiry overall,
+        so ``iv_atm`` matches the tenor of the contracts the pack's consumer
+        will actually trade."""
         today = now.date()
         exp_gte = (today + timedelta(days=dte_min)).isoformat()
         exp_lte = (today + timedelta(days=dte_max)).isoformat()
@@ -274,21 +304,35 @@ class EvidenceCollector:
 
         await self._attach_open_interest(symbol, rows, exp_gte, exp_lte, strike_gte, strike_lte)
 
-        near_dte = min(row["dte"] for row in rows)
-        far_dte = max(row["dte"] for row in rows)
+        dtes = {row["dte"] for row in rows}
+        near_dte = min(dtes)
+        far_dte = max(dtes)
+        # The ATM IV expiry: the one whose DTE sits inside the trading tenor
+        # band, or failing that the closest to it. Ties break toward the middle
+        # of the band. ``near``/``far`` still anchor the scanned span and feed
+        # the term-structure slope.
+        band_mid = (iv_dte_min + iv_dte_max) / 2
+        atm_dte = min(
+            dtes,
+            key=lambda dte: (_tenor_gap(dte, iv_dte_min, iv_dte_max), abs(dte - band_mid)),
+        )
         near_rows = [row for row in rows if row["dte"] == near_dte]
         far_rows = [row for row in rows if row["dte"] == far_dte]
+        atm_rows = [row for row in rows if row["dte"] == atm_dte]
 
-        atm_call, iv_call, src_call = self._atm(near_rows, "call", spot_price)
-        atm_put, iv_put, src_put = self._atm(near_rows, "put", spot_price)
-        iv_atm_near = _mean(iv_call, iv_put)
+        atm_call, iv_call, src_call = self._atm(atm_rows, "call", spot_price)
+        atm_put, iv_put, src_put = self._atm(atm_rows, "put", spot_price)
+        iv_atm = _mean(iv_call, iv_put)
+        iv_atm_near = _mean(
+            self._atm(near_rows, "call", spot_price)[1],
+            self._atm(near_rows, "put", spot_price)[1],
+        )
         iv_atm_far = _mean(
             self._atm(far_rows, "call", spot_price)[1],
             self._atm(far_rows, "put", spot_price)[1],
         )
-        iv_atm = iv_atm_near
 
-        iv_rank, iv_pctile = await self._persist_and_rank(symbol, iv_atm, near_dte, spot_price)
+        iv_rank, iv_pctile = await self._persist_and_rank(symbol, iv_atm, atm_dte, spot_price)
 
         spreads = [row["spread_pct"] for row in rows if isinstance(row["spread_pct"], float)]
         ois = [row["open_interest"] for row in rows if isinstance(row["open_interest"], int)]
@@ -297,12 +341,15 @@ class EvidenceCollector:
 
         return {
             "dte_window": [dte_min, dte_max],
+            "iv_dte_window": [iv_dte_min, iv_dte_max],
             "contracts_scanned": len(rows),
             "expiries_scanned": sorted({row["expiry"] for row in rows}),
             "near_expiry": near_rows[0]["expiry"],
             "near_dte": near_dte,
             "far_expiry": far_rows[0]["expiry"],
             "far_dte": far_dte,
+            "atm_expiry": atm_rows[0]["expiry"],
+            "atm_dte": atm_dte,
             "iv_atm": _or_missing(_round(iv_atm, 4)),
             "iv_atm_near": _or_missing(_round(iv_atm_near, 4)),
             "iv_atm_far": _or_missing(_round(iv_atm_far, 4)),
@@ -452,19 +499,20 @@ class EvidenceCollector:
         self,
         symbol: str,
         iv_atm: float | None,
-        near_dte: int,
+        atm_dte: int,
         spot_price: float | None,
     ) -> tuple[float | None, float | None]:
         """Append today's ATM-IV reading, then rank it against the stored
         history. IV rank is meaningless on day one and fills in as the service
-        runs — which is why the write happens here, once per pull."""
+        runs — which is why the write happens here, once per pull. ``atm_dte``
+        is stored so the history is a like-for-like series at one tenor."""
         if iv_atm is None:
             return None, None
         try:
             await self._store.append_iv_snapshot(
                 symbol,
                 iv_atm=iv_atm,
-                dte=near_dte,
+                dte=atm_dte,
                 spot=spot_price,
                 payload={"iv_atm": iv_atm},
             )
@@ -572,3 +620,12 @@ class EvidenceCollector:
 def _mean(*values: float | None) -> float | None:
     present = [v for v in values if v is not None]
     return sum(present) / len(present) if present else None
+
+
+def _tenor_gap(dte: int, lo: int, hi: int) -> int:
+    """How far ``dte`` sits outside the ``[lo, hi]`` tenor band; ``0`` inside."""
+    if dte < lo:
+        return lo - dte
+    if dte > hi:
+        return dte - hi
+    return 0

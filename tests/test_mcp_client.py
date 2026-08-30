@@ -199,10 +199,20 @@ def _fake_server() -> tuple[FastMCP, dict[str, int]]:
         expiration_date_lte: str | None = None,
         status: str = "active",
         limit: int = 1000,
+        page_token: str | None = None,
         type: str | None = None,  # mirrors the real tool's own parameter name
     ) -> dict[str, Any]:
-        return _wrap(
-            {
+        calls["get_option_contracts"] = calls.get("get_option_contracts", 0) + 1
+        if underlying_symbols == "ENDLESS":
+            n = calls["get_option_contracts"]
+            body = {
+                "option_contracts": [
+                    {"symbol": f"ENDLESS{n:03d}", "strike_price": str(n), "type": "call"}
+                ],
+                "next_page_token": f"c{n}",
+            }
+        elif page_token is None:
+            body = {
                 "option_contracts": [
                     {
                         "symbol": f"{underlying_symbols}250321C00100000",
@@ -214,10 +224,24 @@ def _fake_server() -> tuple[FastMCP, dict[str, int]]:
                         "tradable": True,
                     }
                 ],
+                "next_page_token": "contracts-p2",
+            }
+        else:
+            body = {
+                "option_contracts": [
+                    {
+                        "symbol": f"{underlying_symbols}250321C00105000",
+                        "strike_price": "105",
+                        "expiration_date": "2026-09-18",
+                        "type": "call",
+                        "open_interest": "300",
+                        "status": "active",
+                        "tradable": True,
+                    }
+                ],
                 "next_page_token": None,
-            },
-            "get_option_contracts",
-        )
+            }
+        return _wrap(body, "get_option_contracts")
 
     @server.tool
     def get_option_chain(
@@ -225,10 +249,21 @@ def _fake_server() -> tuple[FastMCP, dict[str, int]]:
         limit: int = 1000,
         expiration_date_gte: str | None = None,
         expiration_date_lte: str | None = None,
+        page_token: str | None = None,
         type: str | None = None,  # mirrors the real tool's own parameter name
     ) -> dict[str, Any]:
-        return _wrap(
-            {
+        calls["get_option_chain"] = calls.get("get_option_chain", 0) + 1
+        if underlying_symbol == "ENDLESS":
+            n = calls["get_option_chain"]
+            return _wrap(
+                {
+                    "snapshots": {f"ENDLESS{n:03d}": {"impliedVolatility": 0.3}},
+                    "next_page_token": f"p{n}",
+                },
+                "get_option_chain",
+            )
+        if page_token is None:
+            body = {
                 "snapshots": {
                     f"{underlying_symbol}250321C00100000": {
                         "greeks": {"delta": 0.4},
@@ -236,10 +271,20 @@ def _fake_server() -> tuple[FastMCP, dict[str, int]]:
                         "latestQuote": {"bp": 4.0, "ap": 4.2},
                     }
                 },
+                "next_page_token": "chain-p2",
+            }
+        else:
+            body = {
+                "snapshots": {
+                    f"{underlying_symbol}250321C00105000": {
+                        "greeks": {"delta": 0.3},
+                        "impliedVolatility": 0.31,
+                        "latestQuote": {"bp": 2.0, "ap": 2.2},
+                    }
+                },
                 "next_page_token": None,
-            },
-            "get_option_chain",
-        )
+            }
+        return _wrap(body, "get_option_chain")
 
     @server.tool
     def get_open_position(symbol_or_asset_id: str) -> dict[str, Any]:
@@ -800,6 +845,65 @@ async def test_get_option_chain_returns_the_snapshots_mapping() -> None:
         await mcp.close()
 
     assert snapshots["SPY250321C00100000"]["greeks"]["delta"] == 0.4
+
+
+async def test_get_option_chain_follows_next_page_token_and_merges_pages() -> None:
+    server, calls = _fake_server()
+    mcp = await _connected(_settings(), server)
+    try:
+        snapshots = await mcp.get_option_chain("SPY")
+    finally:
+        await mcp.close()
+
+    assert set(snapshots) == {"SPY250321C00100000", "SPY250321C00105000"}
+    assert calls["get_option_chain"] == 2
+
+
+async def test_get_option_contracts_follows_next_page_token_and_merges_pages() -> None:
+    server, calls = _fake_server()
+    mcp = await _connected(_settings(), server)
+    try:
+        contracts = await mcp.get_option_contracts("SPY")
+    finally:
+        await mcp.close()
+
+    assert [c["symbol"] for c in contracts] == [
+        "SPY250321C00100000",
+        "SPY250321C00105000",
+    ]
+    assert calls["get_option_contracts"] == 2
+
+
+async def test_get_option_chain_stops_and_warns_at_the_page_ceiling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    server, calls = _fake_server()
+    mcp = await _connected(_settings(), server)
+    try:
+        with caplog.at_level("WARNING"):
+            snapshots = await mcp.get_option_chain("ENDLESS", max_pages=3)
+    finally:
+        await mcp.close()
+
+    assert calls["get_option_chain"] == 3
+    assert len(snapshots) == 3
+    assert "ceiling" in caplog.text
+
+
+async def test_get_option_contracts_stops_and_warns_at_the_page_ceiling(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    server, calls = _fake_server()
+    mcp = await _connected(_settings(), server)
+    try:
+        with caplog.at_level("WARNING"):
+            contracts = await mcp.get_option_contracts("ENDLESS", max_pages=4)
+    finally:
+        await mcp.close()
+
+    assert calls["get_option_contracts"] == 4
+    assert len(contracts) == 4
+    assert "ceiling" in caplog.text
 
 
 async def test_get_portfolio_history_returns_the_series() -> None:
