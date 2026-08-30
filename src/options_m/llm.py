@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 import httpx
 from pydantic import BaseModel, ValidationError
 
+from options_m.prompts import loader as prompt_loader
+
 if TYPE_CHECKING:
     pass
 
@@ -156,18 +158,18 @@ class FeatherlessLlm:
         the trade, never fall back to free text.
         """
         schema_json = json.dumps(schema.model_json_schema(), indent=2)
-        full_user = f"{user}\n\nOutput only valid JSON matching this schema:\n{schema_json}"
+        full_user = prompt_loader.load(
+            "llm_json_schema_suffix", user=user, schema_json=schema_json
+        ).user
 
         last_error: Exception | None = None
         raw_text: str | None = None
         for attempt in range(2):
             if attempt == 1 and raw_text is not None:
                 # Repair attempt: show the model its own bad output + the error.
-                repair_user = (
-                    f"Your previous output could not be parsed. Error: {last_error}\n"
-                    f"Raw output: {raw_text}\n\n"
-                    "Try again. Output only valid JSON matching the schema."
-                )
+                repair_user = prompt_loader.load(
+                    "llm_json_repair", last_error=last_error, raw_text=raw_text
+                ).user
                 messages = [
                     {"role": "system", "content": system},
                     {"role": "user", "content": full_user},

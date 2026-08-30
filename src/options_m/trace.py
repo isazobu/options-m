@@ -153,18 +153,19 @@ async def run(
             stopped_here=True,
         )
         return trace
-    user_prompt = prompt_loader.load(
-        "strategist", symbol=symbol, evidence_json=json.dumps(pack, default=str, indent=2)
+    prompt = prompt_loader.load(
+        "strategist",
+        symbol=symbol,
+        evidence_json=json.dumps(pack, default=str, indent=2),
+        conviction_floor=f"{settings.conviction_floor:.2f}",
     )
     try:
         regime: RegimeRead = await llm.complete_json(
             schema=RegimeRead,
-            system=(
-                "You are a quantitative options strategist. Output only valid JSON as instructed."
-            ),
-            user=user_prompt,
+            system=prompt.require_system(),
+            user=prompt.user,
             max_tokens=settings.llm_max_tokens,
-            temperature=0.2,
+            temperature=prompt.require_temperature(),
         )
     except LlmContractError as exc:
         trace.add("LLM regime read", ok=False, error=str(exc), stopped_here=True)

@@ -35,11 +35,14 @@ retired. The replacement, decided directly by the user and now canonical:
 - Inside that single `step()`, the work happens in four sequential sub-steps (not four
   agents): **filter candidates → collect evidence → one LLM call for the regime read →
   deterministic Strategy Matrix + earnings gate.** Only the third sub-step touches an LLM.
-- **News is gone entirely.** There is no `untrusted_news` field, and therefore no
-  prompt-injection fence to build — the fence existed specifically to neutralize
-  attacker-influenceable headline text, and there is no headline text left in the pipeline.
-  Drop `bull_analyst.md`, `bear_analyst.md`, `volatility_analyst.md`, `portfolio_manager.md`,
-  and `shared/evidence_contract.md`'s news-fencing paragraph from the original plan.
+- **The analyst crew is gone.** Drop `bull_analyst.md`, `bear_analyst.md`,
+  `volatility_analyst.md` and `portfolio_manager.md` from the original plan.
+  **Corrected:** this section previously read "News is gone entirely… and therefore
+  no prompt-injection fence to build." That was wrong, and the error survived into
+  the code. `evidence.py` ships an `untrusted_news` field, `.env` carries the `news`
+  toolset, and for a while the strategist prompt fenced none of it while the chat
+  path fenced the identical data. The fence now lives in
+  `src/options_m/prompts/external_text_fence.md` and is shared by both paths.
 
 ### Why the LLM's job is narrower than it first looks
 
@@ -121,10 +124,17 @@ class RegimeRead(BaseModel):
     # prompt below asks it to acknowledge rather than re-derive them.
 ```
 
-Single prompt file: `src/options_m/prompts/strategist.md`, rendered with `str.format_map`,
-loaded by a small `prompts/loader.py` with a path-escape guard (`AlpacaTradingAgent`'s
-pattern, `tradingagents/prompts/loader.py` — it makes the prompt configuration rather than
-code, so it can be iterated on during the demo without a redeploy). It must state, verbatim:
+Single prompt file: `src/options_m/prompts/strategist.md`, loaded by a small
+`prompts/loader.py` with a path-escape guard — it makes the prompt configuration rather
+than code, so it can be iterated on without a redeploy. **Two corrections:** rendering is
+`string.Template` (`$var`), not `str.format_map`, because these prompts are full of JSON
+and doubling every literal brace was a standing hazard; and the "without a redeploy" claim
+holds for a local, editable or bind-mounted checkout only — the Docker image installs into
+a root-owned venv and runs as `app`, so the shipped copies are read-only there.
+
+The prompt must state (the first two sentences below are no longer repeated here — they
+are `evidence.NOTE`, which the model already reads inside the pack, so the prompt points
+at that field instead of restating it):
 
 > Fields marked `NO_DATA_AVAILABLE` are genuinely unavailable. Do not estimate, infer, or
 > fabricate values for them. The trend and volatility-regime classifications in this evidence
@@ -133,8 +143,10 @@ code, so it can be iterated on during the demo without a redeploy). It must stat
 > matrix and the execution layer decide those. Output only the requested JSON: thesis,
 > invalidation, conviction.
 
-No news-fencing paragraph is needed — there is no `untrusted_news` field in the evidence pack
-this prompt sees.
+A news-fencing paragraph **is** needed: the pack this prompt sees carries
+`untrusted_news`. It is stated immediately ahead of the pack, from the shared
+`external_text_fence.md` fragment, so the fence and the content it governs cannot be
+separated by an edit to either path alone.
 
 ### 3. `src/options_m/matrix.py` — the deterministic Strategy Matrix + earnings gate
 
