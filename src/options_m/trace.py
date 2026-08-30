@@ -119,7 +119,11 @@ async def run(
     if not pack:
         collector = EvidenceCollector(settings, mcp, store)
         pack = await collector.collect(
-            symbol, dte_min=settings.risk_dte_min, dte_max=settings.risk_dte_max
+            symbol,
+            dte_min=settings.risk_dte_min,
+            dte_max=settings.risk_dte_max,
+            iv_dte_min=settings.dte_target_min,
+            iv_dte_max=settings.dte_target_max,
         )
         source = "collected live"
     raw_trend, raw_options = pack.get("trend"), pack.get("options")

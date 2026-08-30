@@ -772,13 +772,17 @@ class AlpacaMcp:
         expiration_lte: str | None = None,
         strike_gte: float | None = None,
         strike_lte: float | None = None,
-        limit: int = 250,
+        limit: int = 1000,
+        max_pages: int = 25,
         feed: str | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Per-contract snapshots (quote, trade, IV, greeks) for an underlying.
 
-        Returns the ``{occ_symbol: snapshot}`` mapping. The chain is large; the
-        caller is expected to pass a DTE window and a strike band.
+        Returns the ``{occ_symbol: snapshot}`` mapping. The chain is large: a
+        single wide-band expiry can exceed ``limit`` on its own, so this follows
+        the server's ``next_page_token`` until the chain is exhausted. Hitting
+        ``max_pages`` first is logged, not swallowed — a truncated chain here
+        skews which expiry the evidence pack reads its ATM IV from.
         """
         args: dict[str, Any] = {"underlying_symbol": underlying, "limit": limit}
         if option_type is not None:
@@ -793,14 +797,35 @@ class AlpacaMcp:
             args["strike_price_lte"] = strike_lte
         if feed is not None:
             args["feed"] = feed
-        payload = self._expect_mapping(
-            "get_option_chain", await self.call("get_option_chain", args)
-        )
-        snapshots = payload.get("snapshots", payload)
-        if not isinstance(snapshots, dict):
-            msg = "get_option_chain returned no snapshots object"
-            raise McpProtocolError(msg)
-        return {key: value for key, value in snapshots.items() if isinstance(value, dict)}
+
+        snapshots: dict[str, dict[str, Any]] = {}
+        page_token: str | None = None
+        for _page in range(max_pages):
+            if page_token:
+                args["page_token"] = page_token
+            payload = self._expect_mapping(
+                "get_option_chain", await self.call("get_option_chain", args)
+            )
+            chunk = payload.get("snapshots", payload)
+            if not isinstance(chunk, dict):
+                msg = "get_option_chain returned no snapshots object"
+                raise McpProtocolError(msg)
+            snapshots.update(
+                {key: value for key, value in chunk.items() if isinstance(value, dict)}
+            )
+            # When the server hands back the bare OCC mapping (no envelope), it
+            # carries no token and there is nothing more to page.
+            page_token = payload.get("next_page_token") if payload is not chunk else None
+            if not page_token:
+                break
+        else:
+            logger.warning(
+                "get_option_chain stopped at the %d-page ceiling for %s; "
+                "the chain may be truncated",
+                max_pages,
+                underlying,
+            )
+        return snapshots
 
     async def get_option_contracts(
         self,
@@ -811,10 +836,15 @@ class AlpacaMcp:
         expiration_lte: str | None = None,
         strike_gte: float | None = None,
         strike_lte: float | None = None,
-        limit: int = 250,
+        limit: int = 1000,
+        max_pages: int = 25,
     ) -> list[dict[str, Any]]:
         """Reference data for an underlying's contracts — carries open interest,
-        which the market-data chain does not."""
+        which the market-data chain does not.
+
+        Follows ``next_page_token`` to the end of the list so open interest is
+        still attached for strikes that fall past the first page.
+        """
         args: dict[str, Any] = {
             "underlying_symbols": underlying,
             "limit": limit,
@@ -830,15 +860,32 @@ class AlpacaMcp:
             args["strike_price_gte"] = strike_gte
         if strike_lte is not None:
             args["strike_price_lte"] = strike_lte
-        payload = await self.call("get_option_contracts", args)
-        if isinstance(payload, dict):
-            contracts = payload.get("option_contracts", payload.get("data"))
+
+        contracts: list[dict[str, Any]] = []
+        page_token: str | None = None
+        for _page in range(max_pages):
+            if page_token:
+                args["page_token"] = page_token
+            payload = await self.call("get_option_contracts", args)
+            if isinstance(payload, dict):
+                chunk = payload.get("option_contracts", payload.get("data"))
+                page_token = payload.get("next_page_token")
+            else:
+                chunk = payload
+                page_token = None
+            if not isinstance(chunk, list):
+                msg = "get_option_contracts returned no contract list"
+                raise McpProtocolError(msg)
+            contracts.extend(item for item in chunk if isinstance(item, dict))
+            if not page_token:
+                break
         else:
-            contracts = payload
-        if not isinstance(contracts, list):
-            msg = "get_option_contracts returned no contract list"
-            raise McpProtocolError(msg)
-        return [item for item in contracts if isinstance(item, dict)]
+            logger.warning(
+                "get_option_contracts stopped at the %d-page ceiling for %s",
+                max_pages,
+                underlying,
+            )
+        return contracts
 
     @staticmethod
     def _expect_mapping(tool: str, payload: Any) -> dict[str, Any]:

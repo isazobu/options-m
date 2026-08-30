@@ -151,6 +151,8 @@ class MarketPulseAgent:
                     symbol,
                     dte_min=self._settings.risk_dte_min,
                     dte_max=self._settings.risk_dte_max,
+                    iv_dte_min=self._settings.dte_target_min,
+                    iv_dte_max=self._settings.dte_target_max,
                 )
                 # Augment with fields StrategistAgent needs so it can classify
                 # trend + IV regime without reading the raw indicators itself.
