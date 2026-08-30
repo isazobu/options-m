@@ -1,9 +1,23 @@
 """StrategistAgent — one LLM call per iteration, zero MCP calls.
 
-Each step: market-open check → kill-switch/budget → candidate selection
-(top score, not open/in-flight/earnings-blackout) → evidence cache read
-→ one LLM call (the ONLY outbound I/O) → deterministic matrix decision
-→ persist a pending or no_action proposal.
+Design:
+
+  step():
+    1. Market-open check (local market_calendar cache — no MCP call).
+    2. Kill switch + LLM-budget check.
+    3. Candidate selection: top candidate by score that is not:
+         - already open (local positions cache)
+         - already held by an active proposal (pending / dry-run approved /
+           submitted) or a working order for the same underlying
+         - within its per-symbol proposal cooldown, or at a per-day cap
+         - inside its earnings blackout window (cheap in-process check)
+    4. Evidence read: get the pre-computed pack from the local evidence cache
+       (written by MarketPulseAgent every 60s). Skip if missing or stale.
+    5. LLM call: one ``complete_json(schema=RegimeRead)`` call — the ONLY
+       outbound I/O in the whole step.
+    6. Matrix decision: deterministic, no LLM.
+    7. Persist: a ``pending`` proposal (actionable) or a ``no_action`` proposal
+       (matrix returned "hold").
 
 ``LlmContractError`` is caught here and recorded as ``llm_failed`` — it does
 not propagate to the supervisor and does not stop ExecutionAgent or
@@ -108,9 +122,11 @@ class StrategistAgent:
             detail["skipped"] = "llm_budget_exhausted"
             return detail
 
-        candidate = await self._pick_candidate(now)
+        # 3. Candidate selection.
+        candidate = await self._pick_candidate(now, detail)
         if candidate is None:
-            detail["skipped"] = "no_candidate"
+            if detail.get("skipped") is None:
+                detail["skipped"] = "no_candidate"
             return detail
         symbol = str(candidate.get("symbol", "")).upper()
         detail["symbol"] = symbol
@@ -288,8 +304,14 @@ class StrategistAgent:
 
         return {"close_proposals": close_count} if close_count else {}
 
-    async def _pick_candidate(self, now: datetime) -> dict[str, Any] | None:
-        """Return the top candidate that passes all pre-filters, or None."""
+    async def _pick_candidate(
+        self, now: datetime, detail: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return the top candidate that passes all pre-filters, or None.
+
+        Sets ``detail["skipped"] = "proposal_cap"`` when the global per-day
+        proposal ceiling is the reason nothing is picked.
+        """
         today = now.date()
         max_age = self._settings.market_pulse_interval_seconds * _EVIDENCE_STALENESS_FACTOR
         candidates = await self._store.top_candidates(
@@ -301,8 +323,34 @@ class StrategistAgent:
 
         # Build sets of symbols to exclude.
         open_positions = {row["symbol"] for row in await self._store.get_cached_positions()}
-        pending = await self._store.recent_proposals(limit=20, status="pending")
-        in_flight_symbols = {str(p.get("underlying", "")).upper() for p in pending}
+        active_symbols = await self._store.active_proposal_underlyings()
+
+        # A symbol is re-proposed at most once per cooldown window and no more
+        # than a hard cap per rolling day. Without this the top-scored name
+        # gets a fresh LLM call and a near-duplicate proposal every tick for
+        # the whole session — under DRY_RUN it never becomes an open position,
+        # so nothing else stops it.
+        recent = await self._store.proposals_since(now - timedelta(days=1))
+        if len(recent) >= self._settings.max_proposals_per_day:
+            detail["skipped"] = "proposal_cap"
+            return None
+
+        cooldown_cutoff = now - timedelta(seconds=self._settings.proposal_cooldown_seconds)
+        per_symbol_today: dict[str, int] = {}
+        cooling_down: set[str] = set()
+        for row in recent:
+            sym = str(row.get("underlying", "")).upper()
+            per_symbol_today[sym] = per_symbol_today.get(sym, 0) + 1
+            ts = row.get("ts")
+            if isinstance(ts, datetime):
+                ts_aware = ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
+                if ts_aware >= cooldown_cutoff:
+                    cooling_down.add(sym)
+        capped_today = {
+            sym
+            for sym, count in per_symbol_today.items()
+            if count >= self._settings.max_proposals_per_symbol_per_day
+        }
 
         for candidate in candidates:
             symbol = str(candidate.get("symbol", "")).upper()
@@ -313,7 +361,9 @@ class StrategistAgent:
                 continue
             if symbol in open_positions:
                 continue
-            if symbol in in_flight_symbols:
+            if symbol in active_symbols:
+                continue
+            if symbol in cooling_down or symbol in capped_today:
                 continue
             return candidate
         return None
