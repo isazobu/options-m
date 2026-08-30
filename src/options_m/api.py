@@ -291,6 +291,14 @@ async def api_proposal_detail(request: Request, proposal_id: int) -> Response:
     return JSONResponse(jsonable({"proposal": proposal, "orders": orders}))
 
 
+@admin_router.get("/orders", include_in_schema=False)
+async def api_orders(request: Request, limit: int = 50) -> Response:
+    """Recent order attempts across every proposal, newest first."""
+    store = _store(request)
+    rows = await store.recent_orders(limit=min(limit, 500)) if store else []
+    return JSONResponse(jsonable({"orders": rows}))
+
+
 @admin_router.get("/risk-events", include_in_schema=False)
 async def api_risk_events(request: Request, limit: int = 50) -> Response:
     store = _store(request)
