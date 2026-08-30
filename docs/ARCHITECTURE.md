@@ -222,10 +222,11 @@ ExecutionAgent._run()
         ├── RiskEngine.evaluate(plan, portfolio)       ← pure code
         │     max_premium_pct_per_trade
         │     max_total_premium_pct
-        │     max_concurrent_positions
-        │     max_positions_per_underlying
+        │     max_concurrent_positions        ← counts structures, not legs
+        │     max_positions_per_underlying    ← counts structures, not legs
         │     DTE window (7–45)
-        │     min_open_interest, max_spread_pct
+        │     min_open_interest
+        │     max_spread_pct AND max_spread_abs (both must be exceeded)
         │     earnings_blackout
         │     daily_loss_halt (3% of equity)
         │     drawdown_halt (8% from high-water mark)
@@ -243,6 +244,93 @@ ExecutionAgent._run()
       _reconcile():
         orders_in_flight() → get_order_by_client_id() → update status
 ```
+
+---
+
+## Structure Construction: `strategy_builder`
+
+All nine structures the matrix can emit have a builder. Two shapes exist, and
+which one a structure takes is decided by whether it fits "one primary contract
+with an optional same-type partner":
+
+- **Single/vertical funnel** — `long_call`, `long_put`, the two debit
+  verticals, `covered_call`, `cash_secured_put`. Anchor selected by delta,
+  optional second leg snapped to `anchor ± width`.
+- **Dedicated builders** — `long_strangle` (two long legs, different types) and
+  the four credit structures (short anchor + protective wing, and the irons are
+  two verticals of *different* types). These bypass `_price`/`_risk_profile`
+  entirely and compute their own pricing and risk profile.
+
+A name absent from `_SUPPORTED_STRATEGIES` is refused by name. This matters:
+an unrecognised strategy is not in `_CALL_STRATEGIES` so `option_type` defaults
+to put, is not in `_VERTICAL_STRATEGIES` so it grows no second leg, and falls
+through `_risk_profile`'s unguarded tail into the cash-secured-put arm — a
+four-leg condor would have been submitted as a lone put.
+
+### Sign convention
+
+Alpaca's multi-leg `limit_price` is **positive = debit, negative = credit**.
+The net is carried **positive throughout the module** and negated exactly once,
+where the `OrderPlan` is constructed. `ExecutionAgent._build_order_request`
+stringifies `plan.limit_price` unchanged, so nothing downstream corrects a bad
+sign — getting it backwards submits a credit spread as if paying for it.
+
+### Credit band
+
+Credit structures must land inside a band, both edges enforced in the builder
+and written to `risk_events` on rejection:
+
+| Edge | Setting | Default | Rejection | Why |
+|---|---|---|---|---|
+| Floor | `min_credit_width_pct` | 0.12 | `thin_credit` | Premium does not pay for the risk. 12% not 15%: at 15% the calibrated 0.20-delta setup is unreachable |
+| Ceiling | `max_credit_width_pct` | 0.70 | `credit_too_rich` | Credit/width is roughly the chance of being breached, so collecting most of the width leaves almost no profit zone — and the tiny resulting `max_loss` is exactly what makes sizing scale the trade up |
+
+Debit verticals have the mirror pair: `max_debit_width_pct` (0.45) and
+`min_reward_risk` (1.0).
+
+### Wing width scales with the expected move
+
+`spread_width` is **not** a flat dollar amount. `matrix.py` leaves it unset and
+the builder sizes it from the expected move over the option's life,
+`spot × IV × √(DTE/365)`, using the IV of the actual selected expiry. An
+explicit width — the CLI's `--spread-width` — is honoured exactly as given.
+
+A flat width is only ever right for one underlying at one vol level: `$5` wings
+are a fifth of the expected move on SPY at 769 and several times it on a `$30`
+name. Measured, a 5-wide at-the-money iron butterfly on SPY collected **95.7%**
+of its width, leaving a `$21.75` max loss and a profit zone of spot ±`$0.22` —
+an almost certain max-loss trade that sizing then scaled to 91 contracts
+*because* the loss per contract looked tiny.
+
+**Two multipliers, because one cannot serve both families.** An at-the-money
+short collects far more premium than a 0.25-delta one, so the same wing
+distance leaves it a far smaller profit zone. Measured on real SPY and NVDA
+chains at 21–38 DTE:
+
+| Multiplier | Credit verticals | Iron condor | Iron butterfly |
+|---|---|---|---|
+| 0.40–0.50 | 15–19% ✅ | 33% ✅ | `credit_too_rich` |
+| 1.00 | `thin_credit` | 23% ✅ | 60–65% ✅ |
+| 1.25 | `thin_credit` | borderline | 53–57% ✅ |
+
+Hence `spread_width_expected_move_mult=0.45` for delta-selected shorts and
+`spread_width_expected_move_mult_atm=1.25` for at-the-money shorts
+(`_ATM_SHORT_STRATEGIES`). Set either to 0 to disable scaling for that family
+and fall back to `spread_width_default`.
+
+Every dollar figure is computed from the **realised** strike distance, never
+the requested width: the wing snaps to a listed strike and the two can differ
+by up to one increment.
+
+### Known limitation
+
+The four credit structures are the whole "premium expensive" column of the
+matrix (IV/RV ≥ 1.10). That column does not currently fire in the live service:
+`iv_atm` is measured at the nearest expiry in the 7–45 DTE scan (~10 DTE) while
+trades are placed at 21–38 DTE, and against a 20-day realised vol the ratio
+came out 0.45–0.94 across all ten universe symbols. Until the IV tenor is
+measured at the trading tenor these structures are reachable only through
+`options-m plan` and the tests, never through `StrategistAgent`.
 
 ---
 
@@ -308,7 +396,8 @@ Exhausted → StrategistAgent skips (PositionManagerAgent is never halted).
 | Earnings gate | `matrix.decide()` | Fires before matrix lookup; a blacked-out symbol never reaches the LLM |
 | `LlmContractError` | `StrategistAgent` | Two failures → `llm_failed`, no trade, no exception to supervisor |
 | `client_order_id = "om-{proposal_id}"` | `ExecutionAgent` | One proposal can never place two orders (broker-level idempotency) |
-| Defined-risk only | `strategy_builder` + `RiskEngine` | Naked short legs rejected at two independent layers |
+| Defined-risk only | `strategy_builder` + `RiskEngine` | Naked short legs rejected at two independent layers. `RiskEngine` matches wings **per option type** — an iron condor's put wing does nothing for its short call, so counting legs in aggregate would pass a half-covered structure |
+| Credit band | `strategy_builder` | `thin_credit` / `credit_too_rich`: a structure that does not pay for its risk, or one with no profit zone left, never becomes a plan |
 | FORBIDDEN_TOOLS | `AlpacaMcp` | `cancel_all_orders`, `close_all_positions`, `exercise_options_position` permanently disabled |
 
 ---
