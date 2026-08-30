@@ -7,7 +7,7 @@ and that the fallback keeps the same contract as the persistent path.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from options_m.config import Settings
 from options_m.db import Database
@@ -185,6 +185,93 @@ async def test_recent_proposals_reflect_arguments_and_verdict_once_set() -> None
 
     assert row["has_arguments"] is True
     assert row["has_verdict"] is True
+
+
+async def test_active_proposal_underlyings_counts_every_slot_holding_status() -> None:
+    """pending / dry_run_approved / submitted each hold a position slot; a
+    rejected or no_action proposal does not."""
+    store = _store()
+    pending_id = await store.save_proposal(underlying="SPY", intent={}, evidence={})
+    approved_id = await store.save_proposal(underlying="QQQ", intent={}, evidence={})
+    await store.update_proposal_status(approved_id, "dry_run_approved")
+    submitted_id = await store.save_proposal(underlying="AAPL", intent={}, evidence={})
+    await store.update_proposal_status(submitted_id, "submitted")
+    rejected_id = await store.save_proposal(underlying="TSLA", intent={}, evidence={})
+    await store.update_proposal_status(rejected_id, "rejected")
+    held_id = await store.save_proposal(underlying="META", intent={}, evidence={})
+    await store.update_proposal_status(held_id, "no_action")
+
+    assert await store.active_proposal_underlyings() == {"SPY", "QQQ", "AAPL"}
+    # The proposal being executed must not block itself.
+    assert await store.active_proposal_underlyings(exclude_proposal_id=pending_id) == {
+        "QQQ",
+        "AAPL",
+    }
+
+
+async def test_working_order_underlyings_parses_single_and_multi_leg_requests() -> None:
+    store = _store()
+    await store.record_order(
+        proposal_id=1,
+        client_order_id="om-1",
+        status="submitted",
+        request={"symbol": "AAPL250620C00190000", "qty": "1"},
+    )
+    await store.record_order(
+        proposal_id=2,
+        client_order_id="om-2",
+        status="submitted",
+        request={
+            "legs": [
+                {"symbol": "SPY250620P00500000"},
+                {"symbol": "SPY250620P00490000"},
+            ]
+        },
+    )
+    # A filled order no longer rests at the broker.
+    await store.record_order(
+        proposal_id=3,
+        client_order_id="om-3",
+        status="filled",
+        request={"symbol": "TSLA250620C00250000"},
+    )
+
+    assert await store.working_order_underlyings() == {"AAPL", "SPY"}
+
+
+async def test_orders_in_flight_is_a_denylist_not_a_submitted_match() -> None:
+    """The first reconcile tick overwrites the local 'submitted' with the
+    broker status; matching only 'submitted' would drop an 'accepted' order
+    from reconcile forever."""
+    store = _store()
+    for cid, status in (
+        ("om-sub", "submitted"),
+        ("om-acc", "accepted"),
+        ("om-part", "partially_filled"),
+        ("om-fill", "filled"),
+        ("om-rej", "rejected"),
+        ("om-can", "canceled"),
+        ("om-fail", "failed"),
+    ):
+        await store.record_order(
+            proposal_id=1, client_order_id=cid, status=status, request={}
+        )
+
+    in_flight = {row["client_order_id"] for row in await store.orders_in_flight()}
+
+    assert in_flight == {"om-sub", "om-acc", "om-part"}
+
+
+async def test_proposals_since_returns_status_and_respects_the_window() -> None:
+    store = _store()
+    old_id = await store.save_proposal(underlying="SPY", intent={}, evidence={})
+    store._memory_proposals[old_id]["ts"] = datetime.now(UTC) - timedelta(days=2)
+    recent_id = await store.save_proposal(underlying="QQQ", intent={}, evidence={})
+    await store.update_proposal_status(recent_id, "rejected")
+
+    rows = await store.proposals_since(datetime.now(UTC) - timedelta(days=1))
+
+    assert [(row["underlying"], row["status"]) for row in rows] == [("QQQ", "rejected")]
 
 
 async def test_orders_for_proposal_returns_only_that_proposals_orders() -> None:
