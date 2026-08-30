@@ -73,7 +73,7 @@ async def run(settings: Settings) -> None:
         else None
     )
     notifier.notify(
-        f"🟢 *options\\-m başladı* — v`{__version__}` "
+        f"🟢 *options\\-m started* — v`{__version__}` "
         f"\\(dry\\_run\\={str(settings.dry_run).lower()}\\)"
     )
 
@@ -93,7 +93,7 @@ async def run(settings: Settings) -> None:
         # Detach the bridge first: shutdown-path errors must not queue messages
         # onto a notifier that is already draining for the last time.
         remove_error_notifier(error_handler)
-        notifier.notify("🔴 *options\\-m durdu*")
+        notifier.notify("🔴 *options\\-m stopped*")
         if isinstance(notifier, TelegramNotifier):
             await notifier.aclose()
 

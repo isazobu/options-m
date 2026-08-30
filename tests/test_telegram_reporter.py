@@ -54,7 +54,7 @@ async def test_a_summary_is_sent_while_the_market_is_open() -> None:
     await agent.step()
     assert len(collector.messages) == 1
     assert "SPY" in collector.messages[0]
-    assert "Pozisyon özeti" in collector.messages[0]
+    assert "Portfolio snapshot" in collector.messages[0]
 
 
 async def test_the_summary_is_tagged_when_dry_run() -> None:
@@ -68,7 +68,7 @@ async def test_the_close_fires_one_final_summary_then_goes_quiet() -> None:
     await agent.step()
     store._is_open = False
     await agent.step()
-    assert "Seans kapanış özeti" in collector.messages[1]
+    assert "Session close snapshot" in collector.messages[1]
 
     # ...and every subsequent closed tick stays silent.
     await agent.step()

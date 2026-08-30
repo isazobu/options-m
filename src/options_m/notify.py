@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 # Telegram rejects a sendMessage body over 4096 characters outright.
 MESSAGE_LIMIT: Final[int] = 4096
-_TRUNCATION_SUFFIX: Final[str] = "\n…(kısaltıldı)"
+_TRUNCATION_SUFFIX: Final[str] = "\n…(truncated)"
 
 # Every character MarkdownV2 treats as markup. Telegram rejects the whole
 # message if any of these appears unescaped, including inside a plain word.
@@ -118,14 +118,14 @@ def format_decision(
     reason: str | None = None,
 ) -> str:
     """One StrategistAgent outcome: a proposal, a hold, a close, or an LLM failure."""
-    icon, title = _DECISION_HEADERS.get(status, ("🤖", f"Karar: {status}"))
+    icon, title = _DECISION_HEADERS.get(status, ("🤖", f"Decision: {status}"))
     lines = [_header(icon, f"{title} — {symbol}", dry_run=dry_run), ""]
     if strategy:
-        lines.append(_kv("Strateji", strategy))
+        lines.append(_kv("Strategy", strategy))
     if conviction is not None:
         lines.append(_kv("Conviction", f"{conviction:.2f}"))
     if reason:
-        lines.append(_kv("Sebep", reason))
+        lines.append(_kv("Reason", reason))
     if proposal_id is not None:
         lines.append(_kv("Proposal", f"#{proposal_id}"))
     if thesis:
@@ -136,10 +136,10 @@ def format_decision(
 
 
 _DECISION_HEADERS: Final[dict[str, tuple[str, str]]] = {
-    "pending": ("💡", "Yeni pozisyon önerisi"),
+    "pending": ("💡", "New position proposal"),
     "no_action": ("⏸", "Hold"),
-    "close": ("🚪", "Kapatma kararı"),
-    "llm_failed": ("⚠️", "LLM kararı üretemedi"),
+    "close": ("🚪", "Exit decision"),
+    "llm_failed": ("⚠️", "LLM produced no decision"),
 }
 
 
@@ -157,14 +157,14 @@ def format_order(
 ) -> str:
     """One terminal order event: submitted, filled, failed, rejected, ambiguous."""
     icon = _ORDER_ICONS.get(status, "📄")
-    verb = "Kapanış emri" if action == "close" else "Açılış emri"
+    verb = "Exit order" if action == "close" else "Entry order"
     lines = [
         _header(icon, f"{verb} — {underlying}", dry_run=dry_run),
         "",
-        _kv("Durum", status),
+        _kv("Status", status),
     ]
     if qty is not None:
-        lines.append(_kv("Adet", qty))
+        lines.append(_kv("Qty", qty))
     if limit_price is not None:
         lines.append(_kv("Limit", limit_price))
     if client_order_id:
@@ -194,17 +194,17 @@ def format_summary(
     positions: list[dict[str, Any]],
     account: dict[str, Any] | None,
     dry_run: bool,
-    title: str = "Pozisyon özeti",
+    title: str = "Portfolio snapshot",
 ) -> str:
     """The periodic portfolio snapshot, read entirely from the local caches."""
     lines = [_header("📊", title, dry_run=dry_run), ""]
     if account:
         lines.append(_kv("Equity", _money(account.get("equity"))))
-        lines.append(_kv("Nakit", _money(account.get("cash"))))
-    lines.append(_kv("Açık pozisyon", len(positions)))
+        lines.append(_kv("Cash", _money(account.get("cash"))))
+    lines.append(_kv("Open positions", len(positions)))
 
     if not positions:
-        lines += ["", escape("Açık pozisyon yok.")]
+        lines += ["", escape("No open positions.")]
         return "\n".join(lines)
 
     total_pl = 0.0
@@ -219,7 +219,7 @@ def format_summary(
             f"\\| {escape(_money(payload.get('unrealized_pl')))} "
             f"\\({escape(_pct(payload.get('pnl_pct')))}\\)"
         )
-    lines += ["", _kv("Toplam gerçekleşmemiş P&L", _money(total_pl))]
+    lines += ["", _kv("Total unrealized P&L", _money(total_pl))]
     return "\n".join(lines)
 
 
@@ -230,7 +230,7 @@ def format_error(record: logging.LogRecord, *, dry_run: bool) -> str:
     traceback belongs in the log stream, not in a chat window.
     """
     lines = [
-        _header("🔴", "Hata", dry_run=dry_run),
+        _header("🔴", "Error", dry_run=dry_run),
         "",
         _kv("Logger", record.name),
         "",
