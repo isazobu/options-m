@@ -38,6 +38,7 @@ from options_m.config import Settings
 from options_m.earnings import is_earnings_blackout
 from options_m.llm import FeatherlessLlm, LlmContractError
 from options_m.models import RegimeRead, StrategyIntent
+from options_m.notify import Notifier, NullNotifier, format_decision
 from options_m.prompts import loader as prompt_loader
 from options_m.store import Store
 
@@ -57,10 +58,12 @@ class StrategistAgent:
         settings: Settings,
         store: Store,
         llm: FeatherlessLlm,
+        notifier: Notifier | None = None,
     ) -> None:
         self._settings = settings
         self._store = store
         self._llm = llm
+        self._notifier = notifier or NullNotifier()
 
     @property
     def name(self) -> str:
@@ -184,6 +187,10 @@ class StrategistAgent:
             )
             detail["proposal_id"] = proposal_id
             detail["status"] = "llm_failed"
+            self._announce(
+                symbol=symbol, status="llm_failed", proposal_id=proposal_id,
+                reason="model did not return a valid RegimeRead",
+            )
             raise
         finally:
             await self._store.record_llm_call(
@@ -217,6 +224,13 @@ class StrategistAgent:
                 "strategist: hold",
                 extra={"symbol": symbol, "conviction": regime.conviction},
             )
+            self._announce(
+                symbol=symbol,
+                status="no_action",
+                conviction=regime.conviction,
+                thesis=regime.thesis,
+                proposal_id=proposal_id,
+            )
         elif isinstance(decision, StrategyIntent):
             matrix_payload["result"] = decision.strategy
             proposal_id = await self._store.save_proposal(
@@ -238,8 +252,23 @@ class StrategistAgent:
                     "conviction": regime.conviction,
                 },
             )
+            self._announce(
+                symbol=symbol,
+                status="pending",
+                strategy=decision.strategy,
+                conviction=regime.conviction,
+                thesis=regime.thesis,
+                invalidation=regime.invalidation,
+                proposal_id=proposal_id,
+            )
 
         return detail
+
+    def _announce(self, **fields: Any) -> None:
+        """Push one decision to Telegram. Never raises, never blocks."""
+        if not self._settings.telegram_notify_decisions:
+            return
+        self._notifier.notify(format_decision(dry_run=self._settings.dry_run, **fields))
 
     async def _evaluate_close_proposals(self) -> dict[str, Any]:
         """Check every open position for exit conditions; write a close proposal
@@ -300,6 +329,10 @@ class StrategistAgent:
             logger.info(
                 "strategist: close proposal",
                 extra={"underlying": underlying, "reason": reason},
+            )
+            self._announce(
+                symbol=underlying, status="close", strategy=strategy,
+                reason=reason, thesis=thesis,
             )
 
         return {"close_proposals": close_count} if close_count else {}

@@ -235,6 +235,25 @@ class Settings(BaseSettings):
     exit_stop_loss_pct: float = Field(default=0.50, gt=0.0, le=1.0)
     exit_time_stop_days: int = Field(default=30, ge=1)
 
+    # Telegram notifications (outbound only — no bot listener, no commands).
+    # Unset token or chat id means "run without notifications", the same
+    # convention as an unset DATABASE_URL or ALPACA_API_KEY above.
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+    telegram_notify_decisions: bool = True
+    telegram_notify_orders: bool = True
+    telegram_notify_errors: bool = True
+    # Cadence of the portfolio snapshot agent. Gated on market hours, so this
+    # is a within-session cadence, not a wall-clock one.
+    telegram_summary_interval_seconds: float = Field(default=1800.0, gt=0)
+    # An error storm repeats one message thousands of times. Suppress an
+    # identical message inside this window — Telegram 429s well before that.
+    telegram_dedupe_seconds: float = Field(default=300.0, ge=0)
+    # A bounded queue is what keeps a slow Telegram from ever reaching the
+    # trading loop: past this depth the oldest message is dropped, not awaited.
+    telegram_queue_max: int = Field(default=100, ge=1)
+    telegram_timeout_seconds: float = Field(default=10.0, gt=0)
+
     @property
     def cors_origins(self) -> tuple[str, ...]:
         """The configured CORS origins, de-duplicated and order-preserving."""

@@ -17,9 +17,21 @@ from options_m.db import Database
 from options_m.store import Store
 
 
-def _agent(store: Store, **overrides: Any) -> StrategistAgent:
+class _Collector:
+    """A notifier that records what the agent would have sent to Telegram."""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def notify(self, text: str) -> None:
+        self.messages.append(text)
+
+
+def _agent(
+    store: Store, notifier: _Collector | None = None, **overrides: Any
+) -> StrategistAgent:
     settings = Settings(database_url=None, **overrides)
-    return StrategistAgent(settings, store, llm=None)  # type: ignore[arg-type]
+    return StrategistAgent(settings, store, llm=None, notifier=notifier)  # type: ignore[arg-type]
 
 
 def _store() -> Store:
@@ -109,3 +121,44 @@ async def test_an_active_proposal_blocks_its_underlying_regardless_of_age() -> N
 
     assert candidate is not None
     assert candidate["symbol"] == "QQQ"
+
+
+# ---------------------------------------------------------------------------
+# Telegram notifications
+# ---------------------------------------------------------------------------
+
+
+async def _seed_position(store: Store, symbol: str, payload: dict[str, Any]) -> None:
+    await store.upsert_position(symbol, payload)
+
+
+async def test_a_close_decision_is_announced() -> None:
+    store = _store()
+    collector = _Collector()
+    # -60% against a 50% stop is unambiguously an exit.
+    await _seed_position(store, "SPY", {"market_value": 400.0, "unrealized_pl": -600.0,
+                                        "pnl_pct": -0.60, "strategy": "long_call"})
+    agent = _agent(store, collector)
+    detail = await agent._evaluate_close_proposals()
+
+    assert detail.get("close_proposals") == 1
+    assert len(collector.messages) == 1
+    assert "SPY" in collector.messages[0]
+
+
+async def test_close_decisions_are_silent_when_decisions_are_off() -> None:
+    store = _store()
+    collector = _Collector()
+    await _seed_position(store, "SPY", {"market_value": 400.0, "unrealized_pl": -600.0,
+                                        "pnl_pct": -0.60, "strategy": "long_call"})
+    agent = _agent(store, collector, telegram_notify_decisions=False)
+    await agent._evaluate_close_proposals()
+    assert collector.messages == []
+
+
+async def test_the_strategist_works_without_a_notifier() -> None:
+    store = _store()
+    await _seed_position(store, "SPY", {"market_value": 400.0, "unrealized_pl": -600.0,
+                                        "pnl_pct": -0.60, "strategy": "long_call"})
+    detail = await _agent(store)._evaluate_close_proposals()
+    assert detail.get("close_proposals") == 1

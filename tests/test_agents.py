@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 
-from options_m.agents import agent_interval, run_agent, run_agents
+from options_m.agents import agent_interval, build_agents, run_agent, run_agents
 from options_m.config import Settings
+from options_m.db import Database
+from options_m.mcp_client import AlpacaMcp
+from options_m.notify import NullNotifier
+from options_m.store import Store
 
 
 class _CountingAgent:
@@ -110,3 +114,43 @@ async def test_a_slow_agent_does_not_starve_a_fast_sibling() -> None:
     await asyncio.wait_for(task, timeout=2)
 
     assert fast.calls > slow.calls
+
+
+# ---------------------------------------------------------------------------
+# build_agents registration
+# ---------------------------------------------------------------------------
+
+
+def _built(**overrides: object) -> list[str]:
+    settings = Settings(database_url=None, **overrides)  # type: ignore[arg-type]
+    store = Store(Database(settings))
+    agents = build_agents(settings, AlpacaMcp(settings), store)
+    return [agent.name for agent in agents]
+
+
+def test_the_reporter_is_not_registered_without_telegram() -> None:
+    """A null notifier means the reporter would only ever discard its work."""
+    assert "telegram_reporter" not in _built()
+
+
+def test_the_reporter_is_registered_when_telegram_is_configured() -> None:
+    settings = Settings(
+        database_url=None, telegram_bot_token="1:A", telegram_chat_id="-1"  # noqa: S106
+    )
+    store = Store(Database(settings))
+    from options_m.notify import build_notifier
+
+    names = [
+        agent.name
+        for agent in build_agents(
+            settings, AlpacaMcp(settings), store, notifier=build_notifier(settings)
+        )
+    ]
+    assert "telegram_reporter" in names
+
+
+def test_an_explicit_null_notifier_still_skips_the_reporter() -> None:
+    settings = Settings(database_url=None)
+    store = Store(Database(settings))
+    agents = build_agents(settings, AlpacaMcp(settings), store, notifier=NullNotifier())
+    assert "telegram_reporter" not in [agent.name for agent in agents]

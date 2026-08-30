@@ -19,6 +19,7 @@ from options_m.agents.execution import (
 )
 from options_m.config import Settings
 from options_m.db import Database
+from options_m.models import Rejection
 from options_m.store import Store
 
 
@@ -107,12 +108,26 @@ def test_no_positions_is_no_structures() -> None:
 # Reconcile: broker rejection feedback
 # ---------------------------------------------------------------------------
 
-def _make_agent() -> tuple[ExecutionAgent, MagicMock, Store]:
-    settings = Settings(database_url=None)  # type: ignore[call-arg]
+class _Collector:
+    """A notifier that records what the agent would have sent to Telegram."""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def notify(self, text: str) -> None:
+        self.messages.append(text)
+
+
+def _make_agent(
+    notifier: _Collector | None = None, **overrides: Any
+) -> tuple[ExecutionAgent, MagicMock, Store]:
+    settings = Settings(database_url=None, **overrides)  # type: ignore[call-arg]
     store = Store(Database(settings))
     mcp = MagicMock()
     risk = MagicMock()
-    agent = ExecutionAgent(settings=settings, mcp=mcp, store=store, risk_engine=risk)
+    agent = ExecutionAgent(
+        settings=settings, mcp=mcp, store=store, risk_engine=risk, notifier=notifier
+    )
     return agent, mcp, store
 
 
@@ -249,3 +264,56 @@ async def test_snapshot_does_not_double_count_a_proposal_that_already_filled() -
 
     assert snapshot.positions_in_underlying == 1
     assert snapshot.concurrent_option_positions == 1
+
+
+# ---------------------------------------------------------------------------
+# Telegram notifications
+# ---------------------------------------------------------------------------
+
+
+async def test_a_broker_rejection_is_announced() -> None:
+    collector = _Collector()
+    agent, _, store = _make_agent(collector)
+    proposal_id = await store.save_proposal(
+        underlying="SPY", intent={"action": "open"}, evidence={}, status="submitted"
+    )
+    await agent._mark_broker_rejected(
+        proposal_id, "om-1", {"symbol": "SPY", "reason": "no buying power"}, "rejected", {}
+    )
+    assert len(collector.messages) == 1
+    assert "no buying power" in collector.messages[0]
+    assert "SPY" in collector.messages[0]
+
+
+async def test_a_risk_rejection_is_announced_with_its_underlying() -> None:
+    collector = _Collector()
+    agent, _, store = _make_agent(collector)
+    proposal_id = await store.save_proposal(
+        underlying="NVDA", intent={"action": "open"}, evidence={}, status="pending"
+    )
+    await agent._reject(
+        proposal_id, Rejection(proposal_id=proposal_id, reason="no_spot_price"), "NVDA"
+    )
+    assert "no\\_spot\\_price" in collector.messages[0]
+    assert "NVDA" in collector.messages[0]
+
+
+async def test_notifications_can_be_switched_off() -> None:
+    collector = _Collector()
+    agent, _, store = _make_agent(collector, telegram_notify_orders=False)
+    proposal_id = await store.save_proposal(
+        underlying="SPY", intent={"action": "open"}, evidence={}, status="pending"
+    )
+    await agent._reject(proposal_id, Rejection(proposal_id=proposal_id, reason="x"), "SPY")
+    assert collector.messages == []
+
+
+async def test_the_agent_works_without_a_notifier() -> None:
+    """The default is a null notifier, so no call site needs to guard."""
+    agent, _, store = _make_agent()
+    proposal_id = await store.save_proposal(
+        underlying="SPY", intent={"action": "open"}, evidence={}, status="pending"
+    )
+    await agent._reject(proposal_id, Rejection(proposal_id=proposal_id, reason="x"), "SPY")
+    row = await store.get_proposal(proposal_id)
+    assert row is not None and row["status"] == "rejected"
