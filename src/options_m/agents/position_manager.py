@@ -1,30 +1,24 @@
-"""PositionManagerAgent -- owns the local positions cache.
+"""PositionManagerAgent -- sole writer of the local positions cache.
 
-Runs every minute. Its first and, for now, only job is the one described in
-docs/plan/00-MASTER.md's local-cache design: it is the **sole writer** of the
-``positions`` table, piggybacked on the same ``get_all_positions`` call it
-needs anyway. ``MarketPulseAgent`` (positions_count for the equity curve),
-``StrategistAgent`` (Phase 3's "already positioned in this underlying"
-pre-filter) and ``ExecutionAgent`` (Phase 2's per-underlying cap) all read
-this cache instead of calling ``get_all_positions`` / ``get_open_position``
-themselves.
+Runs every minute. Owns the ``positions`` table and nothing else: it fetches
+``get_all_positions``, groups legs by underlying, marks to market, enriches
+each row with the originating proposal metadata, and persists. Exit decisions
+belong to ``StrategistAgent``, which reads this cache each iteration and writes
+a ``close`` proposal when a threshold is crossed. ``ExecutionAgent`` then acts
+on that proposal exactly as it does for open proposals.
 
-Deterministic exit rules (profit target, stop loss, DTE exit, thesis
-invalidation, closing via ``close_position`` / a multi-leg closing order) are
-specified in docs/plan/phase-4-position-reflection-dashboard.md and land once
-Phase 2's ``orders`` table and ``OrderPlan`` model exist to match a position
-back to the proposal that opened it -- building that logic against data that
-does not exist yet would mean guessing at a shape Phase 2 has not committed
-to. This module is intentionally scoped to the cache-ownership half of the
-job until then.
+The ``pnl_pct`` field added to each payload avoids StrategistAgent having to
+re-derive it from raw market_value / unrealized_pl every tick.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import re
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 from options_m.config import Settings
@@ -33,12 +27,9 @@ from options_m.store import Store
 
 logger = logging.getLogger(__name__)
 
-# Standard OCC option symbol: 1-6 letter root, YYMMDD expiry, C/P, 8-digit
-# strike (thousandths of a dollar). Anything that does not match this is
-# treated as its own underlying rather than guessed at -- a stock position
-# (which this system never intentionally holds) falls through this path
-# safely instead of raising.
 _OCC_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})\d{6}[CP]\d{8}$")
+
+_ENRICH_KEYS = ("proposal_id", "entry_price", "opened_at", "strategy")
 
 
 class PositionManagerAgent:
@@ -79,28 +70,45 @@ class PositionManagerAgent:
             )
 
     async def _run(self) -> dict[str, Any]:
-        positions = await self._mcp.get_all_positions()
+        positions, existing_rows, all_orders = await asyncio.gather(
+            self._mcp.get_all_positions(),
+            self._store.get_cached_positions(),
+            self._store.get_all_orders(),
+        )
+
+        existing_by_symbol: dict[str, dict[str, Any]] = {
+            row["symbol"]: row["payload"] for row in existing_rows
+        }
 
         grouped: dict[str, list[dict[str, Any]]] = {}
         for position in positions:
             underlying = _underlying_symbol(position)
             grouped.setdefault(underlying, []).append(position)
 
-        # {underlying: {"legs": [...]}} — grouped so Phase 3's "max one open
-        # structure per underlying" reads a single row per symbol.
-        payload_by_symbol: dict[str, dict[str, Any]] = {
-            underlying: {"legs": legs} for underlying, legs in grouped.items()
-        }
+        payload_by_symbol: dict[str, dict[str, Any]] = {}
+        for underlying, legs in grouped.items():
+            old_payload = existing_by_symbol.get(underlying, {})
 
-        # Mark to market: compute unrealized P&L across all legs right now,
-        # not just at exit-check time. This keeps "what is open and how is it
-        # doing" always a fresh local read for the dashboard and for
-        # StrategistAgent's pre-filter.
+            payload: dict[str, Any] = {"legs": legs}
+            payload["unrealized_pl"] = _total_unrealized_pl(legs)
+            payload["market_value"] = _total_market_value(legs)
+
+            # Carry forward enrichment that was resolved in a previous tick.
+            for key in _ENRICH_KEYS:
+                if key in old_payload:
+                    payload[key] = old_payload[key]
+
+            # Enrich on first appearance: link to the originating proposal.
+            if "proposal_id" not in payload:
+                _enrich_from_orders(payload, legs, all_orders)
+
+            # Pre-compute pnl_pct so StrategistAgent can read it directly.
+            payload["pnl_pct"] = _compute_pnl_pct(payload)
+
+            payload_by_symbol[underlying] = payload
+
         total_unrealized_pl = _total_unrealized_pl(positions)
         total_market_value = _total_market_value(positions)
-        for underlying, legs in grouped.items():
-            payload_by_symbol[underlying]["unrealized_pl"] = _total_unrealized_pl(legs)
-            payload_by_symbol[underlying]["market_value"] = _total_market_value(legs)
 
         await self._store.replace_positions(payload_by_symbol)
 
@@ -114,39 +122,114 @@ class PositionManagerAgent:
         return detail
 
 
+# ---------------------------------------------------------------------------
+# Module-level pure helpers
+# ---------------------------------------------------------------------------
+
+
+def _enrich_from_orders(
+    payload: dict[str, Any],
+    legs: list[dict[str, Any]],
+    all_orders: list[dict[str, Any]],
+) -> None:
+    """Fill proposal_id, entry_price, opened_at, strategy into payload in-place.
+
+    Scans the orders cache for a filled entry order (``om-`` prefix) whose
+    request legs share an OCC symbol with this position's legs. Skips close
+    orders (``omc-`` prefix) to avoid matching a position to its own close.
+    """
+    position_symbols = {str(leg.get("symbol", "")).upper() for leg in legs}
+    position_symbols.discard("")
+
+    for order in all_orders:
+        if str(order.get("status", "")).lower() not in ("filled", "partially_filled"):
+            continue
+        client_order_id = str(order.get("client_order_id", ""))
+        if client_order_id.startswith("omc-"):
+            continue
+
+        request = order.get("request") or {}
+        if isinstance(request, str):
+            import json
+
+            with contextlib.suppress(Exception):
+                request = json.loads(request)
+
+        order_symbols: set[str] = set()
+        if isinstance(request, dict):
+            for ol in request.get("legs") or []:
+                if isinstance(ol, dict):
+                    s = str(ol.get("symbol", "")).upper()
+                    if s:
+                        order_symbols.add(s)
+            single = str(request.get("symbol", "")).upper()
+            if single:
+                order_symbols.add(single)
+
+        if not order_symbols.isdisjoint(position_symbols):
+            proposal_id: int | None = None
+            if client_order_id.startswith("om-"):
+                with contextlib.suppress(ValueError):
+                    proposal_id = int(client_order_id[3:])
+
+            payload["proposal_id"] = proposal_id
+            payload["entry_price"] = _maybe_float(order.get("filled_avg_price"))
+            submitted = order.get("submitted_at")
+            payload["opened_at"] = (
+                submitted.isoformat()  # type: ignore[union-attr]
+                if hasattr(submitted, "isoformat")
+                else str(submitted)
+            )
+            payload["strategy"] = ""
+            return
+
+
+def _compute_pnl_pct(payload: dict[str, Any]) -> float | None:
+    """Unrealized P&L as a fraction of entry value. None if uncomputable."""
+    unrealized_pl = payload.get("unrealized_pl")
+    market_value = payload.get("market_value")
+    if unrealized_pl is None or market_value is None:
+        return None
+    with contextlib.suppress(TypeError, ValueError, ZeroDivisionError):
+        unreal = float(unrealized_pl)
+        entry_value = float(market_value) - unreal
+        if abs(entry_value) > 0.001:
+            return unreal / abs(entry_value)
+    return None
+
+
 def _total_unrealized_pl(positions: list[dict[str, Any]]) -> float:
-    """Sum of unrealized_pl across all position entries (legs)."""
     total = 0.0
     for p in positions:
-        val = p.get("unrealized_pl")
         with contextlib.suppress(TypeError, ValueError):
-            total += float(val)  # type: ignore[arg-type]
+            total += float(p.get("unrealized_pl"))  # type: ignore[arg-type]
     return total
 
 
 def _total_market_value(positions: list[dict[str, Any]]) -> float:
-    """Sum of absolute market_value across all position entries."""
     total = 0.0
     for p in positions:
-        val = p.get("market_value")
         with contextlib.suppress(TypeError, ValueError):
-            total += abs(float(val))  # type: ignore[arg-type]
+            total += abs(float(p.get("market_value")))  # type: ignore[arg-type]
     return total
 
 
 def _underlying_symbol(position: dict[str, Any]) -> str:
-    """The underlying ticker for one get_all_positions entry.
-
-    Parses the OCC option symbol rather than trusting an ``underlying_symbol``
-    field that may or may not be present across API versions -- the regex is
-    the one documented, stable part of the contract. Falls through to the raw
-    symbol for anything that is not a recognisable OCC symbol (a stock
-    position, which this system does not intentionally hold, or an
-    unfamiliar shape) rather than raising: grouping by the wrong key here
-    costs the per-underlying cap a clean read, not correctness of an order.
-    """
     symbol = str(position.get("symbol", "")).upper()
     match = _OCC_SYMBOL_RE.match(symbol)
     if match:
         return match.group(1)
     return symbol
+
+
+def _maybe_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _now_utc() -> datetime:
+    return datetime.now(UTC)

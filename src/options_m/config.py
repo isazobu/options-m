@@ -228,6 +228,13 @@ class Settings(BaseSettings):
     # Phase 4 — ReflectionAgent.
     reflection_interval_seconds: float = Field(default=3600.0, gt=0)
 
+    # Phase 4 — StrategistAgent close-proposal thresholds (deterministic, no LLM).
+    # StrategistAgent reads the positions cache and writes a close proposal when
+    # any of these conditions is met; ExecutionAgent then executes it.
+    exit_profit_target_pct: float = Field(default=0.50, gt=0.0, le=1.0)
+    exit_stop_loss_pct: float = Field(default=0.50, gt=0.0, le=1.0)
+    exit_time_stop_days: int = Field(default=30, ge=1)
+
     @property
     def cors_origins(self) -> tuple[str, ...]:
         """The configured CORS origins, de-duplicated and order-preserving."""
