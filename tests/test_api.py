@@ -152,6 +152,35 @@ async def test_proposal_detail_404s_for_an_unknown_id(client: httpx.AsyncClient)
     assert response.status_code == 404
 
 
+async def test_orders_endpoint_is_empty_without_history(client: httpx.AsyncClient) -> None:
+    response = await client.get("/api/orders")
+
+    assert response.status_code == 200
+    assert response.json() == {"orders": []}
+
+
+async def test_orders_endpoint_lists_attempts_newest_first() -> None:
+    db = Database(Settings(database_url=None))
+    store = Store(db)
+    app = create_app(db, [], mcp=None, store=store)
+    proposal_id = await store.save_proposal(
+        underlying="SPY", intent={"direction": "long"}, evidence={}
+    )
+    await store.record_order(
+        proposal_id=proposal_id, client_order_id="om-1", status="submitted", request={}
+    )
+    await store.record_order(
+        proposal_id=proposal_id, client_order_id="om-2", status="failed", request={}
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/orders")
+
+    assert response.status_code == 200
+    orders = response.json()["orders"]
+    assert [row["client_order_id"] for row in orders] == ["om-2", "om-1"]
+
+
 async def test_risk_events_endpoint_is_empty_without_history(client: httpx.AsyncClient) -> None:
     response = await client.get("/api/risk-events")
 
