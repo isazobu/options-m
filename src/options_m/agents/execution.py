@@ -16,6 +16,7 @@ error text, and dry run never even attempts the call.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
@@ -279,6 +280,7 @@ class ExecutionAgent:
             "rejected": 0,
             "failed": 0,
             "reconciled": 0,
+            "broker_rejected": 0,
         }
         kill_switch_engaged = (
             self._settings.kill_switch or await self._store.is_kill_switch_engaged()
@@ -606,11 +608,36 @@ class ExecutionAgent:
                 continue
             if broker_order is None:
                 continue
+            new_status = str(broker_order.get("status", order["status"]))
             await self._store.update_order_status(
                 client_order_id,
-                status=str(broker_order.get("status", order["status"])),
+                status=new_status,
                 response=broker_order,
                 filled_qty=finite_float(broker_order.get("filled_qty")),
                 filled_avg_price=finite_float(broker_order.get("filled_avg_price")),
             )
             detail["reconciled"] += 1
+
+            if new_status in ("rejected", "canceled", "expired"):
+                proposal_id = order.get("proposal_id")
+                if proposal_id is not None:
+                    reason = str(broker_order.get("reason") or new_status)
+                    await self._store.update_proposal_status(
+                        int(proposal_id),
+                        "broker_rejected",
+                        error=reason,
+                    )
+                    await self._store.record_risk_event(
+                        proposal_id=int(proposal_id),
+                        rule="broker_rejected",
+                        detail={"order_status": new_status, "reason": reason},
+                    )
+                    logger.warning(
+                        "execution: order broker-rejected",
+                        extra={
+                            "client_order_id": client_order_id,
+                            "proposal_id": proposal_id,
+                            "reason": reason,
+                        },
+                    )
+                    detail["broker_rejected"] += 1
