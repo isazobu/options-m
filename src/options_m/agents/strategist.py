@@ -105,14 +105,13 @@ class StrategistAgent:
         close_detail = await self._evaluate_close_proposals()
         detail.update(close_detail)
 
-        # 1. Market-open check (local cache, no MCP call).
+        # Local cache read — no MCP call.
         state = await session.current(self._store, self._settings, now)
         if not state.is_open:
             detail["skipped"] = "market_closed"
             return detail
         detail["session_replayed"] = state.replayed
 
-        # 2. Kill switch + LLM budget.
         if self._settings.kill_switch or await self._store.is_kill_switch_engaged():
             detail["skipped"] = "kill_switch"
             return detail
@@ -132,7 +131,7 @@ class StrategistAgent:
         symbol = str(candidate.get("symbol", "")).upper()
         detail["symbol"] = symbol
 
-        # 4. Evidence cache read (local only — no MCP call ever).
+        # Evidence cache — local only, no MCP call ever.
         stale_threshold = timedelta(
             seconds=self._settings.market_pulse_interval_seconds * _EVIDENCE_STALENESS_FACTOR
         )
@@ -160,7 +159,7 @@ class StrategistAgent:
             detail["skipped"] = "empty_evidence"
             return detail
 
-        # 5. One LLM call — the only outbound I/O in step().
+        # One LLM call — the only outbound I/O in step().
         user_prompt = prompt_loader.load(
             "strategist",
             symbol=symbol,
@@ -198,10 +197,8 @@ class StrategistAgent:
                 ok="status" not in detail or detail.get("status") != "llm_failed",
             )
 
-        # 6. Deterministic matrix decision.
         decision = matrix.decide(pack, regime, settings=self._settings, as_of=now.date())
 
-        # 7. Persist proposal.
         matrix_payload: dict[str, Any] = {
             "trend_classified": _trend_label(pack),
             "iv_regime_classified": _iv_regime_label(pack),

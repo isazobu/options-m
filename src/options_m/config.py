@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     log_format: str = "json"
 
     # HTTP server. Render (like most platforms) injects PORT.
-    host: str = "0.0.0.0"  # noqa: S104 - containers must bind all interfaces
+    host: str = "0.0.0.0"
     port: int = Field(default=8080, ge=1, le=65535)
 
     # Postgres. Unset means "run without a database" (useful locally).
