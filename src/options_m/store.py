@@ -318,6 +318,29 @@ class Store:
             return False
         return bool(rows[0]["engaged"])
 
+    async def kill_switch_status(self) -> dict[str, Any]:
+        """Engaged flag plus *why* and *when*, for the admin surface.
+
+        ``is_kill_switch_engaged`` answers the only question the agents need and
+        is deliberately kept to a bool. An operator looking at a halted system
+        needs the other two columns as well — a halt with no reason and no
+        timestamp is indistinguishable from one nobody remembers engaging.
+        """
+        if not self._db.is_enabled:
+            engaged, reason = self._memory_kill_switch
+            return {"engaged": engaged, "reason": reason, "updated_at": None}
+        rows = await self._fetch(
+            "SELECT engaged, reason, updated_at FROM kill_switch WHERE id = 1", ()
+        )
+        if not rows:
+            return {"engaged": False, "reason": None, "updated_at": None}
+        row = rows[0]
+        return {
+            "engaged": bool(row["engaged"]),
+            "reason": row["reason"],
+            "updated_at": row["updated_at"],
+        }
+
     async def set_kill_switch(self, engaged: bool, reason: str | None = None) -> None:
         if not self._db.is_enabled:
             self._memory_kill_switch = (engaged, reason)

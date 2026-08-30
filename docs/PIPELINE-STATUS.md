@@ -305,7 +305,16 @@ should arrive with its own pricing and max-loss tests.
   removed. Harmless but stale.
 - The paper account (`PA3WTOH8U1VV`, created 2025-01-02, equity $99,428.85) is
   not the brand-new $100,000 account the hackathon rules require.
-- No `options-m flatten`, no `trades` table, no `/admin/kill` endpoint.
+- `/admin/kill` now exists: `GET` reports the switch, `POST` sets it, both
+  behind the same bearer token as the dashboard routes. Engaging takes an
+  optional note; **releasing requires a written reason**, because stopping a
+  trading system should not be gated behind a form field and restarting one
+  should not be a stray click. The response carries `env_forced` and
+  `effective` as well as the stored flag — `ExecutionAgent` halts on
+  `settings.kill_switch or store.is_kill_switch_engaged()`, so an operator who
+  releases the stored flag while `KILL_SWITCH=true` needs to see that nothing
+  actually resumed. Each change writes a `risk_events` row for the audit trail.
+- Still missing: `options-m flatten` and the `trades` table.
 - The seeded rows in `proposals` / `orders` / `risk_events` are demo data from
   `scripts/seed_demo_data.py`, stamped `mock: true`.
 
@@ -459,7 +468,8 @@ already does would remove the need for it.
    credit structures the cap currently over-charges.
 8. **Allocation layer** (gap K) — batch scoring, conviction-weighted sizing and
    a concentration gate belong together, and belong after gap H.
-9. `flatten`, `trades`, `/admin/kill` (gap G); `as_of` threading (gap L).
+9. `flatten` and the `trades` table (gap G); `as_of` threading (gap L).
+   `/admin/kill` is done.
 
 Gaps H, I, J and K were all found by replaying a full week through the real
 pipeline. That harness lives in `backtests/` and is the cheapest way to check
