@@ -1,0 +1,6 @@
+symbol,strategy,signal_date,fill_date,qty,entry_value,mark_value,pnl,max_loss,closed
+SPY,long_strangle,2026-08-24,2026-08-25,2,8.2113,5.85,-472.26,1610.0,"NO — marked, never exited"
+QQQ,long_strangle,2026-08-24,2026-08-25,1,13.736,10.29,-344.6,1323.75,"NO — marked, never exited"
+AAPL,long_strangle,2026-08-24,2026-08-25,3,5.8681,6.35,144.57,1800.75,"NO — marked, never exited"
+MSFT,debit_call_spread,2026-08-24,2026-08-25,6,1.9661,6.01,2426.34,1788.0,"NO — marked, never exited"
+NVDA,iron_condor,2026-08-24,2026-08-25,3,-3.1051,-2.31,238.53,1995.75,"NO — marked, never exited"

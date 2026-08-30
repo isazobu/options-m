@@ -1,0 +1,78 @@
+{
+  "generated_by": "alpaca CLI 0.0.14",
+  "fetched_at": "2026-08-30",
+  "stock_bars": {
+    "file": "raw/bars_universe.json",
+    "sha256": "e68452dce9155a54d9329038189d54a7c20b7f927a8512d7087817bbec190ba3",
+    "feed": "sip",
+    "adjustment": "split",
+    "timeframe": "1Day",
+    "range": [
+      "2025-08-01",
+      "2026-08-28"
+    ],
+    "symbols": {
+      "AAPL": 271,
+      "AMD": 271,
+      "GOOGL": 271,
+      "IWM": 271,
+      "META": 271,
+      "MSFT": 271,
+      "NVDA": 271,
+      "QQQ": 271,
+      "SPY": 271,
+      "TSLA": 271
+    }
+  },
+  "option_contracts": {
+    "file": "raw/contracts.json",
+    "sha256": "2e380f963be24f4c344230060587bf5309bc5a6d6c60b16ad7f1654dfdd11728",
+    "expiry_window": [
+      "2026-08-31",
+      "2026-10-12"
+    ],
+    "strike_band_pct": 0.15,
+    "total": 15684,
+    "with_open_interest": 11183,
+    "open_interest_date": "2026-08-27",
+    "per_symbol": {
+      "SPY": 4178,
+      "QQQ": 3916,
+      "IWM": 2210,
+      "AAPL": 590,
+      "MSFT": 918,
+      "NVDA": 516,
+      "AMD": 996,
+      "TSLA": 714,
+      "META": 1078,
+      "GOOGL": 568
+    }
+  },
+  "option_bars": {
+    "file": "raw/option_bars.json",
+    "sha256": "a0078b404b7999143fe0a5bcb4895a0e8cddb1e4a4da343ff6a18a2158e39b20",
+    "timeframe": "1Day",
+    "range": [
+      "2026-08-21",
+      "2026-08-28"
+    ],
+    "contracts_requested": 15684,
+    "contracts_with_bars": 11888
+  },
+  "calendar": {
+    "file": "raw/calendar.json",
+    "sha256": "c84e8ff49d45265b39aa1feda2bec5a083b1c7ddf5d690c1f29db84425b97519",
+    "sessions": [
+      "2026-08-24",
+      "2026-08-25",
+      "2026-08-26",
+      "2026-08-27",
+      "2026-08-28"
+    ]
+  },
+  "known_limitations": [
+    "No historical option quote endpoint exists at Alpaca \u2014 bid/ask is modelled, not observed.",
+    "open_interest is a single snapshot stamped 2026-08-27, not a point-in-time series.",
+    "Contracts with no trade on a date have no bar and are absent from that date's chain."
+  ]
+}

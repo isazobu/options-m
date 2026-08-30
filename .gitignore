@@ -31,3 +31,7 @@ observer.log
 
 # Stray artifact, not produced by this project's build
 tests.zip
+
+# Backtest raw data — 13MB of Alpaca CLI output, re-fetchable from the
+# parameters and SHA-256 digests recorded in each run's data_fingerprint.json
+backtests/runs/*/raw/

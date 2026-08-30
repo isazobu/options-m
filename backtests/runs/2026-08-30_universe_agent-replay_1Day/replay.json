@@ -1,0 +1,1230 @@
+{
+  "config": {
+    "spread_pct": 0.02,
+    "conviction": 0.7,
+    "starting_equity": 100000.0
+  },
+  "days": [
+    {
+      "date": "2026-08-24",
+      "decisions": [
+        {
+          "symbol": "SPY",
+          "proposal_id": 1,
+          "iv_atm": 0.1303,
+          "rv_20d": 0.1324,
+          "iv_rv": 0.984,
+          "atm_dte": 32,
+          "strategy": "long_strangle",
+          "spot": 763.47,
+          "chain_contracts": 675,
+          "limit_price": 8.05,
+          "max_loss": 1610.0000000000002,
+          "qty": 2,
+          "legs": [
+            "buy SPY260918C00781000",
+            "buy SPY260918P00746000"
+          ],
+          "stage": "filled",
+          "outcome": "FILLED",
+          "fill_date": "2026-08-25",
+          "entry_value": 8.2113
+        },
+        {
+          "symbol": "QQQ",
+          "proposal_id": 2,
+          "iv_atm": 0.1998,
+          "rv_20d": 0.2267,
+          "iv_rv": 0.881,
+          "atm_dte": 32,
+          "strategy": "long_strangle",
+          "spot": 706.32,
+          "chain_contracts": 630,
+          "limit_price": 13.2375,
+          "max_loss": 1323.75,
+          "qty": 1,
+          "legs": [
+            "buy QQQ260930C00738000",
+            "buy QQQ260930P00679000"
+          ],
+          "stage": "filled",
+          "outcome": "FILLED",
+          "fill_date": "2026-08-25",
+          "entry_value": 13.736
+        },
+        {
+          "symbol": "IWM",
+          "proposal_id": 3,
+          "iv_atm": 0.1772,
+          "rv_20d": 0.1579,
+          "iv_rv": 1.122,
+          "atm_dte": 32,
+          "strategy": "iron_condor",
+          "spot": 297.97,
+          "chain_contracts": 253,
+          "limit_price": -2.2600000000000002,
+          "max_loss": 1896.0,
+          "qty": 4,
+          "legs": [
+            "sell IWM260925P00287500",
+            "buy IWM260925P00281000",
+            "sell IWM260925C00309000",
+            "buy IWM260925C00316000"
+          ],
+          "stage": "fill",
+          "outcome": "no 2026-08-25 bar for IWM260925P00287500 \u2014 unfilled"
+        },
+        {
+          "symbol": "AAPL",
+          "proposal_id": 4,
+          "iv_atm": 0.2453,
+          "rv_20d": 0.3293,
+          "iv_rv": 0.745,
+          "atm_dte": 32,
+          "strategy": "long_strangle",
+          "spot": 310.34,
+          "chain_contracts": 86,
+          "limit_price": 6.0025,
+          "max_loss": 1800.75,
+          "qty": 3,
+          "legs": [
+            "buy AAPL260918C00325000",
+            "buy AAPL260918P00297500"
+          ],
+          "stage": "filled",
+          "outcome": "FILLED",
+          "fill_date": "2026-08-25",
+          "entry_value": 5.8681
+        },
+        {
+          "symbol": "MSFT",
+          "proposal_id": 5,
+          "iv_atm": 0.2614,
+          "rv_20d": 0.5687,
+          "iv_rv": 0.46,
+          "atm_dte": 32,
+          "strategy": "call_debit_spread",
+          "spot": 487.31,
+          "chain_contracts": 122,
+          "limit_price": 2.9799999999999995,
+          "max_loss": 1787.9999999999995,
+          "qty": 6,
+          "legs": [
+            "buy MSFT260925C00515000",
+            "sell MSFT260925C00530000"
+          ],
+          "stage": "filled",
+          "outcome": "FILLED",
+          "fill_date": "2026-08-25",
+          "entry_value": 1.9661
+        },
+        {
+          "symbol": "NVDA",
+          "proposal_id": 6,
+          "iv_atm": 0.4198,
+          "rv_20d": 0.349,
+          "iv_rv": 1.203,
+          "atm_dte": 32,
+          "strategy": "iron_condor",
+          "spot": 208.48,
+          "chain_contracts": 84,
+          "limit_price": -3.3475000000000006,
+          "max_loss": 1995.75,
+          "qty": 3,
+          "legs": [
+            "sell NVDA260918P00195000",
+            "buy NVDA260918P00185000",
+            "sell NVDA260918C00227500",
+            "buy NVDA260918C00237500"
+          ],
+          "stage": "filled",
+          "outcome": "FILLED",
+          "fill_date": "2026-08-25",
+          "entry_value": -3.1051
+        },
+        {
+          "symbol": "AMD",
+          "proposal_id": 7,
+          "iv_atm": 0.5346,
+          "rv_20d": 0.7829,
+          "iv_rv": 0.683,
+          "atm_dte": 32,
+          "strategy": "put_debit_spread",
+          "spot": 456.745,
+          "chain_contracts": 127,
+          "stage": "builder",
+          "outcome": "rejected: no_strike_within_increment",
+          "detail": {
+            "target": 392.69136366589214,
+            "nearest": 390.0,
+            "increment": 2.5
+          }
+        },
+        {
+          "symbol": "TSLA",
+          "proposal_id": 8,
+          "iv_atm": 0.4052,
+          "rv_20d": 0.3991,
+          "iv_rv": 1.015,
+          "atm_dte": 32,
+          "strategy": "long_strangle",
+          "spot": 348.95,
+          "chain_contracts": 109,
+          "limit_price": 12.2375,
+          "max_loss": 1223.75,
+          "qty": 1,
+          "legs": [
+            "buy TSLA260925C00385000",
+            "buy TSLA260925P00325000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions"
+        },
+        {
+          "symbol": "META",
+          "proposal_id": 9,
+          "iv_atm": 0.3567,
+          "rv_20d": 0.477,
+          "iv_rv": 0.748,
+          "atm_dte": 32,
+          "strategy": "put_debit_spread",
+          "spot": 559.02,
+          "chain_contracts": 151,
+          "limit_price": 5.200000000000002,
+          "max_loss": 1560.0000000000007,
+          "qty": 3,
+          "legs": [
+            "buy META260925P00525000",
+            "sell META260925P00500000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions"
+        },
+        {
+          "symbol": "GOOGL",
+          "proposal_id": 10,
+          "iv_atm": 0.2857,
+          "rv_20d": 0.3839,
+          "iv_rv": 0.744,
+          "atm_dte": 32,
+          "strategy": "long_strangle",
+          "spot": 348.06,
+          "chain_contracts": 97,
+          "limit_price": 7.85,
+          "max_loss": 1570.0,
+          "qty": 2,
+          "legs": [
+            "buy GOOGL260918C00367500",
+            "buy GOOGL260918P00332500"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions"
+        }
+      ]
+    },
+    {
+      "date": "2026-08-25",
+      "decisions": [
+        {
+          "symbol": "SPY",
+          "proposal_id": 11,
+          "iv_atm": 0.1274,
+          "rv_20d": 0.1325,
+          "iv_rv": 0.962,
+          "atm_dte": 31,
+          "strategy": "long_strangle",
+          "spot": 765.91,
+          "chain_contracts": 790,
+          "limit_price": 8.9125,
+          "max_loss": 1782.5,
+          "qty": 2,
+          "legs": [
+            "buy SPY260925C00785000",
+            "buy SPY260925P00746000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "QQQ",
+          "proposal_id": 12,
+          "iv_atm": 0.1915,
+          "rv_20d": 0.223,
+          "iv_rv": 0.859,
+          "atm_dte": 31,
+          "strategy": "long_strangle",
+          "spot": 710.72,
+          "chain_contracts": 724,
+          "limit_price": 12.350000000000001,
+          "max_loss": 1235.0000000000002,
+          "qty": 1,
+          "legs": [
+            "buy QQQ260925C00738000",
+            "buy QQQ260925P00684000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "IWM",
+          "proposal_id": 13,
+          "iv_atm": 0.1711,
+          "rv_20d": 0.1584,
+          "iv_rv": 1.08,
+          "atm_dte": 31,
+          "strategy": "long_strangle",
+          "spot": 299.23,
+          "chain_contracts": 286,
+          "limit_price": 4.0600000000000005,
+          "max_loss": 1624.0000000000002,
+          "qty": 4,
+          "legs": [
+            "buy IWM260918C00308000",
+            "buy IWM260918P00290000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions"
+        },
+        {
+          "symbol": "AAPL",
+          "proposal_id": 14,
+          "iv_atm": 0.247,
+          "rv_20d": 0.3257,
+          "iv_rv": 0.758,
+          "atm_dte": 31,
+          "strategy": "long_strangle",
+          "spot": 309.9,
+          "chain_contracts": 115,
+          "limit_price": 5.72,
+          "max_loss": 1716.0,
+          "qty": 3,
+          "legs": [
+            "buy AAPL260918C00325000",
+            "buy AAPL260918P00297500"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "MSFT",
+          "proposal_id": 15,
+          "iv_atm": 0.2552,
+          "rv_20d": 0.5687,
+          "iv_rv": 0.449,
+          "atm_dte": 31,
+          "strategy": "call_debit_spread",
+          "spot": 491.71,
+          "chain_contracts": 163,
+          "limit_price": 2.5949999999999998,
+          "max_loss": 1816.5,
+          "qty": 7,
+          "legs": [
+            "buy MSFT260918C00515000",
+            "sell MSFT260918C00530000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "NVDA",
+          "proposal_id": 16,
+          "iv_atm": 0.4079,
+          "rv_20d": 0.3552,
+          "iv_rv": 1.148,
+          "atm_dte": 31,
+          "strategy": "iron_condor",
+          "spot": 213.05,
+          "chain_contracts": 116,
+          "limit_price": -3.7174999999999994,
+          "max_loss": 1884.7500000000005,
+          "qty": 3,
+          "legs": [
+            "sell NVDA260918P00200000",
+            "buy NVDA260918P00190000",
+            "sell NVDA260918C00230000",
+            "buy NVDA260918C00240000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "AMD",
+          "proposal_id": 17,
+          "iv_atm": 0.5332,
+          "rv_20d": 0.7417,
+          "iv_rv": 0.719,
+          "atm_dte": 31,
+          "strategy": "long_strangle",
+          "spot": 479.18,
+          "chain_contracts": 179,
+          "stage": "builder",
+          "outcome": "rejected: low_open_interest",
+          "detail": {
+            "symbol": "AMD261002P00435000",
+            "open_interest": 77
+          }
+        },
+        {
+          "symbol": "TSLA",
+          "proposal_id": 18,
+          "iv_atm": 0.4108,
+          "rv_20d": 0.3968,
+          "iv_rv": 1.035,
+          "atm_dte": 31,
+          "strategy": "long_strangle",
+          "spot": 350.25,
+          "chain_contracts": 147,
+          "limit_price": 13.8375,
+          "max_loss": 1383.75,
+          "qty": 1,
+          "legs": [
+            "buy TSLA261002C00390000",
+            "buy TSLA261002P00325000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions"
+        },
+        {
+          "symbol": "META",
+          "proposal_id": 19,
+          "iv_atm": 0.3525,
+          "rv_20d": 0.4837,
+          "iv_rv": 0.729,
+          "atm_dte": 31,
+          "strategy": "long_strangle",
+          "spot": 570.05,
+          "chain_contracts": 207,
+          "limit_price": 15.025000000000002,
+          "max_loss": 1502.5000000000002,
+          "qty": 1,
+          "legs": [
+            "buy META260918C00610000",
+            "buy META260918P00540000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions"
+        },
+        {
+          "symbol": "GOOGL",
+          "proposal_id": 20,
+          "iv_atm": 0.2794,
+          "rv_20d": 0.3781,
+          "iv_rv": 0.739,
+          "atm_dte": 31,
+          "strategy": "long_strangle",
+          "spot": 346.96,
+          "chain_contracts": 125,
+          "limit_price": 8.612499999999999,
+          "max_loss": 1722.4999999999998,
+          "qty": 2,
+          "legs": [
+            "buy GOOGL260925C00370000",
+            "buy GOOGL260925P00330000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions"
+        }
+      ]
+    },
+    {
+      "date": "2026-08-26",
+      "decisions": [
+        {
+          "symbol": "SPY",
+          "proposal_id": 21,
+          "iv_atm": 0.1267,
+          "rv_20d": 0.1163,
+          "iv_rv": 1.089,
+          "atm_dte": 30,
+          "strategy": "long_strangle",
+          "spot": 766.08,
+          "chain_contracts": 783,
+          "limit_price": 9.3,
+          "max_loss": 1860.0000000000002,
+          "qty": 2,
+          "legs": [
+            "buy SPY260930C00787000",
+            "buy SPY260930P00746000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "QQQ",
+          "proposal_id": 22,
+          "iv_atm": 0.1859,
+          "rv_20d": 0.2058,
+          "iv_rv": 0.903,
+          "atm_dte": 30,
+          "strategy": "long_strangle",
+          "spot": 711.37,
+          "chain_contracts": 657,
+          "limit_price": 10.25,
+          "max_loss": 1025.0,
+          "qty": 1,
+          "legs": [
+            "buy QQQ260918C00735000",
+            "buy QQQ260918P00690000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "IWM",
+          "proposal_id": 23,
+          "iv_atm": 0.1689,
+          "rv_20d": 0.1446,
+          "iv_rv": 1.168,
+          "atm_dte": 30,
+          "strategy": "iron_condor",
+          "spot": 298.93,
+          "chain_contracts": 281,
+          "stage": "builder",
+          "outcome": "rejected: low_open_interest",
+          "detail": {
+            "symbol": "IWM261002P00288000",
+            "open_interest": 54
+          }
+        },
+        {
+          "symbol": "AAPL",
+          "proposal_id": 24,
+          "iv_atm": 0.246,
+          "rv_20d": 0.3306,
+          "iv_rv": 0.744,
+          "atm_dte": 30,
+          "strategy": "long_strangle",
+          "spot": 313.45,
+          "chain_contracts": 123,
+          "limit_price": 6.762499999999999,
+          "max_loss": 1352.4999999999998,
+          "qty": 2,
+          "legs": [
+            "buy AAPL260925C00330000",
+            "buy AAPL260925P00300000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "MSFT",
+          "proposal_id": 25,
+          "iv_atm": 0.2505,
+          "rv_20d": 0.5647,
+          "iv_rv": 0.444,
+          "atm_dte": 30,
+          "strategy": "call_debit_spread",
+          "spot": 496.37,
+          "chain_contracts": 173,
+          "limit_price": 2.215,
+          "max_loss": 1993.5,
+          "qty": 9,
+          "legs": [
+            "buy MSFT260918C00520000",
+            "sell MSFT260918C00535000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "NVDA",
+          "proposal_id": 26,
+          "iv_atm": 0.419,
+          "rv_20d": 0.3315,
+          "iv_rv": 1.264,
+          "atm_dte": 30,
+          "strategy": "iron_condor",
+          "spot": 209.66,
+          "chain_contracts": 115,
+          "limit_price": -3.5600000000000005,
+          "max_loss": 1932.0,
+          "qty": 3,
+          "legs": [
+            "sell NVDA260925P00195000",
+            "buy NVDA260925P00185000",
+            "sell NVDA260925C00230000",
+            "buy NVDA260925C00240000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "AMD",
+          "proposal_id": 27,
+          "iv_atm": 0.5279,
+          "rv_20d": 0.7078,
+          "iv_rv": 0.746,
+          "atm_dte": 30,
+          "strategy": "long_strangle",
+          "spot": 480.93,
+          "chain_contracts": 176,
+          "stage": "builder",
+          "outcome": "rejected: zero_quantity",
+          "detail": {
+            "max_premium_budget": 2000.0,
+            "max_loss_per_contract": 2253.75
+          }
+        },
+        {
+          "symbol": "TSLA",
+          "proposal_id": 28,
+          "iv_atm": 0.4001,
+          "rv_20d": 0.3799,
+          "iv_rv": 1.053,
+          "atm_dte": 30,
+          "strategy": "long_strangle",
+          "spot": 345.82,
+          "chain_contracts": 149,
+          "limit_price": 13.325,
+          "max_loss": 1332.5,
+          "qty": 1,
+          "legs": [
+            "buy TSLA261002C00385000",
+            "buy TSLA261002P00320000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions"
+        },
+        {
+          "symbol": "META",
+          "proposal_id": 29,
+          "iv_atm": 0.3633,
+          "rv_20d": 0.4838,
+          "iv_rv": 0.751,
+          "atm_dte": 30,
+          "strategy": "long_strangle",
+          "spot": 576.14,
+          "chain_contracts": 218,
+          "stage": "builder",
+          "outcome": "rejected: zero_quantity",
+          "detail": {
+            "max_premium_budget": 2000.0,
+            "max_loss_per_contract": 2110.0
+          }
+        },
+        {
+          "symbol": "GOOGL",
+          "proposal_id": 30,
+          "iv_atm": 0.2817,
+          "rv_20d": 0.3815,
+          "iv_rv": 0.738,
+          "atm_dte": 30,
+          "strategy": "long_strangle",
+          "spot": 342.0,
+          "chain_contracts": 133,
+          "limit_price": 7.1625,
+          "max_loss": 1432.5,
+          "qty": 2,
+          "legs": [
+            "buy GOOGL260918C00360000",
+            "buy GOOGL260918P00327500"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions"
+        }
+      ]
+    },
+    {
+      "date": "2026-08-27",
+      "decisions": [
+        {
+          "symbol": "SPY",
+          "proposal_id": 31,
+          "iv_atm": 0.1164,
+          "rv_20d": 0.1049,
+          "iv_rv": 1.11,
+          "atm_dte": 29,
+          "strategy": "put_credit_spread",
+          "spot": 771.1,
+          "chain_contracts": 835,
+          "limit_price": -1.6374999999999997,
+          "max_loss": 1872.5000000000002,
+          "qty": 2,
+          "legs": [
+            "sell SPY260930P00752000",
+            "buy SPY260930P00741000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "QQQ",
+          "proposal_id": 32,
+          "iv_atm": 0.1784,
+          "rv_20d": 0.1801,
+          "iv_rv": 0.991,
+          "atm_dte": 29,
+          "strategy": "long_strangle",
+          "spot": 721.11,
+          "chain_contracts": 749,
+          "limit_price": 12.2375,
+          "max_loss": 1223.75,
+          "qty": 1,
+          "legs": [
+            "buy QQQ260930C00748000",
+            "buy QQQ260930P00695000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "IWM",
+          "proposal_id": 33,
+          "iv_atm": 0.1634,
+          "rv_20d": 0.1376,
+          "iv_rv": 1.188,
+          "atm_dte": 29,
+          "strategy": "iron_condor",
+          "spot": 299.81,
+          "chain_contracts": 302,
+          "limit_price": -1.935,
+          "max_loss": 1625.9999999999998,
+          "qty": 4,
+          "legs": [
+            "sell IWM260925P00290000",
+            "buy IWM260925P00284000",
+            "sell IWM260925C00309000",
+            "buy IWM260925C00315000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions"
+        },
+        {
+          "symbol": "AAPL",
+          "proposal_id": 34,
+          "iv_atm": 0.2423,
+          "rv_20d": 0.3292,
+          "iv_rv": 0.736,
+          "atm_dte": 29,
+          "strategy": "long_strangle",
+          "spot": 314.58,
+          "chain_contracts": 126,
+          "limit_price": 5.5975,
+          "max_loss": 1679.25,
+          "qty": 3,
+          "legs": [
+            "buy AAPL260918C00330000",
+            "buy AAPL260918P00302500"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "MSFT",
+          "proposal_id": 35,
+          "iv_atm": 0.2461,
+          "rv_20d": 0.2773,
+          "iv_rv": 0.887,
+          "atm_dte": 29,
+          "strategy": "call_debit_spread",
+          "spot": 505.06,
+          "chain_contracts": 192,
+          "stage": "builder",
+          "outcome": "rejected: low_open_interest",
+          "detail": {
+            "symbol": "MSFT261002C00555000",
+            "open_interest": 79
+          }
+        },
+        {
+          "symbol": "NVDA",
+          "proposal_id": 36,
+          "iv_atm": 0.3346,
+          "rv_20d": 0.4292,
+          "iv_rv": 0.78,
+          "atm_dte": 29,
+          "strategy": "call_debit_spread",
+          "spot": 227.98,
+          "chain_contracts": 123,
+          "limit_price": 1.49,
+          "max_loss": 1937.0,
+          "qty": 13,
+          "legs": [
+            "buy NVDA260925C00245000",
+            "sell NVDA260925C00255000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "AMD",
+          "proposal_id": 37,
+          "iv_atm": 0.5096,
+          "rv_20d": 0.5588,
+          "iv_rv": 0.912,
+          "atm_dte": 29,
+          "strategy": "long_strangle",
+          "spot": 476.67,
+          "chain_contracts": 175,
+          "stage": "builder",
+          "outcome": "rejected: low_open_interest",
+          "detail": {
+            "symbol": "AMD261002C00540000",
+            "open_interest": 67
+          }
+        },
+        {
+          "symbol": "TSLA",
+          "proposal_id": 38,
+          "iv_atm": 0.3892,
+          "rv_20d": 0.3726,
+          "iv_rv": 1.045,
+          "atm_dte": 29,
+          "strategy": "long_strangle",
+          "spot": 354.81,
+          "chain_contracts": 155,
+          "limit_price": 10.55,
+          "max_loss": 1055.0,
+          "qty": 1,
+          "legs": [
+            "buy TSLA260918C00382500",
+            "buy TSLA260918P00335000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions"
+        },
+        {
+          "symbol": "META",
+          "proposal_id": 39,
+          "iv_atm": 0.3537,
+          "rv_20d": 0.3767,
+          "iv_rv": 0.939,
+          "atm_dte": 29,
+          "strategy": "long_strangle",
+          "spot": 571.1,
+          "chain_contracts": 204,
+          "limit_price": 19.35,
+          "max_loss": 1935.0000000000002,
+          "qty": 1,
+          "legs": [
+            "buy META261002C00620000",
+            "buy META261002P00535000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions"
+        },
+        {
+          "symbol": "GOOGL",
+          "proposal_id": 40,
+          "iv_atm": 0.2701,
+          "rv_20d": 0.3801,
+          "iv_rv": 0.711,
+          "atm_dte": 29,
+          "strategy": "long_strangle",
+          "spot": 340.65,
+          "chain_contracts": 135,
+          "limit_price": 6.8,
+          "max_loss": 1360.0,
+          "qty": 2,
+          "legs": [
+            "buy GOOGL260918C00357500",
+            "buy GOOGL260918P00327500"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions"
+        }
+      ]
+    },
+    {
+      "date": "2026-08-28",
+      "decisions": [
+        {
+          "symbol": "SPY",
+          "proposal_id": 41,
+          "iv_atm": 0.1157,
+          "rv_20d": 0.104,
+          "iv_rv": 1.113,
+          "atm_dte": 28,
+          "strategy": "put_credit_spread",
+          "spot": 769.35,
+          "chain_contracts": 842,
+          "limit_price": -1.5375000000000003,
+          "max_loss": 1692.5,
+          "qty": 2,
+          "legs": [
+            "sell SPY260925P00752000",
+            "buy SPY260925P00742000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "QQQ",
+          "proposal_id": 42,
+          "iv_atm": 0.1701,
+          "rv_20d": 0.1823,
+          "iv_rv": 0.933,
+          "atm_dte": 28,
+          "strategy": "long_strangle",
+          "spot": 716.43,
+          "chain_contracts": 745,
+          "stage": "builder",
+          "outcome": "rejected: low_open_interest",
+          "detail": {
+            "symbol": "QQQ260930C00742000",
+            "open_interest": 53
+          }
+        },
+        {
+          "symbol": "IWM",
+          "proposal_id": 43,
+          "iv_atm": 0.1621,
+          "rv_20d": 0.146,
+          "iv_rv": 1.11,
+          "atm_dte": 28,
+          "strategy": "iron_condor",
+          "spot": 295.75,
+          "chain_contracts": 340,
+          "limit_price": -1.7850000000000001,
+          "max_loss": 1929.0,
+          "qty": 6,
+          "legs": [
+            "sell IWM260918P00288000",
+            "buy IWM260918P00283000",
+            "sell IWM260918C00303000",
+            "buy IWM260918C00308000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions"
+        },
+        {
+          "symbol": "AAPL",
+          "proposal_id": 44,
+          "iv_atm": 0.2392,
+          "rv_20d": 0.1895,
+          "iv_rv": 1.262,
+          "atm_dte": 28,
+          "strategy": "iron_condor",
+          "spot": 319.7,
+          "chain_contracts": 131,
+          "limit_price": -2.6,
+          "max_loss": 1960.0000000000002,
+          "qty": 4,
+          "legs": [
+            "sell AAPL260918P00307500",
+            "buy AAPL260918P00300000",
+            "sell AAPL260918C00332500",
+            "buy AAPL260918C00340000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "MSFT",
+          "proposal_id": 45,
+          "iv_atm": 0.2396,
+          "rv_20d": 0.2658,
+          "iv_rv": 0.901,
+          "atm_dte": 28,
+          "strategy": "call_debit_spread",
+          "spot": 513.53,
+          "chain_contracts": 198,
+          "limit_price": 2.3449999999999998,
+          "max_loss": 1875.9999999999998,
+          "qty": 8,
+          "legs": [
+            "buy MSFT260925C00540000",
+            "sell MSFT260925C00555000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "NVDA",
+          "proposal_id": 46,
+          "iv_atm": 0.3223,
+          "rv_20d": 0.4627,
+          "iv_rv": 0.697,
+          "atm_dte": 28,
+          "strategy": "long_strangle",
+          "spot": 217.55,
+          "chain_contracts": 120,
+          "limit_price": 6.7124999999999995,
+          "max_loss": 1342.5,
+          "qty": 2,
+          "legs": [
+            "buy NVDA261002C00235000",
+            "buy NVDA261002P00205000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions,max_positions_per_underlying"
+        },
+        {
+          "symbol": "AMD",
+          "proposal_id": 47,
+          "iv_atm": 0.4728,
+          "rv_20d": 0.5609,
+          "iv_rv": 0.843,
+          "atm_dte": 28,
+          "strategy": "put_debit_spread",
+          "spot": 465.58,
+          "chain_contracts": 173,
+          "stage": "builder",
+          "outcome": "rejected: no_strike_within_increment",
+          "detail": {
+            "target": 412.9200093879005,
+            "nearest": 410.0,
+            "increment": 2.5
+          }
+        },
+        {
+          "symbol": "TSLA",
+          "proposal_id": 48,
+          "iv_atm": 0.384,
+          "rv_20d": 0.3823,
+          "iv_rv": 1.004,
+          "atm_dte": 28,
+          "strategy": "long_strangle",
+          "spot": 348.75,
+          "chain_contracts": 161,
+          "limit_price": 9.650000000000002,
+          "max_loss": 1930.0000000000005,
+          "qty": 2,
+          "legs": [
+            "buy TSLA260918C00372500",
+            "buy TSLA260918P00330000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions"
+        },
+        {
+          "symbol": "META",
+          "proposal_id": 49,
+          "iv_atm": 0.3459,
+          "rv_20d": 0.3624,
+          "iv_rv": 0.954,
+          "atm_dte": 28,
+          "strategy": "long_strangle",
+          "spot": 578.02,
+          "chain_contracts": 207,
+          "limit_price": 16.662499999999998,
+          "max_loss": 1666.2499999999998,
+          "qty": 1,
+          "legs": [
+            "buy META260925C00620000",
+            "buy META260925P00545000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions"
+        },
+        {
+          "symbol": "GOOGL",
+          "proposal_id": 50,
+          "iv_atm": 0.2704,
+          "rv_20d": 0.3032,
+          "iv_rv": 0.892,
+          "atm_dte": 28,
+          "strategy": "long_strangle",
+          "spot": 346.59,
+          "chain_contracts": 142,
+          "limit_price": 8.8,
+          "max_loss": 1760.0000000000002,
+          "qty": 2,
+          "legs": [
+            "buy GOOGL261002C00370000",
+            "buy GOOGL261002P00330000"
+          ],
+          "stage": "risk",
+          "outcome": "rejected: max_concurrent_positions"
+        }
+      ]
+    }
+  ],
+  "positions": [
+    {
+      "symbol": "SPY",
+      "strategy": "long_strangle",
+      "signal_date": "2026-08-24",
+      "fill_date": "2026-08-25",
+      "qty": 2,
+      "legs": [
+        {
+          "symbol": "SPY260918C00781000",
+          "side": "buy",
+          "ratio": 1,
+          "strike": 781.0,
+          "expiry": "2026-09-18",
+          "option_type": "call",
+          "entry_price": 3.8784,
+          "delta": 0.24843408187042565
+        },
+        {
+          "symbol": "SPY260918P00746000",
+          "side": "buy",
+          "ratio": 1,
+          "strike": 746.0,
+          "expiry": "2026-09-18",
+          "option_type": "put",
+          "entry_price": 4.3329,
+          "delta": -0.25391384856647026
+        }
+      ],
+      "entry_value": 8.2113,
+      "max_loss": 1610.0000000000002,
+      "thesis_conviction": 0.7,
+      "mark_value": 5.85,
+      "pnl": -472.26,
+      "mark_note": ""
+    },
+    {
+      "symbol": "QQQ",
+      "strategy": "long_strangle",
+      "signal_date": "2026-08-24",
+      "fill_date": "2026-08-25",
+      "qty": 1,
+      "legs": [
+        {
+          "symbol": "QQQ260930C00738000",
+          "side": "buy",
+          "ratio": 1,
+          "strike": 738.0,
+          "expiry": "2026-09-30",
+          "option_type": "call",
+          "entry_price": 6.3428,
+          "delta": 0.24935765095219053
+        },
+        {
+          "symbol": "QQQ260930P00679000",
+          "side": "buy",
+          "ratio": 1,
+          "strike": 679.0,
+          "expiry": "2026-09-30",
+          "option_type": "put",
+          "entry_price": 7.3932,
+          "delta": -0.24968526748932163
+        }
+      ],
+      "entry_value": 13.736,
+      "max_loss": 1323.75,
+      "thesis_conviction": 0.7,
+      "mark_value": 10.29,
+      "pnl": -344.6,
+      "mark_note": ""
+    },
+    {
+      "symbol": "AAPL",
+      "strategy": "long_strangle",
+      "signal_date": "2026-08-24",
+      "fill_date": "2026-08-25",
+      "qty": 3,
+      "legs": [
+        {
+          "symbol": "AAPL260918C00325000",
+          "side": "buy",
+          "ratio": 1,
+          "strike": 325.0,
+          "expiry": "2026-09-18",
+          "option_type": "call",
+          "entry_price": 3.131,
+          "delta": 0.26221420590341965
+        },
+        {
+          "symbol": "AAPL260918P00297500",
+          "side": "buy",
+          "ratio": 1,
+          "strike": 297.5,
+          "expiry": "2026-09-18",
+          "option_type": "put",
+          "entry_price": 2.7371,
+          "delta": -0.2350204306176591
+        }
+      ],
+      "entry_value": 5.8681,
+      "max_loss": 1800.75,
+      "thesis_conviction": 0.7,
+      "mark_value": 6.35,
+      "pnl": 144.57,
+      "mark_note": ""
+    },
+    {
+      "symbol": "MSFT",
+      "strategy": "debit_call_spread",
+      "signal_date": "2026-08-24",
+      "fill_date": "2026-08-25",
+      "qty": 6,
+      "legs": [
+        {
+          "symbol": "MSFT260925C00515000",
+          "side": "buy",
+          "ratio": 1,
+          "strike": 515.0,
+          "expiry": "2026-09-25",
+          "option_type": "call",
+          "entry_price": 4.7975,
+          "delta": 0.26467976864194176
+        },
+        {
+          "symbol": "MSFT260925C00530000",
+          "side": "sell",
+          "ratio": 1,
+          "strike": 530.0,
+          "expiry": "2026-09-25",
+          "option_type": "call",
+          "entry_price": 2.8314,
+          "delta": null
+        }
+      ],
+      "entry_value": 1.9661,
+      "max_loss": 1787.9999999999995,
+      "thesis_conviction": 0.7,
+      "mark_value": 6.01,
+      "pnl": 2426.34,
+      "mark_note": ""
+    },
+    {
+      "symbol": "NVDA",
+      "strategy": "iron_condor",
+      "signal_date": "2026-08-24",
+      "fill_date": "2026-08-25",
+      "qty": 3,
+      "legs": [
+        {
+          "symbol": "NVDA260918P00195000",
+          "side": "sell",
+          "ratio": 1,
+          "strike": 195.0,
+          "expiry": "2026-09-18",
+          "option_type": "put",
+          "entry_price": 3.267,
+          "delta": -0.25340520405582323
+        },
+        {
+          "symbol": "NVDA260918P00185000",
+          "side": "buy",
+          "ratio": 1,
+          "strike": 185.0,
+          "expiry": "2026-09-18",
+          "option_type": "put",
+          "entry_price": 1.6463,
+          "delta": null
+        },
+        {
+          "symbol": "NVDA260918C00227500",
+          "side": "sell",
+          "ratio": 1,
+          "strike": 227.5,
+          "expiry": "2026-09-18",
+          "option_type": "call",
+          "entry_price": 3.5145,
+          "delta": 0.23462441926436073
+        },
+        {
+          "symbol": "NVDA260918C00237500",
+          "side": "buy",
+          "ratio": 1,
+          "strike": 237.5,
+          "expiry": "2026-09-18",
+          "option_type": "call",
+          "entry_price": 2.0301,
+          "delta": null
+        }
+      ],
+      "entry_value": -3.1051,
+      "max_loss": 1995.75,
+      "thesis_conviction": 0.7,
+      "mark_value": -2.31,
+      "pnl": 238.53,
+      "mark_note": ""
+    }
+  ]
+}

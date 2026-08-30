@@ -1,0 +1,70 @@
+{
+  "run": "2026-08-30_universe_agent-replay_1Day",
+  "period": {
+    "signal_days": [
+      "2026-08-24",
+      "2026-08-25",
+      "2026-08-26",
+      "2026-08-27",
+      "2026-08-28"
+    ],
+    "fill_days": [
+      "2026-08-25",
+      "2026-08-26",
+      "2026-08-27",
+      "2026-08-28"
+    ],
+    "mark_date": "2026-08-28"
+  },
+  "config": {
+    "spread_pct": 0.02,
+    "conviction": 0.7,
+    "starting_equity": 100000.0,
+    "fill_model": "next_open",
+    "universe": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "AAPL",
+      "MSFT",
+      "NVDA",
+      "AMD",
+      "TSLA",
+      "META",
+      "GOOGL"
+    ]
+  },
+  "strategy": {
+    "total_return": 0.019925799999999994,
+    "max_drawdown": -0.0012223046146073724,
+    "final_equity": 101992.58,
+    "daily_sharpe_annualised": 11.300673976146994,
+    "n_daily_obs": 4
+  },
+  "benchmark": {
+    "name": "SPY buy-and-hold",
+    "total_return": 0.004163600000000045,
+    "max_drawdown": -0.0022694671566143576,
+    "final_equity": 100416.36,
+    "daily_sharpe_annualised": 4.336533880834005,
+    "n_daily_obs": 4
+  },
+  "trades": {
+    "decisions_evaluated": 50,
+    "filled": 5,
+    "wins": 3,
+    "win_rate": 0.6,
+    "gross_profit": 2809.44,
+    "gross_loss": 816.86,
+    "profit_factor": 3.439,
+    "total_pnl": 1992.58
+  },
+  "blocking_reasons": {
+    "max_concurrent_positions": 35,
+    "max_positions_per_underlying": 18,
+    "low_open_interest": 5,
+    "no_strike_within_increment": 2,
+    "zero_quantity": 2
+  },
+  "fees_modelled": 0.0
+}
