@@ -21,12 +21,38 @@ from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from options_m.db import Database
+from options_m.evidence.occ import parse_occ_symbol
 from options_m.volatility import iv_rank
 
 logger = logging.getLogger(__name__)
 
 # Enough history for the dashboard without letting a long run eat the heap.
 _MEMORY_LIMIT = 2_000
+
+# A proposal in one of these states stands for a position that
+# get_all_positions cannot show yet: pending execution, dry-run approved, or
+# submitted as a working order that has not filled. Candidate selection and
+# the portfolio snapshot both count these alongside filled positions so the
+# same symbol is not re-proposed while its first order is still resting.
+_ACTIVE_PROPOSAL_STATUSES = ("pending", "dry_run_approved", "submitted")
+
+# Order statuses that will not change on their own — the broker has finished
+# with the order (``filled`` / ``canceled`` / ``rejected`` / …) or submission
+# never reached it (``failed``). Anything else is still in flight. Compared
+# case-insensitively so a broker "CANCELED" and our lowercase spelling match.
+# Kept aligned with execution._TERMINAL_BROKER_STATES.
+_SETTLED_ORDER_STATES = frozenset(
+    {
+        "filled",
+        "canceled",
+        "cancelled",
+        "expired",
+        "rejected",
+        "replaced",
+        "done_for_day",
+        "failed",
+    }
+)
 
 # The exchange's own calendar is expressed in its local time; every
 # open/close boundary check must happen in this zone, never in UTC directly,
@@ -318,6 +344,29 @@ class Store:
             return False
         return bool(rows[0]["engaged"])
 
+    async def kill_switch_status(self) -> dict[str, Any]:
+        """Engaged flag plus *why* and *when*, for the admin surface.
+
+        ``is_kill_switch_engaged`` answers the only question the agents need and
+        is deliberately kept to a bool. An operator looking at a halted system
+        needs the other two columns as well — a halt with no reason and no
+        timestamp is indistinguishable from one nobody remembers engaging.
+        """
+        if not self._db.is_enabled:
+            engaged, reason = self._memory_kill_switch
+            return {"engaged": engaged, "reason": reason, "updated_at": None}
+        rows = await self._fetch(
+            "SELECT engaged, reason, updated_at FROM kill_switch WHERE id = 1", ()
+        )
+        if not rows:
+            return {"engaged": False, "reason": None, "updated_at": None}
+        row = rows[0]
+        return {
+            "engaged": bool(row["engaged"]),
+            "reason": row["reason"],
+            "updated_at": row["updated_at"],
+        }
+
     async def set_kill_switch(self, engaged: bool, reason: str | None = None) -> None:
         if not self._db.is_enabled:
             self._memory_kill_switch = (engaged, reason)
@@ -392,6 +441,58 @@ class Store:
             "FROM proposals ORDER BY ts DESC LIMIT %s",
             (limit,),
         )
+
+    async def proposals_since(self, since: datetime) -> list[dict[str, Any]]:
+        """``underlying``/``ts``/``status`` of every proposal at or after ``since``.
+
+        Newest first. StrategistAgent's per-symbol cooldown and its per-day
+        proposal caps both key on this — they must see proposals of every
+        status, not just ``pending``, or a re-proposed name that was rejected
+        or dry-run-approved last tick would not be counted.
+        """
+        if not self._db.is_enabled:
+            rows = [
+                {"underlying": row["underlying"], "ts": row["ts"], "status": row["status"]}
+                for row in self._memory_proposals.values()
+                if isinstance(row["ts"], datetime) and row["ts"] >= since
+            ]
+            rows.sort(key=lambda row: row["ts"], reverse=True)
+            return rows
+        return await self._fetch(
+            "SELECT underlying, ts, status FROM proposals WHERE ts >= %s ORDER BY ts DESC",
+            (since,),
+        )
+
+    async def active_proposal_underlyings(
+        self, *, exclude_proposal_id: int | None = None
+    ) -> set[str]:
+        """Uppercased underlyings that currently hold a position slot.
+
+        A proposal that is ``pending``, ``dry_run_approved`` or ``submitted``
+        stands for an intended or resting position ``get_all_positions`` does
+        not show yet. Counting these stops the same symbol being re-proposed
+        and re-submitted while its first order rests unfilled. ``exclude_proposal_id``
+        drops the proposal currently being executed so it does not block itself.
+        """
+        if not self._db.is_enabled:
+            return {
+                str(row["underlying"]).upper()
+                for row in self._memory_proposals.values()
+                if row["status"] in _ACTIVE_PROPOSAL_STATUSES
+                and row["id"] != exclude_proposal_id
+            }
+        if exclude_proposal_id is None:
+            rows = await self._fetch(
+                "SELECT DISTINCT underlying FROM proposals WHERE status = ANY(%s)",
+                (list(_ACTIVE_PROPOSAL_STATUSES),),
+            )
+        else:
+            rows = await self._fetch(
+                "SELECT DISTINCT underlying FROM proposals "
+                "WHERE status = ANY(%s) AND id <> %s",
+                (list(_ACTIVE_PROPOSAL_STATUSES), exclude_proposal_id),
+            )
+        return {str(row["underlying"]).upper() for row in rows}
 
     async def get_proposal(self, proposal_id: int) -> dict[str, Any] | None:
         if not self._db.is_enabled:
@@ -578,15 +679,52 @@ class Store:
         )
 
     async def orders_in_flight(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Orders not yet in a settled state — ExecutionAgent's reconcile work list.
+
+        A denylist, not ``status = 'submitted'``: the first reconcile tick
+        overwrites the local ``submitted`` with whatever the broker returns
+        (``accepted``, ``new``, ``partially_filled`` …), so matching only
+        ``submitted`` would drop those rows from reconcile forever and an order
+        that was not ``filled`` on its first poll would never have its fill or
+        its rejection recorded.
+        """
         if not self._db.is_enabled:
-            rows = [row for row in self._memory_orders.values() if row["status"] == "submitted"]
+            rows = [
+                row
+                for row in self._memory_orders.values()
+                if str(row["status"]).lower() not in _SETTLED_ORDER_STATES
+            ]
+            rows.sort(key=lambda row: row["submitted_at"])
             return rows[:limit]
         return await self._fetch(
             "SELECT id, proposal_id, client_order_id, submitted_at, status, request, "
             "response, filled_qty, filled_avg_price, error FROM orders "
-            "WHERE status = 'submitted' ORDER BY submitted_at ASC LIMIT %s",
-            (limit,),
+            "WHERE lower(status) <> ALL(%s) ORDER BY submitted_at ASC LIMIT %s",
+            (list(_SETTLED_ORDER_STATES), limit),
         )
+
+    async def working_order_underlyings(self) -> set[str]:
+        """Uppercased OCC underlyings of every order still working at the broker.
+
+        A submitted-but-unfilled limit order is not a position, so a portfolio
+        snapshot built from ``get_all_positions`` alone misses it. Each leg's
+        symbol is parsed from the stored order request; a leg that will not
+        parse as OCC is skipped rather than guessed at.
+        """
+        roots: set[str] = set()
+        for order in await self.orders_in_flight():
+            request = order.get("request") or {}
+            symbols: list[str] = []
+            if isinstance(request.get("symbol"), str):
+                symbols.append(request["symbol"])
+            for leg in request.get("legs") or []:
+                if isinstance(leg, dict) and isinstance(leg.get("symbol"), str):
+                    symbols.append(leg["symbol"])
+            for symbol in symbols:
+                occ = parse_occ_symbol(symbol)
+                if occ is not None:
+                    roots.add(occ.underlying.upper())
+        return roots
 
     # ---- Risk events -------------------------------------------------------
 
