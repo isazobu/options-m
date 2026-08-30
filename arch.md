@@ -494,9 +494,15 @@ src/options_m/
 │   ├── evidence.py          EvidenceCollector — sembol başına pack oluşturur
 │   └── occ.py               OCC opsiyonu sembol parser'ı
 │
-├── prompts/
-│   ├── loader.py            Path-escape korumalı template yükleyici
-│   └── strategist.md        StrategistAgent LLM prompt şablonu
+├── prompts/                 Modele giden her prompt burada
+│   ├── loader.py            TOML frontmatter + string.Template, path-escape korumalı
+│   ├── strategist.md        StrategistAgent rejim okuması (system + user)
+│   ├── reflection_trade_lesson.md      ReflectionAgent A geçişi — kapanan işlemler
+│   ├── reflection_proposal_lesson.md   ReflectionAgent B geçişi — held / rejected
+│   ├── chat_system.md       Salt-okunur dashboard sohbeti
+│   ├── llm_json_schema_suffix.md       complete_json'un eklediği şema sarmalayıcı
+│   ├── llm_json_repair.md   Bozuk yanıttan sonraki tek onarım turu
+│   └── external_text_fence.md          Paylaşılan untrusted-text çiti (fragment)
 │
 ├── matrix.py                Deterministik Strateji Matrisi + earnings gate
 ├── llm.py                   FeatherlessLlm — chat_completion + complete_json

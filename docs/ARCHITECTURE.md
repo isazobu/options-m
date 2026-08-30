@@ -386,6 +386,58 @@ Exhausted → StrategistAgent skips (PositionManagerAgent is never halted).
 
 ---
 
+## Prompt Files
+
+Every prompt this system sends a model lives in `src/options_m/prompts/` as a
+`<name>.md` file. Nothing that reaches a model is written in Python.
+
+```
++++
+temperature = 0.3
+max_tokens = 120
+variables = ["underlying", "status_phrase"]
+includes  = ["external_text_fence"]
++++
+
+=== system ===
+You are a trading post-mortem analyst...
+
+=== user ===
+Underlying: $underlying
+```
+
+- **TOML frontmatter**, `+++` delimited, parsed with stdlib `tomllib` — no new
+  dependency. An unrecognised key is an error, so a typo'd `temprature` cannot
+  silently leave the temperature unset. `model` is deliberately *not* a key:
+  a prompt ships inside the wheel and `config.py` forbids a model id in source,
+  so the model stays a property of the `FeatherlessLlm` instance the caller holds.
+- **One file per LLM call, not per message.** `max_tokens`, `temperature` and the
+  variable contract belong to the call; splitting a prompt across two files
+  duplicates them and lets the halves drift — which is exactly how the strategist
+  system prompt ended up hand-copied into two Python modules.
+- **`$var` via `string.Template`**, not `str.format_map`. These prompts are full
+  of JSON and doubling every literal brace was a standing hazard. Substituted
+  *values* are never rescanned, so a pack full of `$` is safe.
+- **Exact variable-set equality.** Supplying an extra keyword, or omitting a
+  declared one, raises `PromptError`. A missing variable must never render as the
+  literal text `$evidence_json`: the model answers that prompt anyway, and the
+  matrix turns the answer into a proposal.
+- **`includes` are loader-supplied, never caller-supplied.** `external_text_fence.md`
+  is the untrusted-text warning shared by the strategist prompt (ahead of the
+  evidence pack, which carries `untrusted_news`) and by `chat.py`'s news tool
+  result. A fence a caller could pass is not a fence.
+- Templates are cached and re-read on mtime change, so a prompt can be edited
+  without a restart — in a local, editable or bind-mounted checkout. The Docker
+  image installs into a root-owned venv and runs as `app`, so the shipped copies
+  are read-only there.
+
+`tests/test_prompts.py` walks the directory rather than a hardcoded list: every
+file must parse, declare exactly the placeholders its body uses, and — if it takes
+`$evidence_json` — state the fence ahead of the pack. A prompt added later
+inherits those rules without anyone remembering to opt in.
+
+---
+
 ## Safety Layers
 
 | Layer | Where | What it stops |
@@ -440,9 +492,15 @@ src/options_m/
 │   ├── evidence.py          EvidenceCollector (assembles the per-symbol pack)
 │   └── occ.py               OCC option-symbol parser
 │
-├── prompts/
-│   ├── loader.py            path-escape-guarded template loader
-│   └── strategist.md        StrategistAgent LLM prompt template
+├── prompts/                 every prompt this system sends a model
+│   ├── loader.py            TOML frontmatter + string.Template, path-escape guarded
+│   ├── strategist.md        StrategistAgent regime read (system + user)
+│   ├── reflection_trade_lesson.md      ReflectionAgent pass A — closed trades
+│   ├── reflection_proposal_lesson.md   ReflectionAgent pass B — held / rejected
+│   ├── chat_system.md       read-only dashboard chat
+│   ├── llm_json_schema_suffix.md       schema wrapper complete_json appends
+│   ├── llm_json_repair.md   the one repair turn after a malformed reply
+│   └── external_text_fence.md          shared untrusted-text fence (fragment)
 │
 ├── matrix.py                deterministic Strategy Matrix + earnings gate
 ├── llm.py                   FeatherlessLlm (chat_completion + complete_json)
