@@ -10,16 +10,50 @@ from __future__ import annotations
 
 from datetime import date
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
-from options_m.agents.execution import ExecutionAgent, _group_into_structures
+from options_m.agents.execution import (
+    ExecutionAgent,
+    _group_into_structures,
+    build_portfolio_snapshot,
+)
 from options_m.config import Settings
 from options_m.db import Database
+from options_m.models import Rejection
 from options_m.store import Store
 
 
 def _position(symbol: str) -> dict[str, Any]:
     return {"symbol": symbol, "asset_class": "us_option"}
+
+
+def _store() -> Store:
+    return Store(Database(Settings(database_url=None)))
+
+
+class _SnapshotMcp:
+    """The two reads build_portfolio_snapshot makes."""
+
+    def __init__(self, positions: list[dict[str, Any]] | None = None) -> None:
+        self._positions = positions or []
+
+    async def get_clock(self) -> dict[str, Any]:
+        return {"next_close": None}
+
+    async def get_all_positions(self) -> list[dict[str, Any]]:
+        return list(self._positions)
+
+
+async def _snapshot(store: Store, mcp: Any, underlying: str = "SPY", **kwargs: Any) -> Any:
+    return await build_portfolio_snapshot(
+        underlying,
+        kwargs.pop("client_order_id", "om-new"),
+        {"equity": "100000", "last_equity": "100000"},
+        mcp=mcp,
+        store=store,
+        settings=Settings(database_url=None),
+        **kwargs,
+    )
 
 
 def test_the_four_legs_of_one_condor_count_as_one_structure() -> None:
@@ -74,12 +108,26 @@ def test_no_positions_is_no_structures() -> None:
 # Reconcile: broker rejection feedback
 # ---------------------------------------------------------------------------
 
-def _make_agent() -> tuple[ExecutionAgent, MagicMock, Store]:
-    settings = Settings(database_url=None)  # type: ignore[call-arg]
+class _Collector:
+    """A notifier that records what the agent would have sent to Telegram."""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def notify(self, text: str) -> None:
+        self.messages.append(text)
+
+
+def _make_agent(
+    notifier: _Collector | None = None, **overrides: Any
+) -> tuple[ExecutionAgent, MagicMock, Store]:
+    settings = Settings(database_url=None, **overrides)  # type: ignore[call-arg]
     store = Store(Database(settings))
     mcp = MagicMock()
     risk = MagicMock()
-    agent = ExecutionAgent(settings=settings, mcp=mcp, store=store, risk_engine=risk)
+    agent = ExecutionAgent(
+        settings=settings, mcp=mcp, store=store, risk_engine=risk, notifier=notifier
+    )
     return agent, mcp, store
 
 
@@ -142,3 +190,130 @@ async def test_reconcile_filled_order_does_not_trigger_broker_rejected() -> None
 
     proposals = await store.recent_proposals(limit=5)
     assert proposals[0]["status"] == "submitted"
+
+
+async def test_reconcile_still_polls_an_order_that_was_only_accepted_on_the_first_tick() -> None:
+    """Regression: with orders_in_flight matching only 'submitted', an order
+    reported 'accepted' on tick one dropped out of reconcile and never had its
+    later rejection recorded."""
+    agent, mcp, store = _make_agent()
+    proposal_id = await store.save_proposal(
+        underlying="SPY", intent={"action": "open"}, evidence={}, status="submitted"
+    )
+    await store.record_order(
+        proposal_id=proposal_id, client_order_id="om-acc", status="submitted", request={}
+    )
+    mcp.get_order_by_client_id = AsyncMock(
+        side_effect=[
+            {"status": "accepted", "filled_qty": "0"},
+            {"status": "rejected", "reason": "insufficient_buying_power", "filled_qty": "0"},
+        ]
+    )
+
+    await agent._reconcile({"reconciled": 0, "broker_rejected": 0})
+    assert (await store.get_proposal(proposal_id))["status"] == "submitted"
+
+    detail: dict[str, Any] = {"reconciled": 0, "broker_rejected": 0}
+    await agent._reconcile(detail)
+    assert (await store.get_proposal(proposal_id))["status"] == "broker_rejected"
+    assert detail["broker_rejected"] == 1
+
+
+# ---------------------------------------------------------------------------
+# H1: proposals gated on working orders / in-flight proposals, not just fills
+# ---------------------------------------------------------------------------
+
+
+async def test_snapshot_counts_a_resting_order_as_a_position_in_the_underlying() -> None:
+    store = _store()
+    await store.record_order(
+        proposal_id=1,
+        client_order_id="om-1",
+        status="submitted",
+        request={"symbol": "SPY250620P00500000", "qty": "1"},
+    )
+
+    snapshot = await _snapshot(store, _SnapshotMcp())
+
+    assert snapshot.positions_in_underlying == 1
+    assert snapshot.concurrent_option_positions == 1
+
+
+async def test_snapshot_counts_an_active_proposal_but_excludes_the_current_one() -> None:
+    store = _store()
+    other = await store.save_proposal(underlying="QQQ", intent={}, evidence={})
+    await store.update_proposal_status(other, "dry_run_approved")
+    mine = await store.save_proposal(underlying="SPY", intent={}, evidence={})
+
+    snapshot = await _snapshot(store, _SnapshotMcp(), exclude_proposal_id=mine)
+
+    # QQQ's approved proposal counts toward the concurrent cap; SPY's own
+    # pending proposal is excluded so it does not block itself.
+    assert snapshot.concurrent_option_positions == 1
+    assert snapshot.positions_in_underlying == 0
+
+
+async def test_snapshot_does_not_double_count_a_proposal_that_already_filled() -> None:
+    store = _store()
+    filled = await store.save_proposal(underlying="SPY", intent={}, evidence={})
+    await store.update_proposal_status(filled, "submitted")
+
+    snapshot = await _snapshot(
+        store, _SnapshotMcp(positions=[_position("SPY250620P00500000")])
+    )
+
+    assert snapshot.positions_in_underlying == 1
+    assert snapshot.concurrent_option_positions == 1
+
+
+# ---------------------------------------------------------------------------
+# Telegram notifications
+# ---------------------------------------------------------------------------
+
+
+async def test_a_broker_rejection_is_announced() -> None:
+    collector = _Collector()
+    agent, _, store = _make_agent(collector)
+    proposal_id = await store.save_proposal(
+        underlying="SPY", intent={"action": "open"}, evidence={}, status="submitted"
+    )
+    await agent._mark_broker_rejected(
+        proposal_id, "om-1", {"symbol": "SPY", "reason": "no buying power"}, "rejected", {}
+    )
+    assert len(collector.messages) == 1
+    assert "no buying power" in collector.messages[0]
+    assert "SPY" in collector.messages[0]
+
+
+async def test_a_risk_rejection_is_announced_with_its_underlying() -> None:
+    collector = _Collector()
+    agent, _, store = _make_agent(collector)
+    proposal_id = await store.save_proposal(
+        underlying="NVDA", intent={"action": "open"}, evidence={}, status="pending"
+    )
+    await agent._reject(
+        proposal_id, Rejection(proposal_id=proposal_id, reason="no_spot_price"), "NVDA"
+    )
+    assert "no\\_spot\\_price" in collector.messages[0]
+    assert "NVDA" in collector.messages[0]
+
+
+async def test_notifications_can_be_switched_off() -> None:
+    collector = _Collector()
+    agent, _, store = _make_agent(collector, telegram_notify_orders=False)
+    proposal_id = await store.save_proposal(
+        underlying="SPY", intent={"action": "open"}, evidence={}, status="pending"
+    )
+    await agent._reject(proposal_id, Rejection(proposal_id=proposal_id, reason="x"), "SPY")
+    assert collector.messages == []
+
+
+async def test_the_agent_works_without_a_notifier() -> None:
+    """The default is a null notifier, so no call site needs to guard."""
+    agent, _, store = _make_agent()
+    proposal_id = await store.save_proposal(
+        underlying="SPY", intent={"action": "open"}, evidence={}, status="pending"
+    )
+    await agent._reject(proposal_id, Rejection(proposal_id=proposal_id, reason="x"), "SPY")
+    row = await store.get_proposal(proposal_id)
+    assert row is not None and row["status"] == "rejected"

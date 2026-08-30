@@ -11,6 +11,11 @@ Order submission never fabricates a fill. A duplicate ``client_order_id`` is
 reconciled as a success — Alpaca's own recovery path — never retried as a
 failure; anything else that fails is written down as ``failed`` with the real
 error text, and dry run never even attempts the call.
+
+Reconciliation polls every still-open order each tick. When the broker
+rejects, cancels or expires an order it had accepted, the proposal is marked
+``broker_rejected`` with a ``broker_rejected`` risk event, so the underlying
+is not left blocked by a dead order.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from options_m.config import Settings
 from options_m.evidence.occ import parse_occ_symbol
 from options_m.mcp_client import AlpacaMcp, finite_float
 from options_m.models import OrderPlan, Rejection, StrategyIntent
+from options_m.notify import Notifier, NullNotifier, format_order
 from options_m.risk import PortfolioSnapshot, RiskEngine, RiskVerdict
 from options_m.store import Store
 
@@ -39,6 +45,34 @@ _PENDING_BATCH_SIZE = 5
 # Wider than evidence.py's 0.15 because the builder has to reach a target
 # delta and may need strikes further out than an ATM IV read ever does.
 _STRIKE_BAND = 0.25
+
+# Broker order states that will not progress on their own and did not open a
+# position — the broker finished with an order it had accepted without filling
+# it. Reconcile releases the proposal (``broker_rejected``) rather than leaving
+# it ``submitted`` and blocking its underlying forever. Compared
+# case-insensitively; aligned with store._SETTLED_ORDER_STATES minus ``filled``
+# and ``failed`` (a fill opened a position; ``failed`` never reaches the broker).
+_TERMINAL_UNFILLED_STATES = frozenset(
+    {"canceled", "cancelled", "expired", "rejected", "replaced", "done_for_day"}
+)
+# Keys an Alpaca order object may carry an explanation under. None is standard,
+# so this is best-effort — the status string is the fallback.
+_BROKER_REASON_KEYS = ("reason", "reject_reason", "rejected_reason", "cancel_reason")
+
+
+def _broker_reason(broker_order: dict[str, Any]) -> str | None:
+    for key in _BROKER_REASON_KEYS:
+        value = broker_order.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _is_terminal_unfilled(status: str, filled_qty: float | None) -> bool:
+    """True when the broker is done with an order that never opened a position."""
+    if filled_qty is not None and filled_qty > 0:
+        return False
+    return status.strip().lower() in _TERMINAL_UNFILLED_STATES
 
 
 def _looks_like_duplicate(message: str) -> bool:
@@ -197,6 +231,7 @@ async def build_portfolio_snapshot(
     mcp: AlpacaMcp,
     store: Store,
     settings: Settings,
+    exclude_proposal_id: int | None = None,
 ) -> PortfolioSnapshot:
     """Shared by :class:`ExecutionAgent` and ``cli.py``'s ``plan`` command."""
     clock = await mcp.get_clock()
@@ -209,15 +244,34 @@ async def build_portfolio_snapshot(
     ]
 
     structures = _group_into_structures(option_positions)
+    underlyings_with_position = {root for root, _expiry in structures}
 
+    # A resting limit order and an approved-but-unsubmitted proposal each hold
+    # a position slot that get_all_positions cannot see yet. Counting only
+    # filled positions here lets the same symbol be re-proposed and
+    # re-submitted while its first order is still working, beating
+    # MAX_POSITIONS_PER_UNDERLYING and the concurrent cap in practice. An
+    # unfilled om-<id> order must occupy the slot exactly as a filled one does.
+    slot_holders = await store.working_order_underlyings()
+    slot_holders |= await store.active_proposal_underlyings(
+        exclude_proposal_id=exclude_proposal_id
+    )
+    # Drop anything already counted as a filled position so a proposal that has
+    # since filled is not double-counted against the caps.
+    slot_holders -= underlyings_with_position
+
+    target = underlying.upper()
     return PortfolioSnapshot(
         equity=finite_float(account.get("equity")),
         # last_equity is Alpaca's own "equity as of previous close" field —
         # exactly the daily-loss baseline, with no timezone-boundary guessing.
         start_of_day_equity=finite_float(account.get("last_equity")),
         high_water_mark=max(finite_equities) if finite_equities else None,
-        concurrent_option_positions=len(structures),
-        positions_in_underlying=sum(1 for root, _expiry in structures if root == underlying),
+        concurrent_option_positions=len(structures) + len(slot_holders),
+        positions_in_underlying=(
+            sum(1 for root, _expiry in structures if root == target)
+            + (1 if target in slot_holders else 0)
+        ),
         total_open_option_premium=sum(
             abs(finite_float(p.get("market_value")) or 0.0) for p in option_positions
         ),
@@ -237,12 +291,60 @@ class ExecutionAgent:
     """Picks up pending proposals, builds a plan, risk-gates it, submits it."""
 
     def __init__(
-        self, settings: Settings, mcp: AlpacaMcp, store: Store, risk_engine: RiskEngine
+        self,
+        settings: Settings,
+        mcp: AlpacaMcp,
+        store: Store,
+        risk_engine: RiskEngine,
+        notifier: Notifier | None = None,
     ) -> None:
         self._settings = settings
         self._mcp = mcp
         self._store = store
         self._risk = risk_engine
+        self._notifier = notifier or NullNotifier()
+
+    def _announce(self, **fields: Any) -> None:
+        """Push one terminal order event to Telegram. Never raises, never blocks."""
+        if not self._settings.telegram_notify_orders:
+            return
+        self._notifier.notify(format_order(dry_run=self._settings.dry_run, **fields))
+
+    def _announce_plan(self, plan: OrderPlan, status: str, *, error: str | None = None) -> None:
+        """Announce an entry order, described by the plan that produced it."""
+        self._announce(
+            action="open",
+            underlying=plan.underlying,
+            status=status,
+            legs=[f"{leg.side} {leg.symbol}" for leg in plan.legs],
+            qty=plan.qty,
+            limit_price=plan.limit_price,
+            client_order_id=plan.client_order_id,
+            error=error,
+        )
+
+    def _announce_close(
+        self,
+        underlying: str,
+        legs: list[dict[str, Any]],
+        qty: int,
+        limit_price: str,
+        client_order_id: str,
+        status: str,
+        *,
+        error: str | None = None,
+    ) -> None:
+        """Announce an exit order. Closes have no OrderPlan — legs come from the cache."""
+        self._announce(
+            action="close",
+            underlying=underlying,
+            status=status,
+            legs=[f"{leg.get('side', '?')} {leg.get('symbol', '?')}" for leg in legs],
+            qty=qty,
+            limit_price=limit_price,
+            client_order_id=client_order_id,
+            error=error,
+        )
 
     @property
     def name(self) -> str:
@@ -320,6 +422,35 @@ class ExecutionAgent:
             await self._store.update_proposal_status(proposal_id, status)
             return
 
+        # Another proposal for this underlying is already pending, dry-run
+        # approved, or resting as a working order. The risk gate's idempotency
+        # check is exact-client_order_id only, so a fresh proposal_id slips past
+        # it — reject here before spending any broker calls on a plan that must
+        # not be placed.
+        active_underlyings = await self._store.active_proposal_underlyings(
+            exclude_proposal_id=proposal_id
+        )
+        if intent.underlying.upper() in active_underlyings:
+            await self._store.update_proposal_status(
+                proposal_id,
+                "rejected",
+                error="another proposal for this underlying is already in flight",
+            )
+            await self._store.record_risk_event(
+                proposal_id=proposal_id,
+                rule="duplicate_underlying_in_flight",
+                detail={"underlying": intent.underlying.upper()},
+            )
+            detail["rejected"] += 1
+            self._announce(
+                action="open",
+                underlying=intent.underlying.upper(),
+                status="rejected",
+                client_order_id=f"om-{proposal_id}",
+                error="another proposal for this underlying is already in flight",
+            )
+            return
+
         # From here on every broker read is strict: a failure must reach the
         # supervisor, not be swallowed as "this proposal has no plan".
         account = await self._mcp.get_account_info()
@@ -327,7 +458,7 @@ class ExecutionAgent:
         spot = _spot_from_snapshot(snapshot)
         if spot is None:
             rejection = Rejection(proposal_id=proposal_id, reason="no_spot_price")
-            await self._reject(proposal_id, rejection)
+            await self._reject(proposal_id, rejection, intent.underlying)
             detail["rejected"] += 1
             return
 
@@ -345,7 +476,7 @@ class ExecutionAgent:
             spot=spot,
         )
         if isinstance(result, Rejection):
-            await self._reject(proposal_id, result)
+            await self._reject(proposal_id, result, intent.underlying)
             detail["rejected"] += 1
             return
         plan = result
@@ -357,6 +488,7 @@ class ExecutionAgent:
             mcp=self._mcp,
             store=self._store,
             settings=self._settings,
+            exclude_proposal_id=proposal_id,
         )
         verdict = self._risk.evaluate(plan, portfolio)
         if not verdict.approved:
@@ -372,6 +504,7 @@ class ExecutionAgent:
                 error="; ".join(verdict.reasons),
             )
             detail["rejected"] += 1
+            self._announce_plan(plan, "rejected", error="; ".join(verdict.reasons))
             return
 
         if self._settings.dry_run:
@@ -381,6 +514,7 @@ class ExecutionAgent:
                 plan=plan.model_dump(mode="json"),
                 verdict=verdict.model_dump(),
             )
+            self._announce_plan(plan, "dry_run_approved")
             return
 
         await self._submit(proposal_id, plan, verdict, detail)
@@ -438,6 +572,10 @@ class ExecutionAgent:
             await self._store.update_proposal_status(
                 proposal_id, "dry_run_approved", plan=close_request
             )
+            self._announce_close(
+                intent.underlying, closing_legs, struct_qty, limit_price,
+                client_order_id, "dry_run_approved",
+            )
             return
 
         if len(closing_legs) == 1:
@@ -471,6 +609,10 @@ class ExecutionAgent:
             )
             await self._store.update_proposal_status(proposal_id, "failed", error=str(exc))
             detail["failed"] += 1
+            self._announce_close(
+                intent.underlying, closing_legs, struct_qty, limit_price,
+                client_order_id, "failed", error=f"{type(exc).__name__}: {exc}",
+            )
             return
 
         if isinstance(response, dict) and "error" in response:
@@ -485,6 +627,10 @@ class ExecutionAgent:
             )
             await self._store.update_proposal_status(proposal_id, "failed", error=error_text)
             detail["failed"] += 1
+            self._announce_close(
+                intent.underlying, closing_legs, struct_qty, limit_price,
+                client_order_id, "failed", error=error_text,
+            )
             return
 
         await self._store.record_order(
@@ -500,13 +646,24 @@ class ExecutionAgent:
             "execution: close submitted",
             extra={"underlying": intent.underlying, "client_order_id": client_order_id},
         )
+        self._announce_close(
+            intent.underlying, closing_legs, struct_qty, limit_price,
+            client_order_id, "close_submitted",
+        )
 
-    async def _reject(self, proposal_id: int, rejection: Rejection) -> None:
+    async def _reject(self, proposal_id: int, rejection: Rejection, underlying: str = "") -> None:
         await self._store.update_proposal_status(proposal_id, "rejected", error=rejection.reason)
         await self._store.record_risk_event(
             proposal_id=proposal_id,
             rule=f"strategy:{rejection.reason}",
             detail=rejection.detail,
+        )
+        self._announce(
+            action="open",
+            underlying=underlying or "?",
+            status="rejected",
+            client_order_id=f"om-{proposal_id}",
+            error=rejection.reason,
         )
 
     async def _submit(
@@ -528,6 +685,7 @@ class ExecutionAgent:
             )
             await self._store.update_proposal_status(proposal_id, "failed", error=str(exc))
             detail["failed"] += 1
+            self._announce_plan(plan, "failed", error=f"{type(exc).__name__}: {exc}")
             return
 
         if isinstance(response, dict) and "error" in response:
@@ -545,6 +703,7 @@ class ExecutionAgent:
             )
             await self._store.update_proposal_status(proposal_id, "failed", error=error_text)
             detail["failed"] += 1
+            self._announce_plan(plan, "failed", error=error_text)
             return
 
         await self._store.record_order(
@@ -561,6 +720,7 @@ class ExecutionAgent:
             verdict=verdict.model_dump(),
         )
         detail["submitted"] += 1
+        self._announce_plan(plan, "submitted")
 
     async def _reconcile_duplicate(
         self, proposal_id: int, plan: OrderPlan, request: dict[str, Any], detail: dict[str, Any]
@@ -591,6 +751,14 @@ class ExecutionAgent:
             request=request,
             response=broker_order,
         )
+        if _is_terminal_unfilled(status, finite_float(broker_order.get("filled_qty"))):
+            # The pre-existing order is already dead: release the proposal now
+            # rather than parking it in ``submitted`` where reconcile — which
+            # only polls non-terminal orders — would never revisit it.
+            await self._mark_broker_rejected(
+                proposal_id, plan.client_order_id, broker_order, status, detail
+            )
+            return
         await self._store.update_proposal_status(proposal_id, "submitted")
         detail["submitted"] += 1
 
@@ -609,35 +777,71 @@ class ExecutionAgent:
             if broker_order is None:
                 continue
             new_status = str(broker_order.get("status", order["status"]))
+            filled_qty = finite_float(broker_order.get("filled_qty"))
             await self._store.update_order_status(
                 client_order_id,
                 status=new_status,
                 response=broker_order,
-                filled_qty=finite_float(broker_order.get("filled_qty")),
+                filled_qty=filled_qty,
                 filled_avg_price=finite_float(broker_order.get("filled_avg_price")),
             )
             detail["reconciled"] += 1
 
-            if new_status in ("rejected", "canceled", "expired"):
-                proposal_id = order.get("proposal_id")
-                if proposal_id is not None:
-                    reason = str(broker_order.get("reason") or new_status)
-                    await self._store.update_proposal_status(
-                        int(proposal_id),
-                        "broker_rejected",
-                        error=reason,
-                    )
-                    await self._store.record_risk_event(
-                        proposal_id=int(proposal_id),
-                        rule="broker_rejected",
-                        detail={"order_status": new_status, "reason": reason},
-                    )
-                    logger.warning(
-                        "execution: order broker-rejected",
-                        extra={
-                            "client_order_id": client_order_id,
-                            "proposal_id": proposal_id,
-                            "reason": reason,
-                        },
-                    )
-                    detail["broker_rejected"] += 1
+            # orders_in_flight only ever returns non-terminal orders, so a
+            # status that is now terminal is a first-and-only observation of it.
+            if new_status.lower() in ("filled", "partially_filled"):
+                self._announce(
+                    action="close" if client_order_id.startswith("omc-") else "open",
+                    underlying=str(broker_order.get("symbol") or "?"),
+                    status=new_status.lower(),
+                    qty=int(filled_qty) if filled_qty is not None else None,
+                    limit_price=finite_float(broker_order.get("filled_avg_price")),
+                    client_order_id=client_order_id,
+                )
+
+            proposal_id = order.get("proposal_id")
+            if proposal_id is not None and _is_terminal_unfilled(new_status, filled_qty):
+                await self._mark_broker_rejected(
+                    int(proposal_id), client_order_id, broker_order, new_status, detail
+                )
+
+    async def _mark_broker_rejected(
+        self,
+        proposal_id: int,
+        client_order_id: str,
+        broker_order: dict[str, Any],
+        order_status: str,
+        detail: dict[str, Any],
+    ) -> None:
+        """The broker rejected / canceled / expired an order it had accepted.
+
+        Without this the proposal stays ``submitted`` after the broker is done
+        with its order, so ``active_proposal_underlyings`` — and therefore the
+        candidate gate and the portfolio snapshot — keep the underlying blocked
+        indefinitely for an order that will never fill.
+        """
+        reason = _broker_reason(broker_order) or order_status
+        await self._store.update_proposal_status(
+            proposal_id, "broker_rejected", error=reason
+        )
+        await self._store.record_risk_event(
+            proposal_id=proposal_id,
+            rule="broker_rejected",
+            detail={"order_status": order_status, "reason": reason},
+        )
+        detail["broker_rejected"] = detail.get("broker_rejected", 0) + 1
+        logger.warning(
+            "execution: order broker-rejected",
+            extra={
+                "client_order_id": client_order_id,
+                "proposal_id": proposal_id,
+                "reason": reason,
+            },
+        )
+        self._announce(
+            action="close" if client_order_id.startswith("omc-") else "open",
+            underlying=str(broker_order.get("symbol") or "?"),
+            status="broker_rejected",
+            client_order_id=client_order_id,
+            error=reason,
+        )

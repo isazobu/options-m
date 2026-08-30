@@ -18,6 +18,12 @@ from options_m.lifecycle import install_signal_handlers
 from options_m.llm import FeatherlessLlm
 from options_m.logging_config import setup_logging
 from options_m.mcp_client import AlpacaMcp, LiveTradingRefused, assert_paper_intent
+from options_m.notify import (
+    TelegramNotifier,
+    build_notifier,
+    install_error_notifier,
+    remove_error_notifier,
+)
 from options_m.server import build_server, serve
 from options_m.store import Store
 
@@ -55,17 +61,41 @@ async def run(settings: Settings) -> None:
         daily_token_budget=settings.llm_daily_token_budget,
     )
 
-    async with Database(settings) as db, AlpacaMcp(settings) as mcp:
-        await migrate.apply(db)
-        store = Store(db)
-        agents = build_agents(settings, mcp, store, llm)
-        server = build_server(
-            create_app(db, agents, mcp=mcp, store=store, settings=settings), settings
-        )
+    # Started before the database and the broker so a failure in either is
+    # itself reportable. Errors are bridged in only after setup_logging has
+    # run, because dictConfig replaces the root handlers wholesale.
+    notifier = build_notifier(settings)
+    if isinstance(notifier, TelegramNotifier):
+        await notifier.start()
+    error_handler = (
+        install_error_notifier(notifier, dry_run=settings.dry_run)
+        if settings.telegram_notify_errors
+        else None
+    )
+    notifier.notify(
+        f"🟢 *options\\-m started* — v`{__version__}` "
+        f"\\(dry\\_run\\={str(settings.dry_run).lower()}\\)"
+    )
 
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(serve(server, shutdown, settings), name="http")
-            tg.create_task(run_agents(agents, settings, shutdown), name="agents")
+    try:
+        async with Database(settings) as db, AlpacaMcp(settings) as mcp:
+            await migrate.apply(db)
+            store = Store(db)
+            agents = build_agents(settings, mcp, store, llm, notifier=notifier)
+            server = build_server(
+                create_app(db, agents, mcp=mcp, store=store, settings=settings), settings
+            )
+
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(serve(server, shutdown, settings), name="http")
+                tg.create_task(run_agents(agents, settings, shutdown), name="agents")
+    finally:
+        # Detach the bridge first: shutdown-path errors must not queue messages
+        # onto a notifier that is already draining for the last time.
+        remove_error_notifier(error_handler)
+        notifier.notify("🔴 *options\\-m stopped*")
+        if isinstance(notifier, TelegramNotifier):
+            await notifier.aclose()
 
     logger.info("application stopped")
 

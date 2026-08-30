@@ -63,6 +63,10 @@ services:
         value: "true"
       - key: MARKET_PULSE_INTERVAL_SECONDS
         value: "60"
+      # Every snapshot is a pure cache read (no Alpaca call, no Neon write),
+      # but each one is a Telegram message — half-hourly is plenty.
+      - key: TELEGRAM_SUMMARY_INTERVAL_SECONDS
+        value: "1800"
 
       # Safety defaults. Flip DRY_RUN to false only once the risk engine and
       # the execution agent are in place and tested.
@@ -88,4 +92,10 @@ services:
       - key: FEATHERLESS_API_KEY
         sync: false
       - key: FEATHERLESS_CHAT_MODEL
+        sync: false
+      # Outbound Telegram notifications. Unset means "run without them" — the
+      # reporter agent is not registered and no HTTP client is opened.
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
         sync: false

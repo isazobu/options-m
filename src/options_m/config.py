@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     log_format: str = "json"
 
     # HTTP server. Render (like most platforms) injects PORT.
-    host: str = "0.0.0.0"  # noqa: S104 - containers must bind all interfaces
+    host: str = "0.0.0.0"
     port: int = Field(default=8080, ge=1, le=65535)
 
     # Postgres. Unset means "run without a database" (useful locally).
@@ -160,6 +160,17 @@ class Settings(BaseSettings):
     # Conviction below this floor forces "hold" even when the matrix would
     # otherwise produce a structure.
     conviction_floor: float = Field(default=0.55, ge=0.0, le=1.0)
+    # A symbol that produced any proposal (any status) within this window is
+    # skipped by candidate selection, so the highest-scoring name is not
+    # re-proposed on every strategist tick. Set well above
+    # strategist_interval_seconds.
+    proposal_cooldown_seconds: float = Field(default=3600.0, gt=0)
+    # Hard ceilings on proposal volume over a rolling 24h window — a backstop
+    # for the cooldown, and until the token budget is enforced the only real
+    # cap on LLM spend. A symbol at its per-symbol cap, or the whole run at the
+    # global cap, is recorded as skipped="proposal_cap".
+    max_proposals_per_symbol_per_day: int = Field(default=3, ge=1)
+    max_proposals_per_day: int = Field(default=40, ge=1)
     # Effective options trading level override. Normally read from the account
     # cache; this caps it (useful if the paper account auto-approves Level 3
     # but you want to test Level-2 degradation).
@@ -223,6 +234,25 @@ class Settings(BaseSettings):
     exit_profit_target_pct: float = Field(default=0.50, gt=0.0, le=1.0)
     exit_stop_loss_pct: float = Field(default=0.50, gt=0.0, le=1.0)
     exit_time_stop_days: int = Field(default=30, ge=1)
+
+    # Telegram notifications (outbound only — no bot listener, no commands).
+    # Unset token or chat id means "run without notifications", the same
+    # convention as an unset DATABASE_URL or ALPACA_API_KEY above.
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+    telegram_notify_decisions: bool = True
+    telegram_notify_orders: bool = True
+    telegram_notify_errors: bool = True
+    # Cadence of the portfolio snapshot agent. Gated on market hours, so this
+    # is a within-session cadence, not a wall-clock one.
+    telegram_summary_interval_seconds: float = Field(default=1800.0, gt=0)
+    # An error storm repeats one message thousands of times. Suppress an
+    # identical message inside this window — Telegram 429s well before that.
+    telegram_dedupe_seconds: float = Field(default=300.0, ge=0)
+    # A bounded queue is what keeps a slow Telegram from ever reaching the
+    # trading loop: past this depth the oldest message is dropped, not awaited.
+    telegram_queue_max: int = Field(default=100, ge=1)
+    telegram_timeout_seconds: float = Field(default=10.0, gt=0)
 
     @property
     def cors_origins(self) -> tuple[str, ...]:

@@ -7,7 +7,9 @@ Design:
     2. Kill switch + LLM-budget check.
     3. Candidate selection: top candidate by score that is not:
          - already open (local positions cache)
-         - already in-flight as a pending proposal
+         - already held by an active proposal (pending / dry-run approved /
+           submitted) or a working order for the same underlying
+         - within its per-symbol proposal cooldown, or at a per-day cap
          - inside its earnings blackout window (cheap in-process check)
     4. Evidence read: get the pre-computed pack from the local evidence cache
        (written by MarketPulseAgent every 60s). Skip if missing or stale.
@@ -36,6 +38,7 @@ from options_m.config import Settings
 from options_m.earnings import is_earnings_blackout
 from options_m.llm import FeatherlessLlm, LlmContractError
 from options_m.models import RegimeRead, StrategyIntent
+from options_m.notify import Notifier, NullNotifier, format_decision
 from options_m.prompts import loader as prompt_loader
 from options_m.store import Store
 
@@ -55,10 +58,12 @@ class StrategistAgent:
         settings: Settings,
         store: Store,
         llm: FeatherlessLlm,
+        notifier: Notifier | None = None,
     ) -> None:
         self._settings = settings
         self._store = store
         self._llm = llm
+        self._notifier = notifier or NullNotifier()
 
     @property
     def name(self) -> str:
@@ -103,14 +108,13 @@ class StrategistAgent:
         close_detail = await self._evaluate_close_proposals()
         detail.update(close_detail)
 
-        # 1. Market-open check (local cache, no MCP call).
+        # Local cache read — no MCP call.
         state = await session.current(self._store, self._settings, now)
         if not state.is_open:
             detail["skipped"] = "market_closed"
             return detail
         detail["session_replayed"] = state.replayed
 
-        # 2. Kill switch + LLM budget.
         if self._settings.kill_switch or await self._store.is_kill_switch_engaged():
             detail["skipped"] = "kill_switch"
             return detail
@@ -122,14 +126,15 @@ class StrategistAgent:
             return detail
 
         # 3. Candidate selection.
-        candidate = await self._pick_candidate(now)
+        candidate = await self._pick_candidate(now, detail)
         if candidate is None:
-            detail["skipped"] = "no_candidate"
+            if detail.get("skipped") is None:
+                detail["skipped"] = "no_candidate"
             return detail
         symbol = str(candidate.get("symbol", "")).upper()
         detail["symbol"] = symbol
 
-        # 4. Evidence cache read (local only — no MCP call ever).
+        # Evidence cache — local only, no MCP call ever.
         stale_threshold = timedelta(
             seconds=self._settings.market_pulse_interval_seconds * _EVIDENCE_STALENESS_FACTOR
         )
@@ -182,6 +187,10 @@ class StrategistAgent:
             )
             detail["proposal_id"] = proposal_id
             detail["status"] = "llm_failed"
+            self._announce(
+                symbol=symbol, status="llm_failed", proposal_id=proposal_id,
+                reason="model did not return a valid RegimeRead",
+            )
             raise
         finally:
             await self._store.record_llm_call(
@@ -193,10 +202,8 @@ class StrategistAgent:
                 ok="status" not in detail or detail.get("status") != "llm_failed",
             )
 
-        # 6. Deterministic matrix decision.
         decision = matrix.decide(pack, regime, settings=self._settings, as_of=now.date())
 
-        # 7. Persist proposal.
         matrix_payload: dict[str, Any] = {
             "trend_classified": _trend_label(pack),
             "iv_regime_classified": _iv_regime_label(pack),
@@ -216,6 +223,13 @@ class StrategistAgent:
             logger.info(
                 "strategist: hold",
                 extra={"symbol": symbol, "conviction": regime.conviction},
+            )
+            self._announce(
+                symbol=symbol,
+                status="no_action",
+                conviction=regime.conviction,
+                thesis=regime.thesis,
+                proposal_id=proposal_id,
             )
         elif isinstance(decision, StrategyIntent):
             matrix_payload["result"] = decision.strategy
@@ -238,8 +252,23 @@ class StrategistAgent:
                     "conviction": regime.conviction,
                 },
             )
+            self._announce(
+                symbol=symbol,
+                status="pending",
+                strategy=decision.strategy,
+                conviction=regime.conviction,
+                thesis=regime.thesis,
+                invalidation=regime.invalidation,
+                proposal_id=proposal_id,
+            )
 
         return detail
+
+    def _announce(self, **fields: Any) -> None:
+        """Push one decision to Telegram. Never raises, never blocks."""
+        if not self._settings.telegram_notify_decisions:
+            return
+        self._notifier.notify(format_decision(dry_run=self._settings.dry_run, **fields))
 
     async def _evaluate_close_proposals(self) -> dict[str, Any]:
         """Check every open position for exit conditions; write a close proposal
@@ -301,11 +330,21 @@ class StrategistAgent:
                 "strategist: close proposal",
                 extra={"underlying": underlying, "reason": reason},
             )
+            self._announce(
+                symbol=underlying, status="close", strategy=strategy,
+                reason=reason, thesis=thesis,
+            )
 
         return {"close_proposals": close_count} if close_count else {}
 
-    async def _pick_candidate(self, now: datetime) -> dict[str, Any] | None:
-        """Return the top candidate that passes all pre-filters, or None."""
+    async def _pick_candidate(
+        self, now: datetime, detail: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return the top candidate that passes all pre-filters, or None.
+
+        Sets ``detail["skipped"] = "proposal_cap"`` when the global per-day
+        proposal ceiling is the reason nothing is picked.
+        """
         today = now.date()
         max_age = self._settings.market_pulse_interval_seconds * _EVIDENCE_STALENESS_FACTOR
         candidates = await self._store.top_candidates(
@@ -317,8 +356,34 @@ class StrategistAgent:
 
         # Build sets of symbols to exclude.
         open_positions = {row["symbol"] for row in await self._store.get_cached_positions()}
-        pending = await self._store.recent_proposals(limit=20, status="pending")
-        in_flight_symbols = {str(p.get("underlying", "")).upper() for p in pending}
+        active_symbols = await self._store.active_proposal_underlyings()
+
+        # A symbol is re-proposed at most once per cooldown window and no more
+        # than a hard cap per rolling day. Without this the top-scored name
+        # gets a fresh LLM call and a near-duplicate proposal every tick for
+        # the whole session — under DRY_RUN it never becomes an open position,
+        # so nothing else stops it.
+        recent = await self._store.proposals_since(now - timedelta(days=1))
+        if len(recent) >= self._settings.max_proposals_per_day:
+            detail["skipped"] = "proposal_cap"
+            return None
+
+        cooldown_cutoff = now - timedelta(seconds=self._settings.proposal_cooldown_seconds)
+        per_symbol_today: dict[str, int] = {}
+        cooling_down: set[str] = set()
+        for row in recent:
+            sym = str(row.get("underlying", "")).upper()
+            per_symbol_today[sym] = per_symbol_today.get(sym, 0) + 1
+            ts = row.get("ts")
+            if isinstance(ts, datetime):
+                ts_aware = ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
+                if ts_aware >= cooldown_cutoff:
+                    cooling_down.add(sym)
+        capped_today = {
+            sym
+            for sym, count in per_symbol_today.items()
+            if count >= self._settings.max_proposals_per_symbol_per_day
+        }
 
         for candidate in candidates:
             symbol = str(candidate.get("symbol", "")).upper()
@@ -329,7 +394,9 @@ class StrategistAgent:
                 continue
             if symbol in open_positions:
                 continue
-            if symbol in in_flight_symbols:
+            if symbol in active_symbols:
+                continue
+            if symbol in cooling_down or symbol in capped_today:
                 continue
             return candidate
         return None

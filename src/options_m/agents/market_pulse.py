@@ -12,11 +12,8 @@ Runs every minute. Three jobs, all performed without an LLM:
    deterministic candidate score from those signals so StrategistAgent can
    rank symbols without calling any MCP tool itself.
 
-``get_market_movers`` and ``get_most_active_stocks`` are gone. Candidate
-ranking is now driven entirely by technical evidence (IV/RV ratio, RSI
+Candidate ranking is driven entirely by technical evidence (IV/RV ratio, RSI
 extremity, realised volatility) — the same signals the Strategy Matrix uses.
-A symbol that appears "most active" but has no options edge is invisible to
-this system by design.
 
 Accepted risk, stated explicitly: a once-a-day calendar refresh will not
 catch an unscheduled intraday circuit-breaker halt. Acceptable for this

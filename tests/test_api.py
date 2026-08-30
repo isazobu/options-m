@@ -152,6 +152,35 @@ async def test_proposal_detail_404s_for_an_unknown_id(client: httpx.AsyncClient)
     assert response.status_code == 404
 
 
+async def test_orders_endpoint_is_empty_without_history(client: httpx.AsyncClient) -> None:
+    response = await client.get("/api/orders")
+
+    assert response.status_code == 200
+    assert response.json() == {"orders": []}
+
+
+async def test_orders_endpoint_lists_attempts_newest_first() -> None:
+    db = Database(Settings(database_url=None))
+    store = Store(db)
+    app = create_app(db, [], mcp=None, store=store)
+    proposal_id = await store.save_proposal(
+        underlying="SPY", intent={"direction": "long"}, evidence={}
+    )
+    await store.record_order(
+        proposal_id=proposal_id, client_order_id="om-1", status="submitted", request={}
+    )
+    await store.record_order(
+        proposal_id=proposal_id, client_order_id="om-2", status="failed", request={}
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/orders")
+
+    assert response.status_code == 200
+    orders = response.json()["orders"]
+    assert [row["client_order_id"] for row in orders] == ["om-2", "om-1"]
+
+
 async def test_risk_events_endpoint_is_empty_without_history(client: httpx.AsyncClient) -> None:
     response = await client.get("/api/risk-events")
 
@@ -173,7 +202,7 @@ async def test_dashboard_routes_are_open_when_no_admin_token_is_configured(
 
 async def test_dashboard_routes_require_the_bearer_token_when_configured() -> None:
     db = Database(Settings(database_url=None))
-    settings = Settings(admin_token="secret")  # noqa: S106 - test fixture, not a real credential
+    settings = Settings(admin_token="secret")
     app = create_app(db, [], mcp=None, store=Store(db), settings=settings)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -193,7 +222,7 @@ async def test_dashboard_routes_require_the_bearer_token_when_configured() -> No
 async def test_the_pre_existing_status_route_stays_unauthenticated_even_with_a_token() -> None:
     """The original /api/status contract must not change under this work."""
     db = Database(Settings(database_url=None))
-    settings = Settings(admin_token="secret")  # noqa: S106 - test fixture, not a real credential
+    settings = Settings(admin_token="secret")
     app = create_app(db, [], mcp=None, store=Store(db), settings=settings)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -212,3 +241,100 @@ async def test_chat_reports_when_the_llm_is_not_configured(client: httpx.AsyncCl
     assert response.status_code == 200
     body = response.json()
     assert "llm_unconfigured" in body["warnings"]
+
+
+# ---- admin: kill switch ---------------------------------------------------
+
+
+async def test_kill_switch_starts_released(client: httpx.AsyncClient) -> None:
+    response = await client.get("/admin/kill")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "engaged": False,
+        "reason": None,
+        "updated_at": None,
+        "env_forced": False,
+        "effective": False,
+    }
+
+
+async def test_engaging_the_kill_switch_needs_no_reason(client: httpx.AsyncClient) -> None:
+    """Halting must never be gated behind a form field."""
+    response = await client.post("/admin/kill", json={"engaged": True})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["engaged"] is True
+    assert body["effective"] is True
+
+
+async def test_releasing_the_kill_switch_requires_a_reason(client: httpx.AsyncClient) -> None:
+    await client.post("/admin/kill", json={"engaged": True, "reason": "spread blowout"})
+
+    refused = await client.post("/admin/kill", json={"engaged": False})
+    blank = await client.post("/admin/kill", json={"engaged": False, "reason": "   "})
+
+    assert refused.status_code == 422
+    assert blank.status_code == 422, "whitespace is not a reason"
+    assert (await client.get("/admin/kill")).json()["engaged"] is True
+
+
+async def test_releasing_with_a_reason_succeeds_and_records_it(
+    client: httpx.AsyncClient,
+) -> None:
+    await client.post("/admin/kill", json={"engaged": True, "reason": "spread blowout"})
+
+    response = await client.post(
+        "/admin/kill", json={"engaged": False, "reason": "spreads normal again"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["engaged"] is False
+    assert body["reason"] == "spreads normal again"
+
+
+async def test_kill_switch_writes_an_audit_event(client: httpx.AsyncClient) -> None:
+    """A halt should be visible on the feed next to the rejections it causes."""
+    await client.post("/admin/kill", json={"engaged": True, "reason": "manual halt"})
+
+    events = (await client.get("/api/risk-events")).json()["risk_events"]
+
+    assert events[0]["rule"] == "kill_switch_engaged"
+    assert events[0]["detail"] == {"reason": "manual halt", "source": "admin_api"}
+
+
+async def test_env_forced_kill_switch_is_reported_and_cannot_be_released() -> None:
+    """``KILL_SWITCH=true`` outranks the stored flag, so the UI must not
+    claim trading resumed when the agents will still refuse."""
+    db = Database(Settings(database_url=None))
+    settings = Settings(kill_switch=True)
+    app = create_app(db, [], mcp=None, store=Store(db), settings=settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        released = await client.post(
+            "/admin/kill", json={"engaged": False, "reason": "trying to resume"}
+        )
+
+    body = released.json()
+    assert body["engaged"] is False, "the stored flag did release"
+    assert body["env_forced"] is True
+    assert body["effective"] is True, "but the agents still see it engaged"
+
+
+async def test_kill_switch_routes_require_the_admin_token() -> None:
+    db = Database(Settings(database_url=None))
+    settings = Settings(admin_token="secret")  # noqa: S106 - test fixture, not a real credential
+    app = create_app(db, [], mcp=None, store=Store(db), settings=settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        unauthenticated = await client.post("/admin/kill", json={"engaged": True})
+        authenticated = await client.post(
+            "/admin/kill",
+            json={"engaged": True},
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert unauthenticated.status_code == 401
+    assert authenticated.status_code == 200

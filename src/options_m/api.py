@@ -7,8 +7,10 @@ Liveness and readiness are deliberately separate:
   and it never will.
 * ``/ready`` answers "can it serve real work?" and does check dependencies.
 
-The ``/api/*`` endpoints are what the dashboard polls. They are read-only in
-this phase; the kill-switch control arrives with the dashboard proper.
+The ``/api/*`` endpoints are what the dashboard polls, and they are all
+read-only. The one control that writes — the kill switch — sits apart on
+``/admin/kill`` rather than among them, so the namespace itself says which
+routes can change what the agents do. Both prefixes share the one bearer token.
 """
 
 from __future__ import annotations
@@ -289,6 +291,14 @@ async def api_proposal_detail(request: Request, proposal_id: int) -> Response:
     return JSONResponse(jsonable({"proposal": proposal, "orders": orders}))
 
 
+@admin_router.get("/orders", include_in_schema=False)
+async def api_orders(request: Request, limit: int = 50) -> Response:
+    """Recent order attempts across every proposal, newest first."""
+    store = _store(request)
+    rows = await store.recent_orders(limit=min(limit, 500)) if store else []
+    return JSONResponse(jsonable({"orders": rows}))
+
+
 @admin_router.get("/risk-events", include_in_schema=False)
 async def api_risk_events(request: Request, limit: int = 50) -> Response:
     store = _store(request)
@@ -324,6 +334,93 @@ async def api_chat(request: Request, body: ChatRequest) -> Response:
         max_tool_calls=settings.chat_max_tool_calls,
     )
     return JSONResponse(jsonable(dataclasses.asdict(answer)))
+
+
+# The kill switch is the one control surface that writes. It lives on its own
+# ``/admin`` prefix rather than under ``/api`` with the read-only dashboard
+# routes, so "things that only report" and "the thing that halts trading" are
+# not one namespace. Same bearer-token guard.
+kill_router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin_token)])
+
+
+class KillSwitchRequest(BaseModel):
+    engaged: bool
+    reason: str | None = None
+
+
+async def _kill_switch_state(request: Request) -> dict[str, Any]:
+    """Current state, including whether the environment is forcing it on.
+
+    ``ExecutionAgent`` halts on ``settings.kill_switch or
+    store.is_kill_switch_engaged()``. Only the second half is writable here, so
+    a response that reported just the stored flag would let an operator disengage
+    and watch nothing resume. ``env_forced`` makes that case legible instead.
+    """
+    store = _store(request)
+    if store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="no store configured; the kill switch cannot be read or set",
+        )
+    state = await store.kill_switch_status()
+    env_forced = _settings(request).kill_switch
+    return {
+        **state,
+        "env_forced": env_forced,
+        # What the agents will actually observe, which is the union of the two.
+        "effective": bool(state["engaged"] or env_forced),
+    }
+
+
+@kill_router.get("/kill", include_in_schema=False)
+async def admin_kill_status(request: Request) -> Response:
+    return JSONResponse(jsonable(await _kill_switch_state(request)))
+
+
+@kill_router.post("/kill", include_in_schema=False)
+async def admin_kill_set(request: Request, body: KillSwitchRequest) -> Response:
+    """Engage or release the kill switch.
+
+    Deliberately asymmetric: halting is one call with an optional note, while
+    resuming requires a written reason. Stopping a trading system should never
+    be gated behind a form field, and restarting one should never be a stray
+    click.
+    """
+    reason = (body.reason or "").strip() or None
+    if not body.engaged and reason is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="a reason is required to release the kill switch",
+        )
+
+    store = _store(request)
+    if store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="no store configured; the kill switch cannot be read or set",
+        )
+
+    await store.set_kill_switch(body.engaged, reason)
+    logger.warning(
+        "kill switch %s via /admin/kill (reason=%s)",
+        "ENGAGED" if body.engaged else "RELEASED",
+        reason or "not given",
+    )
+    # Audit trail on the feed the dashboard already renders, so a halt is
+    # visible next to the risk rejections it will start producing.
+    try:
+        await store.record_risk_event(
+            proposal_id=None,
+            rule="kill_switch_engaged" if body.engaged else "kill_switch_released",
+            detail={"reason": reason, "source": "admin_api"},
+        )
+    except Exception:
+        # The switch is already set; failing to write the audit row must not
+        # turn a successful halt into a 500 the operator reads as "it did not
+        # work" and retries.
+        logger.warning("kill switch set, but the audit event failed to write", exc_info=True)
+
+    return JSONResponse(jsonable(await _kill_switch_state(request)))
 
 
 def jsonable(value: Any) -> Any:
@@ -393,4 +490,5 @@ def create_app(
 
     app.include_router(router)
     app.include_router(admin_router)
+    app.include_router(kill_router)
     return app

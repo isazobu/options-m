@@ -29,10 +29,10 @@ def test_render_substitutes_named_variables() -> None:
 
 
 def test_render_without_kwargs_returns_template_verbatim() -> None:
-    system = loader.load("strategist").render("system")
-    assert system == (
-        "You are a quantitative options strategist. Output only valid JSON as instructed."
-    )
+    prompt = loader.load("strategist")
+    # No kwargs -> the template comes back exactly as stored, no format_map pass.
+    assert prompt.render("system") == prompt.templates["system"]
+    assert prompt.render("system").startswith("You are a quantitative options strategist")
 
 
 def test_params_are_exposed() -> None:
