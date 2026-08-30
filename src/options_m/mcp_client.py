@@ -71,20 +71,12 @@ FORBIDDEN_TOOLS = frozenset(
     }
 )
 
-# Exactly the values the MCP server accepts as "paper", mirroring server.py:
-#     os.environ.get("ALPACA_PAPER_TRADE", "true").lower() in ("true", "1", "yes")
-# There is no .strip() there, so "true " with a trailing space selects LIVE, as
-# does "paper" or "yes!". Anything outside this set is a live endpoint.
+# No .strip(): "true " or "yes!" both select live. Anything outside this set is live.
 PAPER_VALUES = frozenset({"true", "1", "yes"})
 
-# Every tool result arrives wrapped in a security envelope:
-#     {"_alpaca_mcp_security": {"trust": "untrusted_tool_output",
-#                               "risk": "api_structured" | "external_text", ...},
-#      "data": <the actual payload>}
-# The envelope is the server telling us the payload is data, not instructions.
-# We unwrap it here and keep the risk classification, which matters from phase 3
-# on: anything marked external_text is attacker-influencable prose (news
-# headlines, corporate filings) heading for an LLM prompt.
+# Every result is wrapped in a security envelope keyed by SECURITY_KEY.
+# We unwrap it and keep the risk classification: external_text marks
+# attacker-influencable prose (news, filings) heading for an LLM prompt.
 SECURITY_KEY = "_alpaca_mcp_security"
 PAYLOAD_KEY = "data"
 RISK_EXTERNAL_TEXT = "external_text"
@@ -470,7 +462,7 @@ class AlpacaMcp:
                 continue
             return self._as_json(tool, result)
 
-        assert last_error is not None  # noqa: S101 - loop always sets it
+        assert last_error is not None
         raise last_error
 
     async def _reconnect_quietly(self) -> None:
@@ -579,19 +571,6 @@ class AlpacaMcp:
 
     async def get_all_positions(self) -> list[dict[str, Any]]:
         return self._expect_sequence("get_all_positions", await self.call("get_all_positions"))
-
-    async def get_market_movers(self, top: int = 25, market_type: str = "stocks") -> dict[str, Any]:
-        """Top gainers and losers. ``market_type`` is required by the tool."""
-        return self._expect_mapping(
-            "get_market_movers",
-            await self.call("get_market_movers", {"market_type": market_type, "top": top}),
-        )
-
-    async def get_most_active_stocks(self, top: int = 25, by: str = "volume") -> dict[str, Any]:
-        return self._expect_mapping(
-            "get_most_active_stocks",
-            await self.call("get_most_active_stocks", {"by": by, "top": top}),
-        )
 
     async def get_news(self, symbols: tuple[str, ...] | list[str], limit: int = 20) -> Any:
         return await self.call("get_news", {"symbols": ",".join(symbols), "limit": limit})

@@ -173,7 +173,7 @@ async def test_dashboard_routes_are_open_when_no_admin_token_is_configured(
 
 async def test_dashboard_routes_require_the_bearer_token_when_configured() -> None:
     db = Database(Settings(database_url=None))
-    settings = Settings(admin_token="secret")  # noqa: S106 - test fixture, not a real credential
+    settings = Settings(admin_token="secret")
     app = create_app(db, [], mcp=None, store=Store(db), settings=settings)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -193,7 +193,7 @@ async def test_dashboard_routes_require_the_bearer_token_when_configured() -> No
 async def test_the_pre_existing_status_route_stays_unauthenticated_even_with_a_token() -> None:
     """The original /api/status contract must not change under this work."""
     db = Database(Settings(database_url=None))
-    settings = Settings(admin_token="secret")  # noqa: S106 - test fixture, not a real credential
+    settings = Settings(admin_token="secret")
     app = create_app(db, [], mcp=None, store=Store(db), settings=settings)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

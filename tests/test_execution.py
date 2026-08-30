@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import date
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from options_m.agents.execution import ExecutionAgent, _group_into_structures
 from options_m.config import Settings

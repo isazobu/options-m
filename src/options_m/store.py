@@ -969,7 +969,7 @@ class Store:
             )
             row = cast("tuple[Any, ...] | None", await cur.fetchone())
             await conn.commit()
-            assert row is not None  # noqa: S101
+            assert row is not None
             return int(row[0])
 
     # ---- LLM call log (Phase 3) -------------------------------------------

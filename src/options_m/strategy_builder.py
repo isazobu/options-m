@@ -471,14 +471,14 @@ async def build(
     entry_price, rejection = _price(intent, settings, primary, secondary, proposal_id)
     if rejection is not None:
         return rejection
-    assert entry_price is not None  # noqa: S101 - _price returns exactly one of the two
+    assert entry_price is not None
 
     max_loss, max_profit, breakeven, rejection = _risk_profile(
         intent, proposal_id, primary, secondary, entry_price, spot, existing_position, settings
     )
     if rejection is not None:
         return rejection
-    assert max_loss is not None  # noqa: S101 - _risk_profile returns exactly one of the two
+    assert max_loss is not None
 
     equity = finite_float(account.get("equity"))
     if equity is None:
@@ -585,8 +585,8 @@ def _build_long_strangle(
         if rejection is not None:
             return rejection
 
-    assert call_contract.bid is not None and call_contract.ask is not None  # noqa: S101
-    assert put_contract.bid is not None and put_contract.ask is not None  # noqa: S101
+    assert call_contract.bid is not None and call_contract.ask is not None
+    assert put_contract.bid is not None and put_contract.ask is not None
     call_mid = (call_contract.bid + call_contract.ask) / 2
     put_mid = (put_contract.bid + put_contract.ask) / 2
     width = (call_contract.ask - call_contract.bid) + (put_contract.ask - put_contract.bid)
@@ -834,7 +834,7 @@ def _net_credit(verticals: list[_CreditVertical], settings: Settings) -> float:
     spread_total = 0.0
     for vertical in verticals:
         for contract, sign in ((vertical.short, 1.0), (vertical.long, -1.0)):
-            assert contract.bid is not None and contract.ask is not None  # noqa: S101
+            assert contract.bid is not None and contract.ask is not None
             credit += sign * (contract.bid + contract.ask) / 2
             spread_total += contract.ask - contract.bid
     return credit - settings.limit_price_spread_nudge_pct * spread_total
@@ -1134,12 +1134,12 @@ def _price(
 ) -> tuple[float | None, Rejection | None]:
     """Net entry price: a positive number either way — the sign that matters
     (debit vs. credit) is implied by ``primary_side``, not stored twice."""
-    assert primary.bid is not None and primary.ask is not None  # noqa: S101 - liquidity-gated above
+    assert primary.bid is not None and primary.ask is not None
     primary_mid = (primary.bid + primary.ask) / 2
     nudge = settings.limit_price_spread_nudge_pct
 
     if secondary is not None:
-        assert secondary.bid is not None and secondary.ask is not None  # noqa: S101
+        assert secondary.bid is not None and secondary.ask is not None
         secondary_mid = (secondary.bid + secondary.ask) / 2
         net_mid = primary_mid - secondary_mid
         if net_mid <= 0:
@@ -1177,7 +1177,7 @@ def _risk_profile(
         return max_loss, None, breakeven, None
 
     if strategy in _VERTICAL_STRATEGIES:
-        assert secondary is not None  # noqa: S101 - verticals always build a secondary leg
+        assert secondary is not None
         # The realised distance between the two strikes, not the width the
         # intent asked for: the second leg snapped to a listed strike and the
         # two can differ by up to one increment. Every dollar figure below has

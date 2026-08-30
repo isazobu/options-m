@@ -189,7 +189,7 @@ async def run(
             stopped_here=True,
         )
         return trace
-    assert isinstance(decision, StrategyIntent)  # noqa: S101 - decide returns one of the two
+    assert isinstance(decision, StrategyIntent)
     intent = decision
     trace.add(
         "strategy matrix",
