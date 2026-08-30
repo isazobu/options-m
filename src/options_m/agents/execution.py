@@ -11,6 +11,11 @@ Order submission never fabricates a fill. A duplicate ``client_order_id`` is
 reconciled as a success — Alpaca's own recovery path — never retried as a
 failure; anything else that fails is written down as ``failed`` with the real
 error text, and dry run never even attempts the call.
+
+Reconciliation polls every still-open order each tick. When the broker
+rejects, cancels or expires an order it had accepted, the proposal is marked
+``broker_rejected`` with a ``broker_rejected`` risk event, so the underlying
+is not left blocked by a dead order.
 """
 
 from __future__ import annotations
@@ -39,6 +44,34 @@ _PENDING_BATCH_SIZE = 5
 # Wider than evidence.py's 0.15 because the builder has to reach a target
 # delta and may need strikes further out than an ATM IV read ever does.
 _STRIKE_BAND = 0.25
+
+# Broker order states that will not progress on their own and did not open a
+# position — the broker finished with an order it had accepted without filling
+# it. Reconcile releases the proposal (``broker_rejected``) rather than leaving
+# it ``submitted`` and blocking its underlying forever. Compared
+# case-insensitively; aligned with store._SETTLED_ORDER_STATES minus ``filled``
+# and ``failed`` (a fill opened a position; ``failed`` never reaches the broker).
+_TERMINAL_UNFILLED_STATES = frozenset(
+    {"canceled", "cancelled", "expired", "rejected", "replaced", "done_for_day"}
+)
+# Keys an Alpaca order object may carry an explanation under. None is standard,
+# so this is best-effort — the status string is the fallback.
+_BROKER_REASON_KEYS = ("reason", "reject_reason", "rejected_reason", "cancel_reason")
+
+
+def _broker_reason(broker_order: dict[str, Any]) -> str | None:
+    for key in _BROKER_REASON_KEYS:
+        value = broker_order.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _is_terminal_unfilled(status: str, filled_qty: float | None) -> bool:
+    """True when the broker is done with an order that never opened a position."""
+    if filled_qty is not None and filled_qty > 0:
+        return False
+    return status.strip().lower() in _TERMINAL_UNFILLED_STATES
 
 
 def _looks_like_duplicate(message: str) -> bool:
@@ -197,6 +230,7 @@ async def build_portfolio_snapshot(
     mcp: AlpacaMcp,
     store: Store,
     settings: Settings,
+    exclude_proposal_id: int | None = None,
 ) -> PortfolioSnapshot:
     """Shared by :class:`ExecutionAgent` and ``cli.py``'s ``plan`` command."""
     clock = await mcp.get_clock()
@@ -209,15 +243,34 @@ async def build_portfolio_snapshot(
     ]
 
     structures = _group_into_structures(option_positions)
+    underlyings_with_position = {root for root, _expiry in structures}
 
+    # A resting limit order and an approved-but-unsubmitted proposal each hold
+    # a position slot that get_all_positions cannot see yet. Counting only
+    # filled positions here lets the same symbol be re-proposed and
+    # re-submitted while its first order is still working, beating
+    # MAX_POSITIONS_PER_UNDERLYING and the concurrent cap in practice. An
+    # unfilled om-<id> order must occupy the slot exactly as a filled one does.
+    slot_holders = await store.working_order_underlyings()
+    slot_holders |= await store.active_proposal_underlyings(
+        exclude_proposal_id=exclude_proposal_id
+    )
+    # Drop anything already counted as a filled position so a proposal that has
+    # since filled is not double-counted against the caps.
+    slot_holders -= underlyings_with_position
+
+    target = underlying.upper()
     return PortfolioSnapshot(
         equity=finite_float(account.get("equity")),
         # last_equity is Alpaca's own "equity as of previous close" field —
         # exactly the daily-loss baseline, with no timezone-boundary guessing.
         start_of_day_equity=finite_float(account.get("last_equity")),
         high_water_mark=max(finite_equities) if finite_equities else None,
-        concurrent_option_positions=len(structures),
-        positions_in_underlying=sum(1 for root, _expiry in structures if root == underlying),
+        concurrent_option_positions=len(structures) + len(slot_holders),
+        positions_in_underlying=(
+            sum(1 for root, _expiry in structures if root == target)
+            + (1 if target in slot_holders else 0)
+        ),
         total_open_option_premium=sum(
             abs(finite_float(p.get("market_value")) or 0.0) for p in option_positions
         ),
@@ -320,6 +373,28 @@ class ExecutionAgent:
             await self._store.update_proposal_status(proposal_id, status)
             return
 
+        # Another proposal for this underlying is already pending, dry-run
+        # approved, or resting as a working order. The risk gate's idempotency
+        # check is exact-client_order_id only, so a fresh proposal_id slips past
+        # it — reject here before spending any broker calls on a plan that must
+        # not be placed.
+        active_underlyings = await self._store.active_proposal_underlyings(
+            exclude_proposal_id=proposal_id
+        )
+        if intent.underlying.upper() in active_underlyings:
+            await self._store.update_proposal_status(
+                proposal_id,
+                "rejected",
+                error="another proposal for this underlying is already in flight",
+            )
+            await self._store.record_risk_event(
+                proposal_id=proposal_id,
+                rule="duplicate_underlying_in_flight",
+                detail={"underlying": intent.underlying.upper()},
+            )
+            detail["rejected"] += 1
+            return
+
         # From here on every broker read is strict: a failure must reach the
         # supervisor, not be swallowed as "this proposal has no plan".
         account = await self._mcp.get_account_info()
@@ -357,6 +432,7 @@ class ExecutionAgent:
             mcp=self._mcp,
             store=self._store,
             settings=self._settings,
+            exclude_proposal_id=proposal_id,
         )
         verdict = self._risk.evaluate(plan, portfolio)
         if not verdict.approved:
@@ -591,6 +667,14 @@ class ExecutionAgent:
             request=request,
             response=broker_order,
         )
+        if _is_terminal_unfilled(status, finite_float(broker_order.get("filled_qty"))):
+            # The pre-existing order is already dead: release the proposal now
+            # rather than parking it in ``submitted`` where reconcile — which
+            # only polls non-terminal orders — would never revisit it.
+            await self._mark_broker_rejected(
+                proposal_id, plan.client_order_id, broker_order, status, detail
+            )
+            return
         await self._store.update_proposal_status(proposal_id, "submitted")
         detail["submitted"] += 1
 
@@ -609,35 +693,52 @@ class ExecutionAgent:
             if broker_order is None:
                 continue
             new_status = str(broker_order.get("status", order["status"]))
+            filled_qty = finite_float(broker_order.get("filled_qty"))
             await self._store.update_order_status(
                 client_order_id,
                 status=new_status,
                 response=broker_order,
-                filled_qty=finite_float(broker_order.get("filled_qty")),
+                filled_qty=filled_qty,
                 filled_avg_price=finite_float(broker_order.get("filled_avg_price")),
             )
             detail["reconciled"] += 1
 
-            if new_status in ("rejected", "canceled", "expired"):
-                proposal_id = order.get("proposal_id")
-                if proposal_id is not None:
-                    reason = str(broker_order.get("reason") or new_status)
-                    await self._store.update_proposal_status(
-                        int(proposal_id),
-                        "broker_rejected",
-                        error=reason,
-                    )
-                    await self._store.record_risk_event(
-                        proposal_id=int(proposal_id),
-                        rule="broker_rejected",
-                        detail={"order_status": new_status, "reason": reason},
-                    )
-                    logger.warning(
-                        "execution: order broker-rejected",
-                        extra={
-                            "client_order_id": client_order_id,
-                            "proposal_id": proposal_id,
-                            "reason": reason,
-                        },
-                    )
-                    detail["broker_rejected"] += 1
+            proposal_id = order.get("proposal_id")
+            if proposal_id is not None and _is_terminal_unfilled(new_status, filled_qty):
+                await self._mark_broker_rejected(
+                    int(proposal_id), client_order_id, broker_order, new_status, detail
+                )
+
+    async def _mark_broker_rejected(
+        self,
+        proposal_id: int,
+        client_order_id: str,
+        broker_order: dict[str, Any],
+        order_status: str,
+        detail: dict[str, Any],
+    ) -> None:
+        """The broker rejected / canceled / expired an order it had accepted.
+
+        Without this the proposal stays ``submitted`` after the broker is done
+        with its order, so ``active_proposal_underlyings`` — and therefore the
+        candidate gate and the portfolio snapshot — keep the underlying blocked
+        indefinitely for an order that will never fill.
+        """
+        reason = _broker_reason(broker_order) or order_status
+        await self._store.update_proposal_status(
+            proposal_id, "broker_rejected", error=reason
+        )
+        await self._store.record_risk_event(
+            proposal_id=proposal_id,
+            rule="broker_rejected",
+            detail={"order_status": order_status, "reason": reason},
+        )
+        detail["broker_rejected"] = detail.get("broker_rejected", 0) + 1
+        logger.warning(
+            "execution: order broker-rejected",
+            extra={
+                "client_order_id": client_order_id,
+                "proposal_id": proposal_id,
+                "reason": reason,
+            },
+        )
