@@ -98,7 +98,7 @@ class MarketPulseAgent:
 
         account = await self._mcp.get_account_info()
         account_config = await self._mcp.get_account_config()
-        options_level = _parse_options_level(account_config)
+        options_level = _parse_options_level(account, account_config)
 
         equity = finite_float(account.get("equity"))
         cash = finite_float(account.get("cash"))
@@ -302,16 +302,39 @@ def _score_from_evidence(pack: dict[str, Any]) -> tuple[float, str]:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _parse_options_level(account_config: dict[str, Any]) -> int | None:
-    """Effective options trading level, never the merely-approved one."""
-    for key in ("options_trading_level", "options_trading_level_effective"):
-        value = account_config.get(key)
-        if value is not None:
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                return None
-    return None
+def _parse_options_level(
+    account: dict[str, Any], account_config: dict[str, Any]
+) -> int | None:
+    """Effective options trading level, never the merely-approved one.
+
+    The level lives on the *account* (`options_trading_level`, alongside the
+    merely-approved `options_approved_level` which is not what may be traded).
+    Account *configurations* carries only `max_options_trading_level`, a
+    self-imposed ceiling — which is why reading the level from the config alone
+    returned None against the real API and every pulse logged
+    `options_trading_level: null`. matrix.py then fell back to the configured
+    cap of 3, so the service assumed full Level 3 approval it may not have.
+
+    Both are honoured when present: the ceiling can only lower the level.
+    """
+    levels = [
+        parsed
+        for parsed in (
+            _int_or_none(account.get("options_trading_level")),
+            _int_or_none(account_config.get("max_options_trading_level")),
+        )
+        if parsed is not None
+    ]
+    return min(levels) if levels else None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_calendar_entry(entry: dict[str, Any]) -> dict[str, Any]:
