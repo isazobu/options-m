@@ -90,9 +90,14 @@ class _FakeMcp:
             "equity": "100000.00",
             "cash": "100000.00",
             "buying_power": "200000.00",
+            # The real Account carries the effective level here. Fixtures that
+            # put it on account *configurations* instead are testing a shape
+            # Alpaca never returns.
+            "options_trading_level": 3,
+            "options_approved_level": 3,
         }
         self._account_config = (
-            account_config if account_config is not None else {"options_trading_level": 3}
+            account_config if account_config is not None else {"max_options_trading_level": 3}
         )
         self._bars_by_symbol = bars_by_symbol or {}
         self._fail_evidence_for = fail_evidence_for or set()
@@ -361,10 +366,62 @@ async def test_positions_count_comes_from_the_local_cache_not_a_live_call() -> N
     assert point["positions_count"] == 1
 
 
+async def test_the_options_level_comes_from_the_account_not_the_config() -> None:
+    """Account *configurations* has no `options_trading_level` field at all.
+
+    It carries `max_options_trading_level`, a self-imposed ceiling. Reading the
+    level from the config alone cached None on the real API, and matrix.py then
+    fell back to the configured cap of 3 — assuming full Level 3 approval.
+    """
+    mcp = _FakeMcp(
+        account={
+            "equity": "100000.00",
+            "cash": "100000.00",
+            "buying_power": "200000.00",
+            # Approved is not what may be traded; only the latter is honoured.
+            "options_approved_level": 3,
+            "options_trading_level": 2,
+        },
+        account_config={"max_options_trading_level": 3},
+    )
+    agent, store = _agent(mcp)
+
+    await agent.step()
+
+    cached = await store.get_cached_account()
+    assert cached is not None
+    assert cached["options_trading_level"] == 2
+
+
+async def test_a_self_imposed_ceiling_lowers_the_options_level() -> None:
+    """max_options_trading_level can only ever lower what the account allows."""
+    mcp = _FakeMcp(
+        account={
+            "equity": "100000.00",
+            "cash": "100000.00",
+            "buying_power": "200000.00",
+            "options_trading_level": 3,
+        },
+        account_config={"max_options_trading_level": 1},
+    )
+    agent, store = _agent(mcp)
+
+    await agent.step()
+
+    cached = await store.get_cached_account()
+    assert cached is not None
+    assert cached["options_trading_level"] == 1
+
+
 async def test_account_cache_is_upserted_from_the_same_tick_no_extra_calls() -> None:
     mcp = _FakeMcp(
-        account={"equity": "123456.78", "cash": "50000.00", "buying_power": "150000.00"},
-        account_config={"options_trading_level": 2},
+        account={
+            "equity": "123456.78",
+            "cash": "50000.00",
+            "buying_power": "150000.00",
+            "options_trading_level": 2,
+        },
+        account_config={"max_options_trading_level": 3},
     )
     agent, store = _agent(mcp)
 
