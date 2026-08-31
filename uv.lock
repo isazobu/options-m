@@ -1064,7 +1064,7 @@ dev = [
 requires-dist = [
     { name = "alpaca-mcp-server", specifier = ">=2.3" },
     { name = "fastapi", specifier = ">=0.115" },
-    { name = "fastmcp", specifier = ">=3.1" },
+    { name = "fastmcp", specifier = ">=3.1,<4" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2" },

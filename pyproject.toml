@@ -16,7 +16,16 @@ dependencies = [
     "pydantic-settings>=2.4",
     # Alpaca is reached only through its official MCP server, spawned as a
     # stdio subprocess. fastmcp gives us the client half of that conversation.
-    "fastmcp>=3.1",
+    #
+    # Capped below 4: fastmcp 4.0.0 dropped the `fastmcp.tools.tool` module
+    # path, which alpaca-mcp-server 2.3.0 imports at module scope
+    # (`from fastmcp.tools.tool import ToolResult`). Upstream declares a bare
+    # `fastmcp>=3.1.0`, so without this cap a fresh image resolves 4.x, the
+    # MCP subprocess dies during import, and the client reports only
+    # "MCPError: Connection closed" — which is how this reached production
+    # 23 minutes after 4.0.0 was published. Lift the cap once
+    # alpaca-mcp-server ships a 4.x-compatible release.
+    "fastmcp>=3.1,<4",
     "alpaca-mcp-server>=2.3",
     "httpx>=0.27",
     # LLM prompts live as YAML under options_m/prompts/ and are read at runtime.

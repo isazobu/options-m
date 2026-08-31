@@ -1221,3 +1221,20 @@ async def test_place_option_order_builds_a_multi_leg_request() -> None:
     assert result["legs"] is not None
     assert len(result["legs"]) == 2
     assert calls["place_option_order"] == 1
+
+
+def test_the_alpaca_mcp_server_imports_under_the_installed_fastmcp() -> None:
+    """The MCP server must survive its own import, or the session never opens.
+
+    It runs as a stdio subprocess, so an ImportError there is invisible: the
+    child dies before speaking, and the parent reports the aftermath as
+    "MCPError: Connection closed" with nothing about the cause. That is how
+    fastmcp 4.0.0 — which dropped the `fastmcp.tools.tool` path that
+    alpaca-mcp-server 2.3.0 imports — reached production, 23 minutes after it
+    was published, through an unpinned `fastmcp>=3.1`.
+
+    This asserts on the resolved environment rather than on the version pin,
+    so it fails for any incompatible pairing however it got installed.
+    """
+    from alpaca_mcp_server.cli import main  # noqa: F401
+    from alpaca_mcp_server.server import build_server  # noqa: F401
