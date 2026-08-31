@@ -292,6 +292,22 @@ class Settings(BaseSettings):
     # but you want to test Level-2 degradation).
     options_level: int = Field(default=3, ge=1, le=3)
 
+    # Whether the matrix may open structures paid for with a debit — the whole
+    # "cheap" IV column. On by default: owning cheap volatility is a legitimate
+    # answer to a cheap-volatility regime, and over a normal holding period a
+    # debit vertical has room for its thesis to resolve.
+    #
+    # Turn it off for a campaign measured in sessions. A sold structure earns
+    # from time passing, which is certain; a bought one earns from the
+    # underlying moving the forecast way, which here rests on an SMA/RSI
+    # classifier and a language model's self-reported confidence, neither with
+    # measured predictive power (see conviction_reliability_prior). Over two or
+    # three sessions that is a coin flip paying two bid/ask spreads for the
+    # privilege. The cost of switching it off is real and should be expected:
+    # when no name is in an expensive-IV regime the matrix holds everything and
+    # the book stays flat. Flat beats a negative-expectancy position.
+    allow_bought_premium: bool = True
+
     # Per-structure defaults consumed by matrix.py.
     short_delta_default: float = Field(default=0.25, gt=0.0, lt=1.0)
     # Wing distance as a multiple of the expected move over the option's life

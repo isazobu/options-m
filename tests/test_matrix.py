@@ -95,3 +95,59 @@ def test_a_single_leg_structure_never_carries_a_width() -> None:
 
     assert intent.strategy == "long_strangle"
     assert intent.spread_width is None
+
+
+# ---------------------------------------------------------------------------
+# Bought premium — the "cheap" IV column, switchable off for a short campaign
+# ---------------------------------------------------------------------------
+
+
+def _up(iv_rv: float) -> dict[str, Any]:
+    return _evidence(sma_20=105.0, sma_50=100.0, rsi_14=60.0, iv_rv=iv_rv)
+
+
+def _down(iv_rv: float) -> dict[str, Any]:
+    return _evidence(sma_20=95.0, sma_50=100.0, rsi_14=40.0, iv_rv=iv_rv)
+
+
+def test_the_cheap_column_is_held_when_bought_premium_is_off() -> None:
+    """Every cell that opens for a debit, across all three trend states."""
+    for evidence, expected in (
+        (_up(0.90), "call_debit_spread"),
+        (_flat_expensive(0.90), "long_strangle"),
+        (_down(0.90), "put_debit_spread"),
+    ):
+        allowed = _decide(evidence, _settings(allow_bought_premium=True))
+        assert allowed.strategy == expected
+
+        blocked = matrix.decide(
+            evidence,
+            _REGIME,
+            settings=_settings(allow_bought_premium=False),
+            as_of=_AS_OF,
+        )
+        assert blocked == "hold"
+
+
+def test_sold_premium_is_untouched_by_the_switch() -> None:
+    """The switch takes the debit column off the board and nothing else."""
+    settings = _settings(allow_bought_premium=False)
+    for evidence, expected in (
+        (_up(1.20), "put_credit_spread"),
+        (_flat_expensive(1.20), "iron_condor"),
+        (_down(1.50), "call_credit_spread"),
+        (_flat_expensive(1.50), "iron_butterfly"),
+    ):
+        assert _decide(evidence, settings).strategy == expected
+
+
+def test_a_level_two_downgrade_cannot_smuggle_a_long_single_through() -> None:
+    """call_debit_spread degrades to long_call at Level 2. That is still bought
+    premium, so the switch has to catch it after the downgrade, not before."""
+    decision = matrix.decide(
+        _up(0.90),
+        _REGIME,
+        settings=_settings(allow_bought_premium=False, options_level=2),
+        as_of=_AS_OF,
+    )
+    assert decision == "hold"

@@ -69,6 +69,17 @@ _LEVEL2_FALLBACK: dict[str, str | None] = {
     "long_strangle": "long_strangle",  # already Level 2
 }
 
+# Structures opened for a debit -- the whole "cheap" IV column, plus the two
+# Level-2 singles it degrades into. Their P&L needs the underlying to move the
+# right way; a sold structure's needs only time to pass. Over a horizon long
+# enough for a thesis to play out that is a fair trade to make. Over one
+# measured in sessions it is a directional bet funded by a forecast this system
+# has never measured -- conviction_reliability_prior says as much -- so
+# allow_bought_premium exists to take the column off the board for a campaign.
+_BOUGHT_PREMIUM: frozenset[str] = frozenset(
+    {"call_debit_spread", "put_debit_spread", "long_call", "long_put", "long_strangle"}
+)
+
 
 def _trend_direction(trend: dict[str, Any]) -> Literal["up", "flat", "down"]:
     """Classify trend from SMA20/50 and RSI14 already in the evidence pack."""
@@ -153,6 +164,13 @@ def decide(
         if fallback is None:
             return "hold"
         strategy = fallback
+
+    # 5b. Bought premium, checked after degradation so a Level-2 downgrade into
+    # a long single is caught by the same rule that catches the vertical it
+    # came from. Holding is the honest answer here: no position beats one whose
+    # edge the campaign is too short to collect.
+    if strategy in _BOUGHT_PREMIUM and not settings.allow_bought_premium:
+        return "hold"
 
     # 6. Conviction floor — the one LLM-sourced veto.
     if regime.conviction < settings.conviction_floor:
