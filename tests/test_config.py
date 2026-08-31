@@ -40,6 +40,7 @@ _REQUIRED_TOOLSETS = {
     "assets": "get_option_contracts, get_calendar, get_clock",
     "stock-data": "get_stock_bars, get_stock_snapshot",
     "options-data": "get_option_chain, get_option_snapshot",
+    "news": "get_news",
 }
 
 

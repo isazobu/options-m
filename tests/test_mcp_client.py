@@ -438,6 +438,36 @@ async def test_a_permanent_failure_raises_after_exhausting_retries() -> None:
     assert calls["always_fails"] == 2
 
 
+async def test_an_unknown_tool_is_not_retried() -> None:
+    """A tool the server never registered cannot appear on a later attempt.
+
+    The toolset allowlist is fixed for the life of the subprocess, so retrying
+    only adds backoff to every caller. This regressed in production: `news`
+    was missing from ALPACA_TOOLSETS and every evidence pull spent ~2.4s
+    failing get_news three times per symbol.
+    """
+    server, _calls = _fake_server()
+    mcp = await _connected(_settings(mcp_max_retries=2), server)
+    mcp._reconnect_quietly = _noop  # type: ignore[method-assign]
+
+    attempts = 0
+    inner = mcp._client.call_tool  # type: ignore[union-attr]
+
+    async def _counting(*args: Any, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        return await inner(*args, **kwargs)
+
+    mcp._client.call_tool = _counting  # type: ignore[union-attr, method-assign]
+    try:
+        with pytest.raises(ToolError, match="Unknown tool"):
+            await mcp.call("no_such_tool")
+    finally:
+        await mcp.close()
+
+    assert attempts == 1
+
+
 async def test_a_timeout_is_bounded_by_the_configured_limit() -> None:
     server, _calls = _fake_server()
     mcp = await _connected(_settings(mcp_call_timeout_seconds=0.01, mcp_max_retries=0), server)

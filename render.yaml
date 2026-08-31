@@ -56,7 +56,7 @@ services:
       # close_position — without it the service starts healthy and cannot
       # trade. `news` is gone with the technical-analysis-only design.
       - key: ALPACA_TOOLSETS
-        value: account,trading,assets,options-data,stock-data
+        value: account,trading,assets,options-data,stock-data,news
       # Must stay exactly "true". The service refuses to start on any value
       # that would select the live agents endpoint.
       - key: ALPACA_PAPER_TRADE
