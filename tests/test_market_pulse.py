@@ -26,6 +26,7 @@ import pytest
 from options_m.agents.market_pulse import _EXCHANGE_TZ, MarketPulseAgent
 from options_m.config import Settings
 from options_m.db import Database
+from options_m.iv_backfill import BackfillReport
 from options_m.store import Store
 
 # ---------------------------------------------------------------------------
@@ -447,3 +448,115 @@ async def test_earnings_blacked_out_symbol_scores_zero() -> None:
     # Both ETFs should score > 0 (RSI / RV signals present from flat bars).
     candidates = await store.recent_candidates()
     assert all(row["score"] >= 0 for row in candidates)
+
+
+# ---------------------------------------------------------------------------
+# IV history backfill wiring
+#
+# What the backfill *produces* is tested in test_iv_backfill.py; these cover
+# only how the agent drives it, because that is where the API budget goes.
+# ---------------------------------------------------------------------------
+
+def _record_backfill(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replace the backfill with a recorder. Returns the symbols it was asked for."""
+    asked: list[str] = []
+
+    async def fake_backfill(settings, mcp, store, symbol, **kwargs):  # type: ignore[no-untyped-def]
+        asked.append(symbol)
+        return BackfillReport(symbol=symbol, sessions_missing=5, sessions_written=5)
+
+    monkeypatch.setattr("options_m.agents.market_pulse.backfill_daily_iv", fake_backfill)
+    return asked
+
+
+async def test_the_backfill_is_paced_and_each_symbol_tried_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A year of option bars per symbol is not something to fetch ten times over
+    in one tick, nor to re-fetch every minute for the life of the process."""
+    asked = _record_backfill(monkeypatch)
+    agent, _store = _agent(_FakeMcp(), universe="SPY,QQQ,AAPL")
+
+    await agent.step()
+    assert asked == ["SPY"]
+
+    await agent.step()
+    await agent.step()
+    assert asked == ["SPY", "QQQ", "AAPL"]
+
+    # Universe exhausted: nothing more is attempted, this process or ever.
+    await agent.step()
+    assert asked == ["SPY", "QQQ", "AAPL"]
+
+
+async def test_the_backfill_pace_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    asked = _record_backfill(monkeypatch)
+    agent, _store = _agent(
+        _FakeMcp(), universe="SPY,QQQ,AAPL", iv_backfill_symbols_per_tick=3
+    )
+
+    await agent.step()
+
+    assert asked == ["SPY", "QQQ", "AAPL"]
+
+
+async def test_the_backfill_can_be_switched_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    asked = _record_backfill(monkeypatch)
+    agent, _store = _agent(_FakeMcp(), universe="SPY", iv_backfill_enabled=False)
+
+    await agent.step()
+
+    assert asked == []
+
+
+async def test_a_closed_market_does_not_start_the_backfill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """It reads historical bars, but the rule that a closed market costs no
+    broker calls applies to it like everything else."""
+    asked = _record_backfill(monkeypatch)
+    agent, _store = _agent(_FakeMcp(is_open=False), universe="SPY")
+
+    await agent.step()
+
+    assert asked == []
+
+
+async def test_a_failing_backfill_does_not_fail_the_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pack degrades to a MISSING IV rank, which is where it started."""
+
+    async def exploding(settings, mcp, store, symbol, **kwargs):  # type: ignore[no-untyped-def]
+        msg = "option bars unavailable"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr("options_m.agents.market_pulse.backfill_daily_iv", exploding)
+    agent, store = _agent(_FakeMcp(), universe="SPY,QQQ")
+
+    await agent.step()
+
+    runs = await store.recent_agent_runs()
+    assert runs[0]["ok"] is True
+    assert await store.recent_candidates()  # evidence still collected
+
+
+async def test_what_the_backfill_did_is_recorded_in_the_run_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _record_backfill(monkeypatch)
+    agent, store = _agent(_FakeMcp(), universe="SPY")
+
+    await agent.step()
+
+    detail = (await store.recent_agent_runs())[0]["detail"]
+    assert detail["iv_backfill"] == [
+        {
+            "symbol": "SPY",
+            "sessions_missing": 5,
+            "sessions_written": 5,
+            "contracts_examined": 0,
+            "expiries_used": 0,
+            "dropped": {},
+        }
+    ]

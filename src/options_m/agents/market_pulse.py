@@ -34,6 +34,7 @@ from options_m import session
 from options_m.config import Settings
 from options_m.earnings import is_earnings_blackout
 from options_m.evidence.evidence import EvidenceCollector
+from options_m.iv_backfill import backfill_daily_iv
 from options_m.mcp_client import AlpacaMcp, finite_float
 from options_m.store import Store
 
@@ -59,6 +60,12 @@ class MarketPulseAgent:
         # Set once the calendar has been fetched with the backward window; see
         # _ensure_calendar_fresh.
         self._backfilled = False
+        # Symbols whose IV history this process has already tried to
+        # reconstruct. One attempt each: the pass is incremental against what
+        # iv_history already holds, so a symbol with sessions that simply
+        # cannot be inverted (no prints on its ATM strike) would otherwise be
+        # refetched every minute forever.
+        self._iv_backfill_attempted: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -136,6 +143,15 @@ class MarketPulseAgent:
             detail["evidence_written"] = 0
             return detail
 
+        # Reconstruct missing IV history before the evidence loop, so this
+        # tick's pack already ranks against the deeper window. Kept behind the
+        # market-open gate above with every other market-data read: the bars it
+        # asks for are historical, but the rule that a closed market costs no
+        # broker calls is worth more than finishing the backfill overnight.
+        iv_backfill = await self._backfill_iv_history()
+        if iv_backfill:
+            detail["iv_backfill"] = iv_backfill
+
         # Collect evidence for every universe symbol, derive scores, persist.
         # Each symbol is independent: a failure on one does not stop the rest.
         today = now.astimezone(_EXCHANGE_TZ).date()
@@ -195,6 +211,46 @@ class MarketPulseAgent:
         detail["evidence_written"] = evidence_written
         logger.info("market pulse", extra=detail)
         return detail
+
+    async def _backfill_iv_history(self) -> list[dict[str, Any]]:
+        """Reconstruct missing daily ATM-IV sessions for a few symbols.
+
+        IV Rank needs a trading year of daily observations before it means
+        anything, and the live writer takes a year to produce one. This pulls
+        the missing sessions out of Alpaca's historical option bars instead —
+        see :mod:`options_m.iv_backfill` for what that price is and is not.
+
+        Paced at ``iv_backfill_symbols_per_tick`` symbols per tick because each
+        symbol costs a handful of Alpaca calls; a ten-symbol universe is
+        therefore covered within the first ten minutes of a run. A failure is
+        logged and dropped: the evidence pack degrades to a MISSING rank, which
+        is the same state the service was already in.
+        """
+        if not self._settings.iv_backfill_enabled:
+            return []
+        pending = [
+            symbol for symbol in self._universe if symbol not in self._iv_backfill_attempted
+        ]
+        if not pending:
+            return []
+
+        reports: list[dict[str, Any]] = []
+        for symbol in pending[: self._settings.iv_backfill_symbols_per_tick]:
+            self._iv_backfill_attempted.add(symbol)
+            try:
+                report = await backfill_daily_iv(
+                    self._settings, self._mcp, self._store, symbol
+                )
+            except Exception:
+                logger.warning(
+                    "iv history backfill failed",
+                    extra={"symbol": symbol},
+                    exc_info=True,
+                )
+                continue
+            if report.sessions_missing:
+                reports.append(report.as_detail())
+        return reports
 
     async def _ensure_calendar_fresh(self) -> bool:
         """Populate or extend the local market_calendar cache.

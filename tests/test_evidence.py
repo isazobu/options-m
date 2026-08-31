@@ -8,8 +8,9 @@ and the pack must still come back whole.
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -276,14 +277,51 @@ async def test_open_interest_is_missing_when_the_contract_fetch_fails() -> None:
     assert options["total_open_interest"] == MISSING
 
 
-async def test_iv_rank_is_missing_on_the_first_pull_then_populates() -> None:
+async def test_iv_rank_stays_missing_while_the_daily_window_is_shallow() -> None:
+    """Repeated pulls inside one session do not deepen the window.
+
+    They used to: the rank ran over the last 252 *readings*, so a second pull a
+    minute later produced a number, and at a one-minute pulse the window
+    saturated at about four hours and stayed there. It is a daily statistic —
+    every pull below lands on the same session, so the window holds one
+    observation however many times it is asked.
+    """
     collector, _store = _collector(_FakeMcp())
 
-    first = (await collector.collect("SPY"))["options"]
-    assert first["iv_rank"] == MISSING  # only one reading exists
+    for _pull in range(5):
+        options = (await collector.collect("SPY"))["options"]
 
-    second = (await collector.collect("SPY"))["options"]
-    assert isinstance(second["iv_rank"], float)
+    assert options["iv_rank"] == MISSING
+    assert options["iv_percentile"] == MISSING
+    assert options["iv_history_sessions"] == 1
+
+
+async def test_iv_rank_populates_once_the_window_holds_enough_sessions() -> None:
+    collector, store = _collector(_FakeMcp())
+    # Stand in for what iv_backfill writes: one dated observation per past
+    # session, ascending, so the live pull that follows is the window's high.
+    exchange_tz = ZoneInfo("America/New_York")
+    first_session = date(2026, 1, 5)
+    await store.append_iv_snapshots(
+        "SPY",
+        [
+            {
+                "ts": datetime.combine(
+                    first_session + timedelta(days=offset), time(hour=16), tzinfo=exchange_tz
+                ).astimezone(UTC),
+                "iv_atm": 0.10 + offset * 0.0005,
+                "dte": 30,
+                "spot": 450.0,
+            }
+            for offset in range(130)
+        ],
+    )
+
+    options = (await collector.collect("SPY"))["options"]
+
+    assert isinstance(options["iv_rank"], float)
+    assert isinstance(options["iv_percentile"], float)
+    assert options["iv_history_sessions"] == 131
 
 
 async def test_a_flat_book_reports_none_while_an_unread_book_reports_missing() -> None:

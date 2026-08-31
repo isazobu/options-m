@@ -37,7 +37,7 @@ framework — the supervisor in `agents/__init__.py` is ~40 lines.
 
 | Agent | Cadence | LLM | MCP calls | Writes to |
 |---|---|---|---|---|
-| `MarketPulseAgent` | 60 s | ✗ | account, calendar, snapshot, bars, chain, contracts, positions, news | `account`, `market_calendar`, `evidence`, `candidates`, `equity_curve`, `iv_history` |
+| `MarketPulseAgent` | 60 s | ✗ | account, calendar, snapshot, bars, chain, contracts, option bars, positions, news | `account`, `market_calendar`, `evidence`, `candidates`, `equity_curve`, `iv_history` |
 | `PositionManagerAgent` | 60 s | ✗ | `get_all_positions` | `positions` |
 | `ExecutionAgent` | 30 s | ✗ | account, snapshot, chain, contracts, position, place_order, get_order | `orders`, `proposals`, `risk_events` |
 | `StrategistAgent` | 5 m | ✓ one call | **none** | `proposals`, `llm_calls` |
@@ -79,7 +79,12 @@ MarketPulseAgent._run()
             ├── get_stock_snapshot    → spot block (bid/ask/last/spread/change_pct)
             ├── get_stock_bars        → trend block (SMA20/50, RSI14, ATR14, RV20d, 52w range)
             ├── get_option_chain      → options block (iv_atm at trading tenor, iv_rank,
-            │                           iv_percentile, put_call_skew, atm_call/put greeks)
+            │                           iv_percentile, iv_history_sessions,
+            │                           put_call_skew, atm_call/put greeks)
+            │                           iv_rank/iv_percentile are daily statistics over
+            │                           252 sessions of iv_history, MISSING below 126;
+            │                           iv_backfill reconstructs the missing sessions
+            │                           from historical option bars.
             ├── get_option_contracts  → open interest
             ├── get_all_positions     → position block
             └── get_news              → untrusted_news (truncated headlines)
@@ -465,6 +470,7 @@ src/options_m/
 ├── earnings.py              Hand-maintained earnings calendar + is_earnings_blackout()
 ├── indicators.py            SMA · RSI · ATR · RV · 52-week range
 ├── volatility.py            IV rank · IV percentile · implied vol (Black-Scholes)
+├── iv_backfill.py           Rebuilds a trading year of daily ATM IV from option bars
 ├── config.py                Env-driven Settings (pydantic-settings)
 ├── schema.sql               Idempotent DDL applied at startup
 ├── migrate.py               Schema runner

@@ -107,6 +107,19 @@ class Settings(BaseSettings):
     limit_price_spread_nudge_pct: float = Field(default=0.25, ge=0.0, le=1.0)
     standard_monthly_expiry_preference: bool = True
 
+    # IV Rank / IV percentile. Both counted in *trading days*, never in
+    # readings: the pulse writes a reading a minute, so a window measured in
+    # rows measures hours. 252 sessions is the trading year every desk quotes
+    # IV Rank over; below 126 the store reports the rank MISSING rather than
+    # ranking today's vol against a fortnight of it.
+    iv_rank_window_days: int = Field(default=252, gt=1)
+    iv_rank_min_days: int = Field(default=126, gt=1)
+    # Reconstruct the missing part of that window from historical option bars
+    # (see iv_backfill). Paced per tick because each symbol costs a handful of
+    # Alpaca calls and the free tier is shared with everything else.
+    iv_backfill_enabled: bool = True
+    iv_backfill_symbols_per_tick: int = Field(default=1, gt=0)
+
     # Risk limits. Single source of truth: strategy_builder's liquidity gate
     # and risk.py's account-wide gate both read these fields.
     max_premium_pct_per_trade: float = Field(default=0.02, gt=0.0, le=1.0)

@@ -43,7 +43,7 @@ run's ``notes.md``. A contract with no OI at all is served as ``None``, which
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -241,11 +241,25 @@ class StubStore:
         self.iv_history: dict[str, list[dict[str, Any]]] = {}
 
     async def append_iv_snapshot(
-        self, symbol: str, *, iv_atm: float, dte: int, spot: float | None, payload: dict[str, Any]
+        self,
+        symbol: str,
+        *,
+        iv_atm: float,
+        dte: int | None = None,
+        spot: float | None = None,
+        payload: dict[str, Any] | None = None,
+        ts: datetime | None = None,
     ) -> None:
-        self.iv_history.setdefault(symbol, []).append({"iv_atm": iv_atm, "dte": dte})
+        self.iv_history.setdefault(symbol, []).append({"iv_atm": iv_atm, "dte": dte, "ts": ts})
 
-    async def iv_rank_for(self, symbol: str) -> float | None:
+    async def iv_rank_and_percentile(
+        self, symbol: str, *, days: int = 252, min_days: int = 126
+    ) -> tuple[float | None, float | None, int]:
+        # A replay has no stored IV history to rank against, so the honest
+        # answer is the same one the real store gives on a cold database.
+        return None, None, 0
+
+    async def iv_rank_for(self, symbol: str, *, days: int = 252, min_days: int = 126) -> None:
         return None
 
     async def recent_iv(self, symbol: str, limit: int = 60) -> list[dict[str, Any]]:

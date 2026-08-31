@@ -24,6 +24,7 @@ options-m/
 │   ├── lifecycle.py         # signal handling, interruptible sleep
 │   ├── logging_config.py    # logging setup (JSON / text)
 │   ├── server.py            # uvicorn wired to the shutdown signal
+│   ├── iv_backfill.py       # daily ATM-IV history rebuilt from option bars
 │   └── volatility.py        # Black-Scholes greeks + IV Rank (pure stdlib)
 ├── tests/
 ├── pyproject.toml           # deps, build, ruff, mypy, pytest config

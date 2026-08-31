@@ -209,6 +209,8 @@ def _fake_server() -> tuple[FastMCP, dict[str, int]]:
         type: str | None = None,  # mirrors the real tool's own parameter name
     ) -> dict[str, Any]:
         calls["get_option_contracts"] = calls.get("get_option_contracts", 0) + 1
+        key = f"get_option_contracts:status={status}"
+        calls[key] = calls.get(key, 0) + 1
         if underlying_symbols == "ENDLESS":
             n = calls["get_option_contracts"]
             body = {
@@ -248,6 +250,46 @@ def _fake_server() -> tuple[FastMCP, dict[str, int]]:
                 "next_page_token": None,
             }
         return _wrap(body, "get_option_contracts")
+
+    @server.tool
+    def get_option_bars(
+        symbols: str,
+        timeframe: str,
+        start: str | None = None,
+        end: str | None = None,
+        limit: int = 1000,
+        page_token: str | None = None,
+        sort: str | None = None,
+    ) -> dict[str, Any]:
+        calls["get_option_bars"] = calls.get("get_option_bars", 0) + 1
+        requested = symbols.split(",")
+        if requested == ["QUIET"]:
+            # A window in which nothing printed: the API omits the key rather
+            # than returning an empty object.
+            return _wrap({"next_page_token": None}, "get_option_bars")
+        if page_token is None:
+            return _wrap(
+                {
+                    "bars": {
+                        occ: [
+                            {"t": "2026-01-06T05:00:00Z", "o": 2.0, "c": 2.2, "v": 500, "n": 120}
+                        ]
+                        for occ in requested
+                    },
+                    "next_page_token": "bars-p2",
+                },
+                "get_option_bars",
+            )
+        return _wrap(
+            {
+                "bars": {
+                    occ: [{"t": "2026-01-05T05:00:00Z", "o": 1.9, "c": 2.0, "v": 400, "n": 90}]
+                    for occ in requested
+                },
+                "next_page_token": None,
+            },
+            "get_option_bars",
+        )
 
     @server.tool
     def get_option_chain(
@@ -887,6 +929,80 @@ async def test_get_option_contracts_returns_the_contracts_list() -> None:
 
     assert contracts[0]["symbol"] == "SPY250321C00100000"
     assert contracts[0]["strike_price"] == "100"
+
+
+async def test_get_option_contracts_can_ask_for_expired_contracts() -> None:
+    """The backfill's only route to a strike that expired months ago: Alpaca
+    returns active contracts unless the status is spelled out."""
+    server, calls = _fake_server()
+    mcp = await _connected(_settings(), server)
+    try:
+        await mcp.get_option_contracts("SPY")
+        await mcp.get_option_contracts("SPY", status="inactive")
+    finally:
+        await mcp.close()
+
+    # Two pages each, and the status travels with every page of a listing.
+    assert calls["get_option_contracts:status=active"] == 2
+    assert calls["get_option_contracts:status=inactive"] == 2
+
+
+async def test_get_option_bars_merges_pages_and_sorts_oldest_first() -> None:
+    server, calls = _fake_server()
+    mcp = await _connected(_settings(), server)
+    try:
+        bars = await mcp.get_option_bars(
+            ["SPY260116C00100000"], start="2026-01-05", end="2026-01-06"
+        )
+    finally:
+        await mcp.close()
+
+    series = bars["SPY260116C00100000"]
+    assert calls["get_option_bars"] == 2
+    # Page one carried the 6th and page two the 5th; the series comes back in
+    # chronological order regardless of the order the pages arrived in.
+    assert [bar["t"][:10] for bar in series] == ["2026-01-05", "2026-01-06"]
+    assert series[0]["n"] == 90
+
+
+async def test_get_option_bars_treats_a_window_with_no_prints_as_empty() -> None:
+    """No key at all is how the API says "nothing traded" — not an error, and
+    not something to raise on: the backfill drops those sessions."""
+    server, _calls = _fake_server()
+    mcp = await _connected(_settings(), server)
+    try:
+        bars = await mcp.get_option_bars(["QUIET"], start="2026-01-05", end="2026-01-06")
+    finally:
+        await mcp.close()
+
+    assert bars == {}
+
+
+async def test_get_option_bars_refuses_more_symbols_than_the_api_accepts() -> None:
+    """Past 100 the API silently drops the tail, which would read back as
+    contracts that never traded."""
+    server, _calls = _fake_server()
+    mcp = await _connected(_settings(), server)
+    try:
+        with pytest.raises(ValueError, match="at most 100 symbols"):
+            await mcp.get_option_bars(
+                [f"SPY260116C{index:08d}" for index in range(101)],
+                start="2026-01-05",
+                end="2026-01-06",
+            )
+    finally:
+        await mcp.close()
+
+
+async def test_get_option_bars_with_no_symbols_makes_no_call() -> None:
+    server, calls = _fake_server()
+    mcp = await _connected(_settings(), server)
+    try:
+        assert await mcp.get_option_bars([], start="2026-01-05", end="2026-01-06") == {}
+    finally:
+        await mcp.close()
+
+    assert "get_option_bars" not in calls
 
 
 async def test_get_option_chain_returns_the_snapshots_mapping() -> None:
