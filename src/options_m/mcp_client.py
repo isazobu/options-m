@@ -447,19 +447,26 @@ class AlpacaMcp:
                 # (bad credentials, a rejected parameter, a rate limit).
                 # Respawning it would fix nothing and costs a subprocess.
                 last_error = exc
-                permanent = _is_unknown_tool(exc)
-                logger.warning(
+                not_found = _looks_like_not_found(str(exc))
+                permanent = not_found or _is_unknown_tool(exc)
+                # "position does not exist" is an answer, not a fault: it is how
+                # get_open_position reports flat. Logging it at WARNING made a
+                # normal flat symbol look like a broker incident.
+                log = logger.debug if not_found else logger.warning
+                log(
                     "mcp tool call failed",
                     extra={
                         "tool": tool,
                         "attempt": attempt + 1,
                         "attempts_allowed": 1 if permanent else self._max_retries + 1,
                         "permanent": permanent,
+                        "not_found": not_found,
                     },
                 )
                 # A tool the server never registered will not appear on the
                 # next attempt: the toolset allowlist is fixed for the life of
-                # the subprocess. Retrying only adds backoff to every caller.
+                # the subprocess. Neither will a position that does not exist —
+                # retrying either only adds backoff to every caller.
                 if permanent:
                     break
                 if attempt < self._max_retries:

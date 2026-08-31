@@ -1112,6 +1112,34 @@ async def test_get_open_position_returns_none_for_a_genuine_not_found() -> None:
     assert position is None
 
 
+async def test_a_missing_position_is_not_retried() -> None:
+    """"Position does not exist" is an answer, not a fault.
+
+    Alpaca answers a flat symbol with a 404, which the server raises as a
+    ToolError. Treating that as transient spent three attempts plus backoff —
+    and three WARNING lines with a rich traceback — on every flat underlying.
+    """
+    server, _calls = _fake_server()
+    mcp = await _connected(_settings(mcp_max_retries=2), server)
+    mcp._reconnect_quietly = _noop  # type: ignore[method-assign]
+
+    attempts = 0
+    inner = mcp._client.call_tool  # type: ignore[union-attr]
+
+    async def _counting(*args: Any, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        return await inner(*args, **kwargs)
+
+    mcp._client.call_tool = _counting  # type: ignore[union-attr, method-assign]
+    try:
+        assert await mcp.get_open_position("MISSING") is None
+    finally:
+        await mcp.close()
+
+    assert attempts == 1
+
+
 async def test_get_open_position_propagates_an_unrelated_broker_error() -> None:
     """A broker outage must never be misread as "flat"."""
     server, _calls = _fake_server()
