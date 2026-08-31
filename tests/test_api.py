@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import httpx
 import pytest
@@ -338,3 +339,64 @@ async def test_kill_switch_routes_require_the_admin_token() -> None:
 
     assert unauthenticated.status_code == 401
     assert authenticated.status_code == 200
+
+
+# ---- CORS ---------------------------------------------------------------
+
+
+async def test_a_configured_origin_gets_a_preflight_response() -> None:
+    """The dashboard is a browser app: without this it cannot call the API.
+
+    A preflight is the *first* request the browser makes, so when the CORS
+    middleware is missing it never reaches a route at all — FastAPI has no
+    OPTIONS handler and answers 405 with no ACAO header. That is invisible
+    from the server side; the health check still passes.
+    """
+    db = Database(Settings(database_url=None))
+    settings = Settings(cors_allowed_origins="https://options-m-dashboard.vercel.app")
+    app = create_app(db, [], mcp=None, store=Store(db), settings=settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        preflight = await client.options(
+            "/api/agent-runs",
+            headers={
+                "Origin": "https://options-m-dashboard.vercel.app",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization",
+            },
+        )
+
+    assert preflight.status_code == 200
+    assert (
+        preflight.headers["access-control-allow-origin"]
+        == "https://options-m-dashboard.vercel.app"
+    )
+
+
+async def test_an_unlisted_origin_is_not_allowed() -> None:
+    db = Database(Settings(database_url=None))
+    settings = Settings(cors_allowed_origins="https://options-m-dashboard.vercel.app")
+    app = create_app(db, [], mcp=None, store=Store(db), settings=settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/status", headers={"Origin": "https://evil.example"})
+
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_the_blueprint_ships_a_non_empty_cors_origin() -> None:
+    """The outage this guards: a blueprint apply overwrote the origin with "".
+
+    The value belongs in render.yaml precisely because an apply overwrites
+    whatever the Render dashboard holds — so an empty value here is not a
+    placeholder, it is a broken dashboard on the next deploy.
+    """
+    import yaml
+
+    repo_root = Path(__file__).resolve().parent.parent
+    blueprint = yaml.safe_load((repo_root / "render.yaml").read_text())
+    env_vars = blueprint["services"][0]["envVars"]
+    origins = next(var for var in env_vars if var["key"] == "CORS_ALLOWED_ORIGINS")
+
+    assert origins.get("value"), "CORS_ALLOWED_ORIGINS must carry the dashboard origin"
+    assert origins["value"].startswith("https://")
