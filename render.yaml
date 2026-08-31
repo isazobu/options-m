@@ -54,7 +54,9 @@ services:
       # instance holds two Python processes. Keep the toolset list tight.
       # `trading` carries positions, orders, place_option_order and
       # close_position — without it the service starts healthy and cannot
-      # trade. `news` is gone with the technical-analysis-only design.
+      # trade. `news` carries get_news, which EvidenceCollector calls on every
+      # pull: without it each symbol logs "Unknown tool: 'get_news'" and the
+      # catalyst signal is dropped from the evidence pack.
       - key: ALPACA_TOOLSETS
         value: account,trading,assets,options-data,stock-data,news
       # Must stay exactly "true". The service refuses to start on any value
