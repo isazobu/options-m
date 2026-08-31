@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     # error. `trading` is the one that carries positions, orders,
     # place_option_order and close_position: without it the service connects,
     # reports healthy, and cannot trade.
-    alpaca_toolsets: str = "account,trading,assets,options-data,stock-data"
+    alpaca_toolsets: str = "account,trading,assets,options-data,stock-data,news"
     mcp_call_timeout_seconds: float = Field(default=30.0, gt=0)
     mcp_max_retries: int = Field(default=2, ge=0)
 

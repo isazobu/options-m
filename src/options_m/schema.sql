@@ -84,6 +84,19 @@ CREATE TABLE IF NOT EXISTS iv_history (
     total_open_interest bigint
 );
 
+-- Every column past iv_atm was added after the table shipped, and
+-- CREATE TABLE IF NOT EXISTS does not backfill columns onto a table that
+-- already exists: a deployed database created before them kept failing every
+-- INSERT with 'column "dte" ... does not exist'. Restated as ALTERs so the
+-- file is idempotent against an old table as well as a fresh one.
+ALTER TABLE iv_history ADD COLUMN IF NOT EXISTS dte integer;
+ALTER TABLE iv_history ADD COLUMN IF NOT EXISTS spot numeric;
+ALTER TABLE iv_history ADD COLUMN IF NOT EXISTS payload jsonb;
+ALTER TABLE iv_history ADD COLUMN IF NOT EXISTS put_call_skew numeric;
+ALTER TABLE iv_history ADD COLUMN IF NOT EXISTS term_structure numeric;
+ALTER TABLE iv_history ADD COLUMN IF NOT EXISTS median_spread_pct numeric;
+ALTER TABLE iv_history ADD COLUMN IF NOT EXISTS total_open_interest bigint;
+
 CREATE INDEX IF NOT EXISTS iv_history_symbol_ts_idx ON iv_history (symbol, ts DESC);
 
 -- One row per StrategyIntent considered. llm_read and matrix_verdict are

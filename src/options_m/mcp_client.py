@@ -171,6 +171,15 @@ def finite_float(value: object) -> float | None:
     return number
 
 
+def _is_unknown_tool(exc: ToolError) -> bool:
+    """True when the server reported the tool as unregistered.
+
+    fastmcp raises a plain ToolError carrying the server's message, so the
+    message text is the only signal available.
+    """
+    return "unknown tool" in str(exc).casefold()
+
+
 class AlpacaMcp:
     """A long-lived MCP session against the official Alpaca MCP server.
 
@@ -432,14 +441,21 @@ class AlpacaMcp:
                 # (bad credentials, a rejected parameter, a rate limit).
                 # Respawning it would fix nothing and costs a subprocess.
                 last_error = exc
+                permanent = _is_unknown_tool(exc)
                 logger.warning(
                     "mcp tool call failed",
                     extra={
                         "tool": tool,
                         "attempt": attempt + 1,
-                        "attempts_allowed": self._max_retries + 1,
+                        "attempts_allowed": 1 if permanent else self._max_retries + 1,
+                        "permanent": permanent,
                     },
                 )
+                # A tool the server never registered will not appear on the
+                # next attempt: the toolset allowlist is fixed for the life of
+                # the subprocess. Retrying only adds backoff to every caller.
+                if permanent:
+                    break
                 if attempt < self._max_retries:
                     await asyncio.sleep(0.5 * (attempt + 1))
                 continue
