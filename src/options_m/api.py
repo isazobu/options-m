@@ -487,6 +487,17 @@ def create_app(
             allow_headers=["Authorization", "Content-Type"],
             allow_credentials=False,
         )
+        logger.info("cors enabled", extra={"cors_origins": list(cors_origins)})
+    else:
+        # Said out loud because the failure is otherwise invisible from the
+        # server side: with no middleware there is no OPTIONS route, so a
+        # browser preflight gets a bare 405 and the dashboard reports only
+        # "No 'Access-Control-Allow-Origin' header". Every log line, health
+        # check and curl still looks perfectly healthy.
+        logger.warning(
+            "CORS_ALLOWED_ORIGINS is empty; no CORS middleware is installed and "
+            "browser calls from the dashboard will fail their preflight"
+        )
 
     app.include_router(router)
     app.include_router(admin_router)
