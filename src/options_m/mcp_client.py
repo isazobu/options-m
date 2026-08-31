@@ -729,11 +729,18 @@ class AlpacaMcp:
     async def get_stock_bars(
         self, symbol: str, *, timeframe: str = "1Day", limit: int = 252
     ) -> list[dict[str, Any]]:
-        """Historical OHLCV bars for one symbol, oldest first.
+        """The most recent ``limit`` OHLCV bars for one symbol, oldest first.
 
         ``days`` is sized generously from ``limit`` so weekends and holidays do
-        not starve a daily-bar request; the API still caps the result at
-        ``limit``.
+        not starve a daily-bar request — which means the window holds more bars
+        than ``limit`` and the API truncates it, leaving the rest behind a
+        ``next_page_token`` this does not follow. So the request is sorted
+        newest-first: ``limit`` then cuts the *old* end of the window off, not
+        the recent end. Asking ascending instead silently returned a series that
+        stopped weeks before today, and every trend figure computed from it —
+        the moving averages, RSI, ATR, realised vol, the 52-week extremes — was
+        that stale. The bars are re-sorted here to keep the oldest-first order
+        callers expect.
         """
         payload = self._expect_mapping(
             "get_stock_bars",
@@ -744,7 +751,7 @@ class AlpacaMcp:
                     "timeframe": timeframe,
                     "limit": limit,
                     "days": int(limit * 1.6) + 15,
-                    "sort": "asc",
+                    "sort": "desc",
                 },
             ),
         )
@@ -754,7 +761,12 @@ class AlpacaMcp:
         if not isinstance(bars, list):
             msg = "get_stock_bars returned no bar list"
             raise McpProtocolError(msg)
-        return [bar for bar in bars if isinstance(bar, dict)]
+        rows = [bar for bar in bars if isinstance(bar, dict)]
+        # Sorted rather than reversed: correct whether or not the server build
+        # honoured ``sort``. Bar timestamps are fixed-format RFC 3339, so the
+        # string order is the chronological order.
+        rows.sort(key=lambda bar: str(bar.get("t") or ""))
+        return rows
 
     async def get_option_chain(
         self,

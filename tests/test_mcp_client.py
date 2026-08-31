@@ -170,7 +170,9 @@ def _fake_server() -> tuple[FastMCP, dict[str, int]]:
         limit: int = 1000,
         sort: str = "asc",
     ) -> dict[str, Any]:
-        bars = [
+        # Modelled on the real endpoint: the window holds more bars than
+        # ``limit``, and the cut is taken from whichever end ``sort`` starts at.
+        history = [
             {
                 "t": f"2026-08-{10 + i:02d}T00:00:00Z",
                 "o": 100.0,
@@ -181,9 +183,13 @@ def _fake_server() -> tuple[FastMCP, dict[str, int]]:
                 "n": 10,
                 "vw": 100.0,
             }
-            for i in range(5)
+            for i in range(10)
         ]
-        return _wrap({"bars": {symbols: bars}, "next_page_token": None}, "get_stock_bars")
+        if sort == "desc":
+            history.reverse()
+        bars = history[:limit]
+        token = None if len(history) <= limit else "more"
+        return _wrap({"bars": {symbols: bars}, "next_page_token": token}, "get_stock_bars")
 
     @server.tool
     def get_stock_snapshot(symbols: str) -> dict[str, Any]:
@@ -838,7 +844,24 @@ async def test_get_stock_bars_returns_the_named_symbols_bars() -> None:
         await mcp.close()
 
     assert len(bars) == 5
-    assert bars[0]["c"] == 100.0
+    assert [bar["t"] for bar in bars] == sorted(bar["t"] for bar in bars)
+
+
+async def test_get_stock_bars_takes_the_newest_bars_not_the_oldest() -> None:
+    """The window is deliberately wider than ``limit``, so a truncated page has
+    to drop the far end of it. Dropping the recent end instead handed the trend
+    block a series that stopped weeks short of today."""
+    server, _calls = _fake_server()
+    mcp = await _connected(_settings(), server)
+    try:
+        bars = await mcp.get_stock_bars("SPY", limit=5)
+    finally:
+        await mcp.close()
+
+    # The fake serves ten days, 2026-08-10 .. 2026-08-19; the last five of them,
+    # still oldest first, are what a caller asking for five must get.
+    assert [bar["t"][:10] for bar in bars] == [f"2026-08-{day}" for day in range(15, 20)]
+    assert bars[-1]["c"] == 109.0
 
 
 async def test_get_stock_snapshot_unwraps_the_per_symbol_key() -> None:
