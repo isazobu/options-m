@@ -7,8 +7,9 @@ belong to ``StrategistAgent``, which reads this cache each iteration and writes
 a ``close`` proposal when a threshold is crossed. ``ExecutionAgent`` then acts
 on that proposal exactly as it does for open proposals.
 
-The ``pnl_pct`` field added to each payload avoids StrategistAgent having to
-re-derive it from raw market_value / unrealized_pl every tick.
+The derived fields added to each payload -- ``net_value``, ``pnl_pct`` and
+``min_dte`` -- are the whole input surface of the exit rule, so
+StrategistAgent never has to re-derive them from raw legs every tick.
 """
 
 from __future__ import annotations
@@ -16,18 +17,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import re
 import time
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from options_m.config import Settings
+from options_m.evidence.occ import parse_occ_symbol
 from options_m.mcp_client import AlpacaMcp
 from options_m.store import Store
 
 logger = logging.getLogger(__name__)
-
-_OCC_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})\d{6}[CP]\d{8}$")
 
 _ENRICH_KEYS = ("proposal_id", "entry_price", "opened_at", "strategy")
 
@@ -79,6 +78,7 @@ class PositionManagerAgent:
         existing_by_symbol: dict[str, dict[str, Any]] = {
             row["symbol"]: row["payload"] for row in existing_rows
         }
+        today = _now_utc().date()
 
         grouped: dict[str, list[dict[str, Any]]] = {}
         for position in positions:
@@ -91,7 +91,13 @@ class PositionManagerAgent:
 
             payload: dict[str, Any] = {"legs": legs}
             payload["unrealized_pl"] = _total_unrealized_pl(legs)
+            # Gross exposure, what the Telegram summary and the dashboard show.
             payload["market_value"] = _total_market_value(legs)
+            # Signed net -- negative for a structure that was opened for a
+            # credit. This, not the gross, is what pnl_pct divides by and what
+            # ExecutionAgent prices a close against.
+            payload["net_value"] = _net_market_value(legs)
+            payload["min_dte"] = _min_dte(legs, today)
 
             # Carry forward enrichment that was resolved in a previous tick.
             for key in _ENRICH_KEYS:
@@ -101,6 +107,13 @@ class PositionManagerAgent:
             # Enrich on first appearance: link to the originating proposal.
             if "proposal_id" not in payload:
                 _enrich_from_orders(payload, legs, all_orders)
+
+            # The strategy name lives on the proposal, not on the order, so it
+            # needs a read the pure enrichment helper cannot do. Attempted once
+            # per position: the key is set either way, and from here on
+            # _ENRICH_KEYS carries it forward without another read.
+            if "strategy" not in payload:
+                await self._resolve_strategy(payload)
 
             # Pre-compute pnl_pct so StrategistAgent can read it directly.
             payload["pnl_pct"] = _compute_pnl_pct(payload)
@@ -121,6 +134,23 @@ class PositionManagerAgent:
         logger.info("position pulse", extra=detail)
         return detail
 
+    async def _resolve_strategy(self, payload: dict[str, Any]) -> None:
+        """Copy the strategy name off the originating proposal, in-place.
+
+        Always sets the key, empty when there is no proposal to read or the
+        proposal is gone -- so the attempt is made once rather than on every
+        tick. A position left with an empty strategy still exits, just on the
+        fallback thresholds rather than its family's.
+        """
+        strategy = ""
+        proposal_id = payload.get("proposal_id")
+        if isinstance(proposal_id, int):
+            proposal = await self._store.get_proposal(proposal_id)
+            intent = (proposal or {}).get("intent")
+            if isinstance(intent, dict):
+                strategy = str(intent.get("strategy") or "")
+        payload["strategy"] = strategy
+
 
 # ---------------------------------------------------------------------------
 # Module-level pure helpers
@@ -132,7 +162,7 @@ def _enrich_from_orders(
     legs: list[dict[str, Any]],
     all_orders: list[dict[str, Any]],
 ) -> None:
-    """Fill proposal_id, entry_price, opened_at, strategy into payload in-place.
+    """Fill proposal_id, entry_price and opened_at into payload in-place.
 
     Scans the orders cache for a filled entry order (``om-`` prefix) whose
     request legs share an OCC symbol with this position's legs. Skips close
@@ -180,19 +210,30 @@ def _enrich_from_orders(
                 if hasattr(submitted, "isoformat")
                 else str(submitted)
             )
-            payload["strategy"] = ""
             return
 
 
 def _compute_pnl_pct(payload: dict[str, Any]) -> float | None:
-    """Unrealized P&L as a fraction of entry value. None if uncomputable."""
+    """Unrealized P&L as a fraction of entry value. None if uncomputable.
+
+    Divides by the signed ``net_value`` where there is one: on a two-legged
+    credit structure the gross exposure is the sum of both legs' magnitudes,
+    which is not what was risked and not what the P&L is a share of. With the
+    net, this ratio reads directly as "share of the credit realised" for a
+    credit structure and "share of the debit recovered" for a debit one.
+
+    Falls back to ``market_value`` for a payload written before ``net_value``
+    existed, and for a single-leg long position where the two are identical.
+    """
     unrealized_pl = payload.get("unrealized_pl")
-    market_value = payload.get("market_value")
-    if unrealized_pl is None or market_value is None:
+    current_value = payload.get("net_value")
+    if current_value is None:
+        current_value = payload.get("market_value")
+    if unrealized_pl is None or current_value is None:
         return None
     with contextlib.suppress(TypeError, ValueError, ZeroDivisionError):
         unreal = float(unrealized_pl)
-        entry_value = float(market_value) - unreal
+        entry_value = float(current_value) - unreal
         if abs(entry_value) > 0.001:
             return unreal / abs(entry_value)
     return None
@@ -207,6 +248,7 @@ def _total_unrealized_pl(positions: list[dict[str, Any]]) -> float:
 
 
 def _total_market_value(positions: list[dict[str, Any]]) -> float:
+    """Gross exposure: every leg's magnitude, regardless of side."""
     total = 0.0
     for p in positions:
         with contextlib.suppress(TypeError, ValueError):
@@ -214,12 +256,36 @@ def _total_market_value(positions: list[dict[str, Any]]) -> float:
     return total
 
 
+def _net_market_value(positions: list[dict[str, Any]]) -> float:
+    """Net value of the structure: long legs positive, short legs negative.
+
+    Alpaca already signs a short leg's market_value, so netting is a plain sum.
+    """
+    total = 0.0
+    for p in positions:
+        with contextlib.suppress(TypeError, ValueError):
+            total += float(p.get("market_value"))  # type: ignore[arg-type]
+    return total
+
+
+def _min_dte(legs: list[dict[str, Any]], today: date) -> int | None:
+    """Days to the nearest expiry across the option legs, None if there is none.
+
+    The nearest one is what matters: it is the leg that expires, gets assigned,
+    or leaves the rest of the structure naked.
+    """
+    dtes = [
+        (parsed.expiry - today).days
+        for leg in legs
+        if (parsed := parse_occ_symbol(str(leg.get("symbol", "")))) is not None
+    ]
+    return min(dtes) if dtes else None
+
+
 def _underlying_symbol(position: dict[str, Any]) -> str:
     symbol = str(position.get("symbol", "")).upper()
-    match = _OCC_SYMBOL_RE.match(symbol)
-    if match:
-        return match.group(1)
-    return symbol
+    parsed = parse_occ_symbol(symbol)
+    return parsed.underlying if parsed is not None else symbol
 
 
 def _maybe_float(value: object) -> float | None:

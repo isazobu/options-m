@@ -182,7 +182,16 @@ async def run(
                     intent,
                     contracts=contracts,
                     snapshots=snapshots,
-                    account={"equity": STARTING_EQUITY, "options_trading_level": 3},
+                    account={
+                        "equity": STARTING_EQUITY,
+                        # Sizing refuses to guess at collateral, so the harness
+                        # has to declare the account's options capacity. A cash
+                        # account holding the starting equity is the shape the
+                        # replay assumes elsewhere.
+                        "cash": STARTING_EQUITY,
+                        "options_buying_power": STARTING_EQUITY,
+                        "options_trading_level": 3,
+                    },
                     existing_position=None,
                     settings=settings,
                     proposal_id=proposal_id,
@@ -208,6 +217,16 @@ async def run(
 
             portfolio = PortfolioSnapshot(
                 equity=STARTING_EQUITY,
+                # No margin modelling in the replay: the harness never closes a
+                # position mid-run, so options buying power stays at the
+                # starting equity rather than tracking collateral posted.
+                options_buying_power=STARTING_EQUITY,
+                # The replay does not model portfolio greeks: it never holds a
+                # book long enough for aggregate delta/vega to matter, and the
+                # evidence packs it replays carry no position side. Zero is a
+                # measured "no exposure", which is what an unbuilt book is here.
+                projected_beta_weighted_delta=0.0,
+                projected_net_vega=0.0,
                 start_of_day_equity=STARTING_EQUITY,
                 high_water_mark=STARTING_EQUITY,
                 concurrent_option_positions=len(open_positions),

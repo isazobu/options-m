@@ -43,6 +43,9 @@ class RiskLimits(BaseModel):
 
     max_premium_pct_per_trade: float
     max_total_premium_pct: float
+    buying_power_utilization_cap: float
+    max_beta_weighted_delta_pct: float
+    max_net_vega_pct: float
     max_concurrent_positions: int
     max_positions_per_underlying: int
     dte_min: int
@@ -59,6 +62,9 @@ class RiskLimits(BaseModel):
         return cls(
             max_premium_pct_per_trade=settings.max_premium_pct_per_trade,
             max_total_premium_pct=settings.max_total_premium_pct,
+            buying_power_utilization_cap=settings.buying_power_utilization_cap,
+            max_beta_weighted_delta_pct=settings.max_beta_weighted_delta_pct,
+            max_net_vega_pct=settings.max_net_vega_pct,
             max_concurrent_positions=settings.max_concurrent_positions,
             max_positions_per_underlying=settings.max_positions_per_underlying,
             dte_min=settings.risk_dte_min,
@@ -83,11 +89,21 @@ class PortfolioSnapshot(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     equity: float | None
+    # *Options* buying power, resolved by sizing.resolve_options_buying_power —
+    # never the account's headline `buying_power`, which is the 2x margin figure
+    # and would authorise twice the options exposure the account can carry.
+    options_buying_power: float | None
     start_of_day_equity: float | None
     high_water_mark: float | None
     concurrent_option_positions: int
     positions_in_underlying: int
     total_open_option_premium: float | None
+    # Book exposure *including* the plan under evaluation, from
+    # exposure.book_exposure combined with exposure.plan_exposure. Both nullable:
+    # a book whose greeks could not be computed is unknown, never zero — zero is
+    # indistinguishable from a perfectly hedged book and would read as smaller.
+    projected_beta_weighted_delta: float | None
+    projected_net_vega: float | None
     market_is_open: bool
     minutes_to_close: float | None
     kill_switch_engaged: bool
@@ -122,6 +138,9 @@ class RiskEngine:
             self._check_spread,
             self._check_premium_per_trade,
             self._check_total_premium,
+            self._check_buying_power,
+            self._check_beta_weighted_delta,
+            self._check_net_vega,
             self._check_concurrent_positions,
             self._check_positions_per_underlying,
             self._check_daily_loss_halt,
@@ -228,6 +247,76 @@ class RiskEngine:
         existing = finite_float(portfolio.total_open_option_premium) or 0.0
         if existing + plan.max_loss > self._limits.max_total_premium_pct * equity:
             return "total_premium_exceeded"
+        return None
+
+    def _check_buying_power(self, plan: OrderPlan, portfolio: PortfolioSnapshot) -> str | None:
+        """Can the account actually carry this order?
+
+        Nothing checked this before, and equity is not a substitute: a
+        defined-risk short structure holds its whole width as collateral while
+        leaving equity untouched, so an account can be fully committed and still
+        report the equity it started with. Submitting anyway means the broker
+        does the refusing, which costs a full round of chain reads and lands as
+        an opaque ``failed`` proposal.
+
+        ``max_loss`` stands in for the collateral requirement, which is exact
+        for every structure this system builds except a cash-secured put, where
+        it understates the cash actually held — sizing applies the strike-based
+        requirement for that one, so the understatement here can only make this
+        gate more permissive than sizing, never less.
+        """
+        buying_power = finite_float(portfolio.options_buying_power)
+        if buying_power is None:
+            return "unknown_buying_power"
+        if plan.max_loss > self._limits.buying_power_utilization_cap * buying_power:
+            return "insufficient_buying_power"
+        return None
+
+    def _check_beta_weighted_delta(
+        self, _plan: OrderPlan, portfolio: PortfolioSnapshot
+    ) -> str | None:
+        """Total directional exposure, restated in index-equivalent dollars.
+
+        The check the position count cannot do. Five short-premium spreads
+        across SPY, QQQ and large-cap tech are not five independent bets — they
+        correlate around 0.8-0.9 and the matrix picks the same family for all of
+        them whenever the IV regime is the same, so their deltas add rather than
+        diversify. ``max_concurrent_positions`` counts them as five slots; this
+        counts them as one exposure.
+
+        Symmetric in sign: a book that is heavily *short* the index is as
+        directional as one that is long, and the failure mode this exists to
+        stop — every position losing together on one index move — does not care
+        which way.
+        """
+        equity = finite_float(portfolio.equity)
+        if equity is None:
+            return "unknown_equity"
+        exposure = finite_float(portfolio.projected_beta_weighted_delta)
+        if exposure is None:
+            return "unknown_portfolio_delta"
+        if abs(exposure) > self._limits.max_beta_weighted_delta_pct * equity:
+            return "beta_weighted_delta_exceeded"
+        return None
+
+    def _check_net_vega(self, _plan: OrderPlan, portfolio: PortfolioSnapshot) -> str | None:
+        """Dollars per one point of implied vol, across the whole book.
+
+        Also symmetric, and for a sharper reason than delta: a book of five
+        credit structures is short vol five times over, and a book of five
+        strangles is long vol five times over. Both are one bet, and each
+        position's own defined max loss says nothing about the aggregate — which
+        is exactly how a short-premium book gets destroyed by a single vol spike
+        while every individual position looked correctly sized.
+        """
+        equity = finite_float(portfolio.equity)
+        if equity is None:
+            return "unknown_equity"
+        vega = finite_float(portfolio.projected_net_vega)
+        if vega is None:
+            return "unknown_portfolio_vega"
+        if abs(vega) > self._limits.max_net_vega_pct * equity:
+            return "net_vega_exceeded"
         return None
 
     def _check_concurrent_positions(

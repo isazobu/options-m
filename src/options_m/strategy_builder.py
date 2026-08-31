@@ -29,6 +29,7 @@ from typing import Any, Literal
 from options_m.config import Settings
 from options_m.mcp_client import finite_float
 from options_m.models import Leg, OrderPlan, Rejection, StrategyIntent
+from options_m.sizing import SizingDecision, SizingState, size_position
 from options_m.volatility import implied_vol
 
 # Dividend yield assumed away for the IV solve, matching evidence.py's own
@@ -307,6 +308,32 @@ def _liquidity_rejection(
     return None
 
 
+def _sizing_rejection(
+    proposal_id: int, decision: SizingDecision, max_loss_per_contract: float
+) -> Rejection | None:
+    """``None`` when the trade has a size; a :class:`Rejection` when it has none.
+
+    The reason keeps the historical ``zero_quantity`` spelling for the ordinary
+    "one contract does not fit the budget" case, so the dashboard's existing
+    rejection tallies stay comparable, and carries the full sizing arithmetic in
+    the detail. A campaign that has run out of sessions, or a broker field that
+    could not be read, gets its own reason instead — those are not budget
+    outcomes and reading them as one would hide a stalled campaign as a run of
+    trades that were merely too expensive.
+    """
+    if decision.qty > 0:
+        return None
+    reason = decision.blocked_reason or "zero_quantity"
+    if reason.startswith("zero_quantity"):
+        reason = "zero_quantity"
+    return _reject(
+        proposal_id,
+        reason,
+        max_loss_per_contract=max_loss_per_contract,
+        **decision.detail,
+    )
+
+
 async def build(
     intent: StrategyIntent,
     *,
@@ -317,8 +344,19 @@ async def build(
     settings: Settings,
     proposal_id: int,
     spot: float,
+    sizing_state: SizingState | None = None,
 ) -> OrderPlan | Rejection:
-    """Build a fully-priced :class:`OrderPlan`, or explain why one is refused."""
+    """Build a fully-priced :class:`OrderPlan`, or explain why one is refused.
+
+    ``sizing_state`` carries the account history that scales the trade up or
+    down (see :mod:`options_m.sizing`). Omitting it falls back to capacity read
+    from ``account`` alone with every history-derived scalar neutral — correct
+    for the CLI's one-shot ``plan`` and for a first run against an empty store,
+    both of which have genuinely observed no drawdown to taper against.
+    """
+    state = sizing_state or SizingState.from_account(
+        account, prior=settings.conviction_reliability_prior
+    )
     canonical = _STRATEGY_ALIASES.get(intent.strategy, intent.strategy)
     if canonical not in _SUPPORTED_STRATEGIES:
         return _reject(
@@ -342,7 +380,7 @@ async def build(
         return _build_long_strangle(
             intent,
             universe=universe,
-            account=account,
+            state=state,
             settings=settings,
             proposal_id=proposal_id,
             spot=spot,
@@ -357,7 +395,7 @@ async def build(
         return _build_credit_structure(
             intent,
             universe=universe,
-            account=account,
+            state=state,
             settings=settings,
             proposal_id=proposal_id,
             spot=spot,
@@ -480,25 +518,17 @@ async def build(
         return rejection
     assert max_loss is not None
 
-    equity = finite_float(account.get("equity"))
-    if equity is None:
-        return _reject(proposal_id, "no_account_equity")
-    max_premium_budget = settings.max_premium_pct_per_trade * equity
-    qty = math.floor(max_premium_budget / max_loss)
-
-    if intent.strategy == "cash_secured_put":
-        cash = finite_float(account.get("cash"))
-        if cash is not None:
-            max_qty_by_cash = math.floor(cash / (primary.strike * _CONTRACT_MULTIPLIER))
-            qty = min(qty, max_qty_by_cash)
-
-    if qty <= 0:
-        return _reject(
-            proposal_id,
-            "zero_quantity",
-            max_premium_budget=max_premium_budget,
-            max_loss_per_contract=max_loss,
-        )
+    decision = size_position(
+        strategy=intent.strategy,
+        conviction=intent.conviction,
+        max_loss_per_contract=max_loss,
+        state=state,
+        settings=settings,
+        strike=primary.strike,
+    )
+    rejection = _sizing_rejection(proposal_id, decision, max_loss)
+    if rejection is not None:
+        return rejection
 
     client_order_id = f"om-{proposal_id}"
     return OrderPlan(
@@ -506,10 +536,10 @@ async def build(
         underlying=intent.underlying,
         strategy=intent.strategy,
         legs=legs,
-        qty=qty,
+        qty=decision.qty,
         limit_price=entry_price,
-        max_loss=max_loss * qty,
-        max_profit=max_profit * qty if max_profit is not None else None,
+        max_loss=max_loss * decision.qty,
+        max_profit=max_profit * decision.qty if max_profit is not None else None,
         breakeven=breakeven,
         client_order_id=client_order_id,
     )
@@ -519,7 +549,7 @@ def _build_long_strangle(
     intent: StrategyIntent,
     *,
     universe: list[NormalizedContract],
-    account: dict[str, Any],
+    state: SizingState,
     settings: Settings,
     proposal_id: int,
     spot: float,
@@ -593,17 +623,16 @@ def _build_long_strangle(
     entry_price = call_mid + put_mid + settings.limit_price_spread_nudge_pct * width
 
     max_loss = entry_price * _CONTRACT_MULTIPLIER
-    equity = finite_float(account.get("equity"))
-    if equity is None:
-        return _reject(proposal_id, "no_account_equity")
-    qty = math.floor(settings.max_premium_pct_per_trade * equity / max_loss)
-    if qty <= 0:
-        return _reject(
-            proposal_id,
-            "zero_quantity",
-            max_premium_budget=settings.max_premium_pct_per_trade * equity,
-            max_loss_per_contract=max_loss,
-        )
+    decision = size_position(
+        strategy=intent.strategy,
+        conviction=intent.conviction,
+        max_loss_per_contract=max_loss,
+        state=state,
+        settings=settings,
+    )
+    rejection = _sizing_rejection(proposal_id, decision, max_loss)
+    if rejection is not None:
+        return rejection
 
     return OrderPlan(
         proposal_id=proposal_id,
@@ -617,9 +646,9 @@ def _build_long_strangle(
                 put_contract, side="buy", delta=put_delta, delta_source="black_scholes"
             ),
         ],
-        qty=qty,
+        qty=decision.qty,
         limit_price=entry_price,
-        max_loss=max_loss * qty,
+        max_loss=max_loss * decision.qty,
         # Unbounded on the upside, and the downside is capped only at a zero
         # underlying — there is no honest single max_profit here.
         max_profit=None,
@@ -951,7 +980,7 @@ def _build_credit_structure(
     intent: StrategyIntent,
     *,
     universe: list[NormalizedContract],
-    account: dict[str, Any],
+    state: SizingState,
     settings: Settings,
     proposal_id: int,
     spot: float,
@@ -1061,18 +1090,16 @@ def _build_credit_structure(
     max_loss = (width - credit) * _CONTRACT_MULTIPLIER
     max_profit = credit * _CONTRACT_MULTIPLIER
 
-    equity = finite_float(account.get("equity"))
-    if equity is None:
-        return _reject(proposal_id, "no_account_equity")
-    max_premium_budget = settings.max_premium_pct_per_trade * equity
-    qty = math.floor(max_premium_budget / max_loss)
-    if qty <= 0:
-        return _reject(
-            proposal_id,
-            "zero_quantity",
-            max_premium_budget=max_premium_budget,
-            max_loss_per_contract=max_loss,
-        )
+    decision = size_position(
+        strategy=intent.strategy,
+        conviction=intent.conviction,
+        max_loss_per_contract=max_loss,
+        state=state,
+        settings=settings,
+    )
+    rejection = _sizing_rejection(proposal_id, decision, max_loss)
+    if rejection is not None:
+        return rejection
 
     legs: list[Leg] = []
     for vertical in verticals:
@@ -1091,13 +1118,13 @@ def _build_credit_structure(
         underlying=intent.underlying,
         strategy=intent.strategy,
         legs=legs,
-        qty=qty,
+        qty=decision.qty,
         # The one and only place the sign is inverted. Alpaca reads a negative
         # multi-leg limit price as a credit to be collected; everything above
         # carries the credit positive.
         limit_price=-credit,
-        max_loss=max_loss * qty,
-        max_profit=max_profit * qty,
+        max_loss=max_loss * decision.qty,
+        max_profit=max_profit * decision.qty,
         breakeven=breakeven,
         client_order_id=f"om-{proposal_id}",
     )

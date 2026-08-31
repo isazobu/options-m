@@ -81,3 +81,21 @@ def test_the_deployment_blueprint_matches_the_default() -> None:
     assert values, "render.yaml no longer sets ALPACA_TOOLSETS"
     for value in values:
         assert _configured(value) == _configured(Settings().alpaca_toolsets)
+
+
+def test_a_credit_stop_may_exceed_one_hundred_percent() -> None:
+    """The exit thresholds are fractions, but not all of them are fractions of
+    one. A credit structure's stop is a multiple of the credit received and a
+    long option's target is a double, so the bounds that fit the original
+    symmetric pair would reject a perfectly ordinary configuration at boot —
+    and a Settings() that raises takes the whole process with it.
+    """
+    settings = Settings(
+        exit_credit_stop_loss_pct=2.0,
+        exit_long_profit_target_pct=3.0,
+        exit_debit_profit_target_pct=1.5,
+    )
+
+    assert settings.exit_credit_stop_loss_pct == 2.0
+    assert settings.exit_long_profit_target_pct == 3.0
+    assert settings.exit_debit_profit_target_pct == 1.5

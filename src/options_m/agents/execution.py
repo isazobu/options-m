@@ -29,7 +29,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from options_m import session, strategy_builder
+from options_m import exposure, session, sizing, strategy_builder
 from options_m.config import Settings
 from options_m.evidence.occ import parse_occ_symbol
 from options_m.mcp_client import AlpacaMcp, finite_float
@@ -223,6 +223,50 @@ def _group_into_structures(option_positions: list[dict[str, Any]]) -> set[tuple[
     return structures
 
 
+async def _projected_exposure(
+    option_positions: list[dict[str, Any]],
+    plan: OrderPlan | None,
+    *,
+    spot: float | None,
+    store: Store,
+    settings: Settings,
+) -> exposure.Exposure:
+    """The open book's exposure plus the plan's, in one figure per Greek.
+
+    Broker positions carry no greeks, so each leg's are recomputed from its OCC
+    symbol against the spot and ATM vol MarketPulseAgent cached for that
+    underlying — one local read per underlying in the book, never a broker call.
+    A symbol the cache has never seen makes the aggregate unknown, which the
+    risk gate treats as "cannot approve" rather than as an unexposed book.
+    """
+    market: dict[str, tuple[float, float | None]] = {}
+    for root in {root for root, _expiry in _group_into_structures(option_positions)}:
+        row = await store.get_cached_evidence(root)
+        payload = row.get("payload") if row else None
+        if isinstance(payload, dict) and (found := exposure.market_from_evidence(payload)):
+            market[root] = found
+
+    book = exposure.book_exposure(
+        option_positions, market_by_symbol=market, risk_free_rate=settings.risk_free_rate
+    )
+    if plan is None:
+        return book
+    if spot is None:
+        return exposure.Exposure.unknown(len(plan.legs))
+    # The plan's own ATM vol comes from the same cache as the book's, so the two
+    # halves of the sum are computed on consistent inputs. A missing pack leaves
+    # iv None, which makes the plan's vega — and therefore the total — unknown.
+    plan_row = await store.get_cached_evidence(plan.underlying)
+    plan_payload = plan_row.get("payload") if plan_row else None
+    plan_iv: float | None = None
+    if isinstance(plan_payload, dict) and (found := exposure.market_from_evidence(plan_payload)):
+        plan_iv = found[1]
+    added = exposure.plan_exposure(
+        plan, spot=spot, iv=plan_iv, risk_free_rate=settings.risk_free_rate
+    )
+    return book.combined_with(added)
+
+
 async def build_portfolio_snapshot(
     underlying: str,
     client_order_id: str,
@@ -232,8 +276,17 @@ async def build_portfolio_snapshot(
     store: Store,
     settings: Settings,
     exclude_proposal_id: int | None = None,
+    plan: OrderPlan | None = None,
+    spot: float | None = None,
 ) -> PortfolioSnapshot:
-    """Shared by :class:`ExecutionAgent` and ``cli.py``'s ``plan`` command."""
+    """Shared by :class:`ExecutionAgent` and ``cli.py``'s ``plan`` command.
+
+    ``plan`` and ``spot`` are what make the portfolio-Greeks checks meaningful:
+    the snapshot reports the book's exposure *including* the order under
+    evaluation, because a cap that only measures what is already open would
+    approve the trade that breaches it. Omitting them describes the book alone,
+    which is correct for inspection but not for gating an order.
+    """
     clock = await mcp.get_clock()
     positions = await mcp.get_all_positions()
     option_positions = [p for p in positions if p.get("asset_class") == "us_option"]
@@ -261,8 +314,15 @@ async def build_portfolio_snapshot(
     slot_holders -= underlyings_with_position
 
     target = underlying.upper()
+    options_buying_power, _source = sizing.resolve_options_buying_power(account)
+    projected = await _projected_exposure(
+        option_positions, plan, spot=spot, store=store, settings=settings
+    )
     return PortfolioSnapshot(
         equity=finite_float(account.get("equity")),
+        options_buying_power=options_buying_power,
+        projected_beta_weighted_delta=projected.beta_weighted_delta,
+        projected_net_vega=projected.net_vega,
         # last_equity is Alpaca's own "equity as of previous close" field —
         # exactly the daily-loss baseline, with no timezone-boundary guessing.
         start_of_day_equity=finite_float(account.get("last_equity")),
@@ -465,6 +525,9 @@ class ExecutionAgent:
         contracts, snapshots = await fetch_chain_window(self._mcp, intent, spot=spot)
         existing_position = await self._mcp.get_open_position(intent.underlying)
 
+        sizing_state = await sizing.build_sizing_state(
+            account, store=self._store, settings=self._settings
+        )
         result = await strategy_builder.build(
             intent,
             contracts=contracts,
@@ -474,6 +537,7 @@ class ExecutionAgent:
             settings=self._settings,
             proposal_id=proposal_id,
             spot=spot,
+            sizing_state=sizing_state,
         )
         if isinstance(result, Rejection):
             await self._reject(proposal_id, result, intent.underlying)
@@ -489,6 +553,8 @@ class ExecutionAgent:
             store=self._store,
             settings=self._settings,
             exclude_proposal_id=proposal_id,
+            plan=plan,
+            spot=spot,
         )
         verdict = self._risk.evaluate(plan, portfolio)
         if not verdict.approved:
@@ -539,8 +605,7 @@ class ExecutionAgent:
         payload = position_row.get("payload") or {}
         legs: list[dict[str, Any]] = payload.get("legs", [])
         option_legs = [
-            leg for leg in legs
-            if re.match(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$", str(leg.get("symbol", "")).upper())
+            leg for leg in legs if _OCC_RE.match(str(leg.get("symbol", "")).upper())
         ]
         if not option_legs:
             await self._store.update_proposal_status(
@@ -551,13 +616,18 @@ class ExecutionAgent:
 
         closing_legs = _build_closing_legs(option_legs)
 
-        # Limit price from the position mark: market_value / struct_qty / 100.
-        market_value = abs(float(payload.get("market_value") or 0))
+        # Limit price from the position mark, per structure: |value| / qty / 100.
+        # The net is what closing the structure actually costs or pays -- the
+        # gross market_value double-counts a spread's two legs and would send a
+        # credit spread out at roughly twice the price it can be bought back at.
+        net_value = payload.get("net_value")
+        raw_value = net_value if net_value is not None else payload.get("market_value")
+        mark_value = abs(float(raw_value or 0))
         try:
             struct_qty = max(1, abs(int(float(str(option_legs[0].get("qty", "1"))))))
         except (TypeError, ValueError):
             struct_qty = 1
-        raw_price = market_value / (struct_qty * 100) if market_value > 0 else 0.01
+        raw_price = mark_value / (struct_qty * 100) if mark_value > 0 else 0.01
         limit_price = _decimal_str(max(0.01, raw_price))
 
         client_order_id = f"omc-{proposal_id}"

@@ -151,6 +151,15 @@ class Store:
     def is_persistent(self) -> bool:
         return self._db.is_enabled
 
+    def session_day(self, at: datetime) -> date:
+        """The exchange session ``at`` belongs to. See :func:`_session_day`.
+
+        Exposed as a method so callers that need to bucket timestamps into
+        sessions (sizing.py's campaign window) get the same exchange-zone rule
+        the store writes with, instead of reimplementing it against UTC.
+        """
+        return _session_day(at)
+
     async def record_agent_run(
         self,
         agent: str,
@@ -637,6 +646,124 @@ class Store:
             (since,),
         )
 
+    async def conviction_outcomes(self, limit: int = 200) -> list[dict[str, Any]]:
+        """``{conviction, pnl_pct, underlying, ts}`` for every closed structure.
+
+        Answers "does this system's stated conviction predict anything?", which
+        nothing asked before. The link is already in the data and needs no new
+        writer: PositionManagerAgent enriches each open position with the
+        ``proposal_id`` that opened it and recomputes ``pnl_pct`` every tick, and
+        when StrategistAgent decides to exit it stores that whole payload as the
+        close proposal's ``evidence``. So a close proposal carries both the P&L
+        the position was closed on and a pointer back to the proposal whose
+        intent holds the conviction.
+
+        ``pnl_pct`` is the unrealized figure at the moment the exit was decided,
+        not the realized fill — a documented approximation. The fill happens
+        seconds later at a price this system does not attribute back to the
+        structure, and the difference is a spread, not a signal.
+
+        Newest first. Rows missing either half are skipped rather than defaulted:
+        a conviction with no outcome carries no information, and an outcome with
+        no conviction cannot be attributed.
+        """
+        closes = await self._closing_proposals(limit)
+        if not closes:
+            return []
+
+        opened_ids = {row["opened_by"] for row in closes}
+        convictions = await self._convictions_for(opened_ids)
+
+        outcomes: list[dict[str, Any]] = []
+        for row in closes:
+            conviction = convictions.get(row["opened_by"])
+            if conviction is None:
+                continue
+            outcomes.append(
+                {
+                    "conviction": conviction,
+                    "pnl_pct": row["pnl_pct"],
+                    "underlying": row["underlying"],
+                    "ts": row["ts"],
+                }
+            )
+        return outcomes
+
+    async def _closing_proposals(self, limit: int) -> list[dict[str, Any]]:
+        """Close proposals whose evidence carries both an opener and a P&L."""
+        rows: list[dict[str, Any]]
+        if not self._db.is_enabled:
+            rows = sorted(
+                self._memory_proposals.values(),
+                key=lambda row: row["ts"],
+                reverse=True,
+            )
+            candidates = [
+                {
+                    "underlying": row["underlying"],
+                    "ts": row["ts"],
+                    "evidence": row.get("evidence"),
+                    "intent": row.get("intent"),
+                }
+                for row in rows
+            ]
+        else:
+            candidates = await self._fetch(
+                "SELECT underlying, ts, evidence, intent FROM proposals "
+                "WHERE intent->>'action' = 'close' ORDER BY ts DESC LIMIT %s",
+                (limit,),
+            )
+
+        result: list[dict[str, Any]] = []
+        for row in candidates:
+            intent = row.get("intent")
+            if not isinstance(intent, dict) or intent.get("action") != "close":
+                continue
+            evidence = row.get("evidence")
+            if not isinstance(evidence, dict):
+                continue
+            opened_by = evidence.get("proposal_id")
+            pnl_pct = _maybe_float(evidence.get("pnl_pct"))
+            if not isinstance(opened_by, int) or pnl_pct is None:
+                continue
+            result.append(
+                {
+                    "opened_by": opened_by,
+                    "pnl_pct": pnl_pct,
+                    "underlying": row["underlying"],
+                    "ts": row["ts"],
+                }
+            )
+            if len(result) >= limit:
+                break
+        return result
+
+    async def _convictions_for(self, proposal_ids: set[int]) -> dict[int, float]:
+        """``{proposal_id: conviction}`` for the proposals that opened a trade."""
+        if not proposal_ids:
+            return {}
+        rows: list[dict[str, Any]]
+        if not self._db.is_enabled:
+            rows = [
+                {"id": pid, "intent": self._memory_proposals[pid].get("intent")}
+                for pid in proposal_ids
+                if pid in self._memory_proposals
+            ]
+        else:
+            rows = await self._fetch(
+                "SELECT id, intent FROM proposals WHERE id = ANY(%s)",
+                (list(proposal_ids),),
+            )
+        convictions: dict[int, float] = {}
+        for row in rows:
+            intent = row.get("intent")
+            if not isinstance(intent, dict):
+                continue
+            conviction = _maybe_float(intent.get("conviction"))
+            if conviction is not None:
+                convictions[int(row["id"])] = conviction
+        return convictions
+
     async def active_proposal_underlyings(
         self, *, exclude_proposal_id: int | None = None
     ) -> set[str]:
@@ -986,6 +1113,26 @@ class Store:
         rows = await self._fetch("SELECT min(date) AS min_date FROM market_calendar", ())
         value = rows[0]["min_date"] if rows else None
         return cast("date | None", value)
+
+    async def sessions_between(self, start: date, end: date) -> int:
+        """Cached trading sessions in ``[start, end]``, both ends inclusive.
+
+        Counted from the calendar rather than from calendar-day arithmetic
+        because a two-or-three-session campaign that spans a weekend would
+        otherwise report itself as already over. Rows missing from the cache are
+        simply not counted — the same conservative direction as
+        :meth:`market_is_open`, since undercounting elapsed sessions makes a
+        campaign look *younger*, which sizes trades down rather than up.
+        """
+        if end < start:
+            return 0
+        if not self._db.is_enabled:
+            return sum(1 for day in self._memory_calendar if start <= day <= end)
+        rows = await self._fetch(
+            "SELECT count(*) AS sessions FROM market_calendar WHERE date BETWEEN %s AND %s",
+            (start, end),
+        )
+        return int(rows[0]["sessions"]) if rows else 0
 
     async def market_is_open(self, at: datetime) -> bool:
         """Local, cache-only market-open check -- never calls the broker.

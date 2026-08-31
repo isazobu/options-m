@@ -17,7 +17,7 @@ import pprint
 import sys
 from typing import Any
 
-from options_m import strategy_builder, trace
+from options_m import sizing, strategy_builder, trace
 from options_m.agents.execution import (
     ExecutionAgent,
     build_portfolio_snapshot,
@@ -122,12 +122,20 @@ async def _run_plan(
         settings=settings,
         proposal_id=0,
         spot=spot,
+        sizing_state=await sizing.build_sizing_state(account, store=store, settings=settings),
     )
     if isinstance(result, Rejection):
         return {"rejection": result.model_dump()}
 
     portfolio = await build_portfolio_snapshot(
-        intent.underlying, result.client_order_id, account, mcp=mcp, store=store, settings=settings
+        intent.underlying,
+        result.client_order_id,
+        account,
+        mcp=mcp,
+        store=store,
+        settings=settings,
+        plan=result,
+        spot=spot,
     )
     verdict = RiskEngine(RiskLimits.from_settings(settings)).evaluate(result, portfolio)
     return {"plan": result.model_dump(), "verdict": verdict.model_dump()}

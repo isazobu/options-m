@@ -35,3 +35,7 @@ tests.zip
 # Backtest raw data — 13MB of Alpaca CLI output, re-fetchable from the
 # parameters and SHA-256 digests recorded in each run's data_fingerprint.json
 backtests/runs/*/raw/
+# ...and the symlink form: a later run points `raw` at an earlier run's cache,
+# and the pattern above (trailing slash) matches only real directories. Tracking
+# the link would leave it dangling in a fresh clone.
+backtests/runs/*/raw

@@ -73,22 +73,20 @@ Fetches all open positions from the broker, groups option legs by the
 underlying stock they belong to, and saves a current snapshot of each
 position including live profit/loss.
 
-Also evaluates every open position against exit rules and creates a "close
-this position" instruction when one is triggered.
+It does not decide anything itself. What it does is prepare the numbers the
+exit rules read, so the Strategist can apply them without touching the broker:
+
+| Field | What it is |
+|---|---|
+| Gross value | Every leg's value added up regardless of side — what the portfolio summary shows |
+| Net value | The legs netted, so a spread is worth what it would cost to close, not the sum of its parts |
+| Profit/loss % | Unrealised P&L over the net paid or received at entry. On a credit structure this reads directly as "how much of the credit has been realised" |
+| Days to expiry | The nearest expiry among the legs — the one that expires or gets assigned first |
+| Strategy | Which structure this position came from, read once off the originating proposal |
 
 #### Conditions — when it runs normally
 - Always — this agent is never gated by market hours or kill switch, because
   monitoring positions must work even when new trades are blocked.
-
-#### Exit conditions it checks (deterministic)
-| Condition | Threshold | What happens |
-|---|---|---|
-| Profit target reached | Position is up 50% from entry | Creates a close instruction |
-| Stop loss hit | Position is down 50% from entry | Creates a close instruction |
-| Time stop | Position has been open 30+ days | Creates a close instruction |
-
-When any condition is met, a close instruction is written to the database.
-The Trader picks it up and submits the actual closing order to the broker.
 
 ---
 
@@ -113,9 +111,49 @@ The Strategist checks these in order and stops immediately if any is true:
 | No fresh data exists for the selected stock | `skipped: no_evidence_cache` |
 | Data for the selected stock is stale (>2 min old) | `skipped: stale_evidence` |
 
-> **Important:** the kill switch only blocks new trade proposals. The close
-> evaluation (checking whether open positions need to exit) runs regardless —
-> exits must work even when new entries are frozen.
+> **Important:** the close evaluation runs before all of these checks, so a
+> closed market or an engaged kill switch does not stop a position from being
+> assessed and a close instruction from being written. Note what this does
+> *not* mean: the Trader stops at the kill switch too, so while the switch is
+> on those close instructions sit unexecuted in the queue. The switch freezes
+> the broker, not just new entries.
+
+#### Exit conditions it checks (deterministic, no AI)
+
+Every open position is checked against this ladder each cycle. It is ordered
+by urgency and the first match wins, so a position that trips two rungs is
+reported by the more serious one.
+
+| # | Condition | Threshold | Applies to |
+|---|---|---|---|
+| 1 | Expiry is imminent | 2 or fewer days to the nearest expiry | Every position |
+| 2 | Short premium in its last weeks | 21 or fewer days to expiry | Credit structures only |
+| 3 | Stop loss hit | See the family table below | Every position |
+| 4 | Profit target reached | See the family table below | Every position |
+| 5 | Time stop | Open 30+ calendar days | Every position |
+
+Rung 1 exists because an in-the-money option carried into expiration stops
+being an options position and becomes a stock position nobody sized for.
+Rung 2 applies only to structures opened for a credit: in the final weeks it
+is gamma, not the original thesis, that drives their P&L. A structure that
+*paid* for its convexity is left alone — closing it early throws away exactly
+what was bought.
+
+Rungs 3 and 4 are measured against the position's own structure, because "up
+50%" does not mean the same thing for a sold spread as for a bought call:
+
+| Structure | Take profit at | Stop out at |
+|---|---|---|
+| Credit spreads, iron condors, iron butterflies | 50% of the credit received | A loss equal to the credit received |
+| Debit spreads | 75% of the debit paid | 50% of the debit paid |
+| Long calls, puts, strangles | 100% (a double) | 50% of the premium paid |
+| Structure unknown | 50% | 50% |
+
+The last row is the fallback for a position that could not be linked back to
+the proposal that opened it. Every threshold here is configurable.
+
+When any rung is met, a close instruction is written to the database. The
+Trader picks it up and submits the actual closing order to the broker.
 
 #### Candidate filtering (deterministic)
 Before selecting a stock to evaluate, the Strategist silently skips any stock that:
@@ -243,6 +281,16 @@ Every 60 s  Market Watcher
             └──────────► save ranked list to database
 
 Every 5 m   Strategist
+            ├── [always first, before every check below]
+            │     for each open position, first match wins:
+            │       ≤2 DTE?                    → close proposal (expiry_hard_stop)
+            │       ≤21 DTE and sold premium?  → close proposal (dte_stop)
+            │       past its family's stop?    → close proposal (stop_loss)
+            │       past its family's target?  → close proposal (profit_target)
+            │       open 30+ days?             → close proposal (time_stop)
+            │     (Trader picks these up next cycle — unless the kill switch
+            │      is on, which stops the Trader too)
+            │
             ├── market open?          NO  → stop (record: market_closed)
             ├── kill switch on?       YES → stop (record: kill_switch)
             ├── AI configured?        NO  → stop (record: llm_not_configured)
@@ -290,11 +338,10 @@ Every 30 s  Trader
                   broker rejected/cancelled? → record reason as broker_rejected
 
 Every 60 s  Position Tracker [deterministic, always runs]
-            └── for each open position:
-                  up 50%?       → create close proposal
-                  down 50%?     → create close proposal
-                  open 30+ days? → create close proposal
-                  (Trader picks up the close proposal on its next cycle)
+            └── for each open position: mark to market and record
+                  net value, P&L %, days to the nearest expiry,
+                  and the strategy it was opened as
+                  (no decisions here — the Strategist reads these)
 
 Every 60 m  Reviewer
             ├── [AI] for each filled order not yet reviewed:
@@ -344,7 +391,7 @@ Multiple independent layers prevent a bad trade from going through:
 | **Time filter** | Options must expire 7–45 days from today. No same-day or very long-dated positions. |
 | **Daily loss halt** | If the account has lost more than 3% today, no new trades are opened. |
 | **Drawdown halt** | If the account is down more than 8% from its peak, no new trades are opened. |
-| **Kill switch** | A single toggle (available via the dashboard or an API call) that instantly stops all new orders. Existing positions are unaffected until exit conditions trigger separately. |
+| **Kill switch** | A single toggle (available via the dashboard or an API call) that instantly stops the Trader submitting anything to the broker — closes included. Exit conditions keep being evaluated and close instructions keep queueing up, but nothing leaves the building until the switch is off. |
 | **Dry run mode** | When enabled (the default), the system goes through every step including order construction and risk checks, but never submits to the broker. Used for testing and monitoring. |
 | **Defined-risk only** | Every structure must have a finite, calculated maximum loss before it is allowed. A trade where the loss is theoretically unlimited is rejected at two independent layers. |
 | **AI conviction floor** | The AI must express at least 55% confidence in its regime assessment. Below that, the Strategist holds regardless of what the strategy table says. |
@@ -379,9 +426,11 @@ are fully implemented. The key areas still being refined:
   when the market is fairly priced. This causes the system to prefer
   long-premium structures more often than is optimal.
 
-- **Exit management**: The position tracker monitors P&L and triggers closes,
-  but the logic for what constitutes the right exit (beyond simple
-  profit/stop targets) is still basic.
+- **Exit management**: Exits are aware of the structure and of the calendar,
+  but they are still all-or-nothing and never reconsider the thesis. There is
+  no scaling out of a winner, no rolling a tested strike out or down, no
+  trailing stop that protects a gain already made, and the invalidation the AI
+  wrote at entry is never checked again while the position is open.
 
 - **Allocation**: When multiple stocks all look good simultaneously, the
   system currently fills slots in the order the universe list is evaluated

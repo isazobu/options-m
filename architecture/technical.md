@@ -212,9 +212,13 @@ ExecutionAgent._run()
         ├── get_option_chain(underlying, dte_range)     ← live MCP
         ├── get_open_position(underlying)               ← live MCP
         │
-        ├── strategy_builder.build(intent, contracts, snapshots, …)
+        ├── sizing.build_sizing_state(account)          ← pure code + equity_curve
+        │     high-water mark, campaign window, options buying power
+        │
+        ├── strategy_builder.build(intent, contracts, snapshots, sizing_state, …)
         │     selects OCC contracts closest to target delta + DTE
         │     computes limit_price, max_loss, breakeven
+        │     sizing.size_position() → qty        ← pure code
         │     → OrderPlan  or  Rejection
         │
         ├── build_portfolio_snapshot()
@@ -223,6 +227,8 @@ ExecutionAgent._run()
         ├── RiskEngine.evaluate(plan, portfolio)        ← pure code
         │     premium cap per trade
         │     total premium cap
+        │     options buying power (collateral the account can post)
+        │     beta-weighted delta + net vega (whole book, plan included)
         │     max concurrent positions   (counts structures, not legs)
         │     max positions per underlying
         │     DTE window (7–45)
@@ -315,6 +321,133 @@ wider wing than delta-selected ones to leave a meaningful profit zone:
 
 ---
 
+## sizing
+
+All three construction shapes call one function — `sizing.size_position` — for
+the contract count. It is pure, deterministic, and reads neither the clock nor
+the broker: everything state-dependent arrives in a `SizingState`.
+
+```
+risk_fraction = base_risk_pct_per_trade      (0.015)
+              × drawdown_scalar              [0.35 … 1.00]
+              × gain_scalar                  [1.00 … 1.60]
+              × conviction_scalar            [0.60 … 1.50], shrunk by reliability
+              × horizon_scalar               {0, 1.00}   (front-load off by default)
+              ↓ clamped to max_premium_pct_per_trade (0.02)
+
+qty = min(
+    risk_fraction × equity            ÷ max_loss_per_contract,
+    options_buying_power × 0.50       ÷ collateral_per_contract,
+    cash                              ÷ (strike × 100)   ← cash-secured put only
+)
+```
+
+| Scalar | Source | Direction |
+|---|---|---|
+| `drawdown` | worse of equity-vs-high-water-mark and equity-vs-previous-close, each measured against its own halt threshold | Down as losses accumulate, floored at `drawdown_size_floor` so a recovery stays tradeable |
+| `gain` | equity vs the campaign's opening equity | Up to `gain_size_cap`, one-directional |
+| `conviction` | `StrategyIntent.conviction`, mapped across `[conviction_floor, 1.0]`, then shrunk toward 1.0 by the measured reliability | Bet size proportional to stated edge — but only as far as that edge has shown up in P&L |
+| `horizon` | sessions left in the campaign, counted from `market_calendar` | `0` once too few remain → `campaign_horizon_closed` |
+
+**This is not a martingale.** Every scalar moves size *down* after losses and
+*up* after gains. Sizing up into a drawdown is how an account reaches its halt
+threshold and stops being able to trade at all.
+
+**Collateral, not premium.** Options are never marginable, so the account's
+headline `buying_power` (2× equity on a margin account) is the wrong meter and is
+deliberately absent from the resolution chain — `options_buying_power` →
+`non_marginable_buying_power` → `cash`. Per contract, the requirement is
+`max_loss` for every structure except a cash-secured put (`strike × 100`) and a
+covered call (`0` — the shares are already paid for).
+
+Buying power doubles as the aggregate-risk meter: every open defined-risk
+structure already holds its max loss as collateral, so buying power falling *is*
+open risk rising. That is why there is no separate portfolio-heat cap.
+
+Unknown fields are handled two ways, on purpose. Unknown *capacity* (equity,
+buying power) blocks the trade — approving because a broker field was unreadable
+is the dangerous direction. Unknown *history* (no high-water mark, no campaign)
+scales by 1.0 — a fresh database has genuinely observed no drawdown, and
+refusing to trade until it has would mean the service can never place a first
+order.
+
+**Conviction is measured, not assumed.** Sizing by conviction is Kelly-flavoured
+— bet in proportion to edge — but Kelly wants a *calibrated* probability, and
+conviction is a language model's self-reported confidence with no prior claim to
+predicting anything. `sizing.conviction_reliability` computes the Pearson
+correlation between conviction and realised `pnl_pct` over closed trades, clamped
+to `[0, 1]`, and shrinks the multiplier toward 1.0 by it. At zero reliability
+every trade is sized the same, which is the right answer when the number carries
+no signal.
+
+The link needs no new writer: PositionManagerAgent already stamps the opening
+`proposal_id` and a fresh `pnl_pct` onto each open position, and StrategistAgent
+stores that payload as the close proposal's `evidence` — so a close proposal
+carries both the P&L it was closed on and a pointer back to the conviction that
+opened it. `store.conviction_outcomes()` joins the two.
+
+Below `conviction_calibration_min_samples` (20) the answer is
+`conviction_reliability_prior` (0.50), not 1.0: a short campaign closes something
+like eight trades, a correlation over eight points is noise, and assuming full
+predictive power on no evidence is the aggressive direction. Negative correlation
+clamps to zero rather than inverting — "high conviction has lost money so far" is
+a reason to stop leaning on the number, not to bet against the system's own
+thesis on a handful of trades. ReflectionAgent's pass C reports the figure and
+whether it is measured or still the prior, because a number that silently shrinks
+every position is a number nobody will audit.
+
+---
+
+## exposure
+
+Position counts and dollar-risk caps treat five positions as five independent
+bets. In this universe they are not: SPY, QQQ, IWM and six large-cap tech names
+correlate around 0.8-0.9, and the matrix reaches for the same structure family
+across all of them whenever the IV regime is the same. A book of five
+short-premium spreads is one short-vol, long-delta position wearing five hats.
+
+Two aggregate measures, both checked in `RiskEngine` against the book *including*
+the plan under evaluation — a cap that only measures what is already open would
+approve the trade that breaches it:
+
+| Measure | Unit | Cap | Rejection |
+|---|---|---|---|
+| Beta-weighted dollar delta | index-equivalent dollars | `max_beta_weighted_delta_pct` (1.00 × equity) | `beta_weighted_delta_exceeded` |
+| Net vega | dollars per vol point | `max_net_vega_pct` (0.0075 × equity) | `net_vega_exceeded` |
+
+Both compare on the absolute value: a book heavily short the index is as
+directional as one heavily long, and the failure mode — every position losing
+together on one move — does not care which way.
+
+Both defaults are derived from `drawdown_halt_pct` (0.08) rather than picked, so
+the caps and the breaker agree on the same worst case. At a delta cap of 1.00 a
+maxed book loses ~1% of equity per 1% index move, so a 5% gap costs ~5% — inside
+the halt. At a vega cap of 0.0075 a 10-point vol shock costs ~7.5% — the halt,
+near enough.
+
+Measured on the intended 5-position credit book at 10 DTE: 73% of equity in
+beta-weighted delta, and 0.09% in vega. A credit structure's long wing offsets
+most of its short's vega, so the vega cap never binds on a credit book; a
+long-strangle book (both legs long vega, nothing offsetting) reaches 0.38-0.52%,
+which is what that cap is actually for. Short DTE shrinks vega — it scales with
+√T — which is why at a 7-14 DTE entry window **gamma, not vega, is the live
+risk**, and why the delta cap is the one doing the work.
+
+Broker positions carry no greeks at all, so each open leg's are recomputed from
+its OCC symbol against the spot and ATM vol MarketPulseAgent cached for that
+underlying — one local read per underlying, never a broker call. Betas are
+hand-maintained in `exposure._BETA`, the same idiom as `earnings.py`; an unlisted
+symbol is assumed *more* volatile than the index (1.50), never less, so an
+unknown name overstates its own exposure and sizes the book down.
+
+A leg whose greeks cannot be computed makes the whole aggregate unknown, never
+zero — zero is indistinguishable from a perfectly hedged book and would read as
+smaller. An unmeasurable book is refused (`unknown_portfolio_delta` /
+`unknown_portfolio_vega`); an *empty* book is a measured zero and does not block
+the first trade.
+
+---
+
 ## LLM Client
 
 `FeatherlessLlm` (`llm.py`) — OpenAI-compatible, plain `httpx`, no SDK.
@@ -399,7 +532,10 @@ class Rejection:
 | Paper assertion | `AlpacaMcp.connect()` | Refuses to connect unless `ALPACA_PAPER_TRADE` is set to a paper value |
 | `kill_switch` | Every agent, every tick | DB flag + env var + `POST /admin/kill`; halts new orders immediately |
 | Earnings gate | `matrix.decide()` | Fires before the matrix lookup; a blacked-out symbol never reaches the LLM |
-| `RiskEngine` | `ExecutionAgent` | Premium cap, position cap, DTE, spread width, earnings, daily loss, drawdown |
+| `RiskEngine` | `ExecutionAgent` | Premium cap, buying power, position cap, DTE, spread width, earnings, daily loss, drawdown |
+| Drawdown taper | `sizing.size_position` | Sizes every trade down as equity falls, so the halts are a backstop rather than the first line |
+| Portfolio greeks | `RiskEngine` + `exposure` | Beta-weighted delta and net vega across the whole book: five correlated positions read as one bet, not five slots |
+| Conviction shrinkage | `sizing.conviction_reliability` | Size leans on conviction only as far as conviction has measurably predicted P&L |
 | `LlmContractError` | `StrategistAgent` | Two failures → `llm_failed`, no trade, does not propagate to supervisor |
 | `client_order_id = "om-{id}"` | `ExecutionAgent` | One proposal can never place two orders (broker-level idempotency) |
 | Defined-risk only | `strategy_builder` + `RiskEngine` | Naked short legs rejected at two independent layers |
@@ -464,6 +600,8 @@ src/options_m/
 ├── llm.py                   FeatherlessLlm — chat_completion + complete_json
 ├── models.py                StrategyIntent · RegimeRead · OrderPlan · Leg · Rejection
 ├── strategy_builder.py      StrategyIntent → real contract selection → OrderPlan
+├── sizing.py                State-aware contract count — pure code, no LLM, no MCP
+├── exposure.py              Beta-weighted delta + net vega — pure code, no LLM, no MCP
 ├── risk.py                  RiskEngine — pure code, no LLM, no MCP
 ├── store.py                 Postgres repository + in-memory fallback
 ├── mcp_client.py            AlpacaMcp — sole broker interface
@@ -496,9 +634,41 @@ whole expiry. Real ladders densify near the money and widen in the wings, so a
 2.50 ATM tolerance rejects valid wing targets that are 5.00 apart. Fix: derive
 tolerance from the local gap bracketing the target, not the global minimum.
 
-**`buying_power` is not consulted**
-The account cache stores `buying_power`, but sizing and risk decisions use only
-`equity`. Nothing checks before submission that the account can carry the order.
+**Total premium cap mixes two units**
+`RiskEngine._check_total_premium` compares the new plan's `max_loss` against the
+sum of open positions' `|market_value|`. For a short credit spread those differ
+substantially — market value is the premium still owed, max loss is the width
+minus the credit — so the 15% aggregate cap is looser in practice than it reads.
+Sizing does not depend on it (buying power is the aggregate meter there), but the
+cap itself should be restated in risk terms.
+
+**No end-of-campaign flatten**
+`campaign_start_date` / `campaign_days` stop sizing from *opening* once too few
+sessions remain, but nothing closes what is already open when the window ends.
+`exit_time_stop_days` is cut to the campaign length (3) as an approximation, and
+it is only that: it counts calendar days from the fill, so a position opened on
+the first session exits a day *after* a three-session campaign ends. A campaign
+that must end flat needs a PositionManagerAgent rule keyed on the campaign
+window, not a duration backstop.
+
+**Gamma is unmeasured**
+`exposure` computes beta-weighted delta and net vega. At the configured 7-14 DTE
+entry window gamma is the dominant risk — delta itself moves fast enough that a
+cap on the *current* delta understates a gap through a short strike — and there
+is no gamma budget. The delta cap plus the per-family stop loss stand in for one.
+
+**Betas are hand-maintained and static**
+`exposure._BETA` is a fixed table. Realised betas move, especially for the
+high-beta single names, and a stale value understates exposure in exactly the
+regime where correlation matters most. Deriving them from stock bars would mean a
+returns regression per symbol; the table is right to about a tenth, which is
+enough for a cap but not for hedging.
+
+**Conviction calibration needs a season, not a campaign**
+`conviction_reliability` needs 20 closed trades before it measures anything. A
+three-session campaign produces roughly eight, so a short run will always size on
+`conviction_reliability_prior` (0.50) rather than on measured data. The
+measurement is there to compound across campaigns, not to help inside one.
 
 **Clock reads in `strategy_builder` and `risk`**
 `date.today()` / `datetime.now()` are called directly in several places.
@@ -539,8 +709,10 @@ CONVICTION_FLOOR=0.55
 OPTIONS_LEVEL=3
 SHORT_DELTA_DEFAULT=0.25
 SPREAD_WIDTH_DEFAULT=5.0
-DTE_TARGET_MIN=21
-DTE_TARGET_MAX=38
+DTE_TARGET_MIN=7                     # matched to the holding period; see config.py
+DTE_TARGET_MAX=14
+EXIT_DTE_SHORT_PREMIUM=3             # MUST stay below DTE_TARGET_MIN
+EXIT_TIME_STOP_DAYS=3                # holding duration, cut to the campaign length
 
 # Risk limits
 MAX_PREMIUM_PCT_PER_TRADE=0.02
@@ -554,4 +726,23 @@ MAX_SPREAD_PCT=0.10
 DAILY_LOSS_HALT_PCT=0.03
 DRAWDOWN_HALT_PCT=0.08
 MINUTES_BEFORE_CLOSE_BLACKOUT=15
+
+# Dynamic position sizing
+BASE_RISK_PCT_PER_TRADE=0.015        # starting point; scaled, then clamped to the cap above
+BUYING_POWER_UTILIZATION_CAP=0.50    # share of options buying power one trade may tie up
+MAX_BETA_WEIGHTED_DELTA_PCT=1.00     # index-equivalent dollar delta, whole book
+MAX_NET_VEGA_PCT=0.0075              # dollars per vol point, whole book
+DRAWDOWN_SIZE_FLOOR=0.35             # smallest multiple a drawdown can taper to
+GAIN_SIZE_CAP=1.60                   # largest multiple gains can fund
+GAIN_SIZE_REFERENCE_PCT=0.04         # campaign gain at which the cap is reached
+CONVICTION_SIZE_MIN_MULT=0.60
+CONVICTION_SIZE_MAX_MULT=1.50
+CONVICTION_RELIABILITY_PRIOR=0.50    # trust in conviction before it is measured
+CONVICTION_CALIBRATION_MIN_SAMPLES=20
+
+# Campaign horizon (unset start date = no horizon pacing)
+CAMPAIGN_START_DATE=
+CAMPAIGN_DAYS=3
+CAMPAIGN_FRONT_LOAD_MULT=1.00        # neutral: 1.0 is off
+CAMPAIGN_MIN_SESSIONS_TO_HOLD=1      # no new opens while this many sessions or fewer remain
 ```

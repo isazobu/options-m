@@ -14,6 +14,7 @@ from typing import Any
 from options_m import strategy_builder
 from options_m.config import Settings
 from options_m.models import OrderPlan, Rejection, StrategyIntent
+from options_m.sizing import SizingState
 
 _EXPIRY = date.today() + timedelta(days=30)
 _SPOT = 100.0
@@ -535,3 +536,70 @@ async def test_a_leg_wide_in_both_percentage_and_cash_is_still_refused() -> None
 
     assert isinstance(result, Rejection)
     assert result.reason == "wide_spread"
+
+
+# ---------------------------------------------------------------------------
+# Position sizing — the builder's end of it. The scalars themselves are
+# exercised in test_sizing.py; these assert that the state actually reaches the
+# contract count, which is the wiring a unit test of sizing.py cannot see.
+# ---------------------------------------------------------------------------
+
+def _sizing_state(**overrides: Any) -> SizingState:
+    return SizingState.from_account(_ACCOUNT).model_copy(update=overrides)
+
+
+async def test_conviction_reaches_the_contract_count() -> None:
+    """The intent's own conviction is the sizing input, not a fixed budget."""
+    weak = await _build(_credit_intent("put_credit_spread", conviction=0.55))
+    strong = await _build(_credit_intent("put_credit_spread", conviction=1.0))
+
+    assert isinstance(weak, OrderPlan), getattr(weak, "reason", None)
+    assert isinstance(strong, OrderPlan), getattr(strong, "reason", None)
+    assert strong.qty > weak.qty
+    assert strong.max_loss > weak.max_loss
+
+
+async def test_a_drawdown_reaches_the_contract_count() -> None:
+    full = await _build(_credit_intent("put_credit_spread"))
+    tapered = await _build(
+        _credit_intent("put_credit_spread"),
+        sizing_state=_sizing_state(high_water_mark=100_000.0, equity=98_000.0),
+    )
+
+    assert isinstance(full, OrderPlan), getattr(full, "reason", None)
+    assert isinstance(tapered, OrderPlan), getattr(tapered, "reason", None)
+    assert tapered.qty < full.qty
+
+
+async def test_an_exhausted_campaign_is_refused_by_its_own_name() -> None:
+    """Not as zero_quantity: the trade was affordable, the window was shut."""
+    result = await _build(
+        _credit_intent("put_credit_spread"),
+        sizing_state=_sizing_state(sessions_remaining=1),
+    )
+
+    assert isinstance(result, Rejection)
+    assert result.reason == "campaign_horizon_closed"
+
+
+async def test_an_account_with_no_readable_collateral_is_refused() -> None:
+    """Nothing checked this before, and equity alone cannot answer it."""
+    result = await _build(
+        _credit_intent("put_credit_spread"),
+        account={"equity": "100000"},
+    )
+
+    assert isinstance(result, Rejection)
+    assert result.reason == "unknown_buying_power"
+
+
+async def test_the_rejection_carries_the_sizing_arithmetic() -> None:
+    """A refusal that does not say which cap bound it is not auditable."""
+    result = await _build(
+        _credit_intent("iron_condor"), account={"equity": "100", "cash": "100"}
+    )
+
+    assert isinstance(result, Rejection)
+    assert result.reason == "zero_quantity"
+    assert result.detail["binding_constraint"] in {"risk_budget", "buying_power"}
+    assert set(result.detail["scalars"]) == {"drawdown", "gain", "conviction", "horizon"}

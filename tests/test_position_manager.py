@@ -6,7 +6,7 @@ row with proposal metadata + pnl_pct. Exit decisions belong to StrategistAgent.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -216,3 +216,127 @@ def test_enrich_from_orders_no_match_leaves_payload_unchanged() -> None:
     payload: dict[str, Any] = {}
     _enrich_from_orders(payload, [{"symbol": "AAPL250321C00150000"}], [])
     assert payload == {}
+
+
+# ---------------------------------------------------------------------------
+# Net value and expiry — the fields the exit rule reads
+# ---------------------------------------------------------------------------
+
+
+def _occ(days_out: int, right: str = "C", strike: str = "00150000") -> str:
+    """An OCC symbol expiring ``days_out`` days from today."""
+    expiry = (datetime.now(UTC).date() + timedelta(days=days_out)).strftime("%y%m%d")
+    return f"AAPL{expiry}{right}{strike}"
+
+
+def _credit_spread_legs() -> list[dict[str, Any]]:
+    """A put credit spread as Alpaca reports it: the short leg's market_value
+    is negative, the long leg's positive."""
+    return [
+        {
+            "symbol": _occ(30, "P", "00150000"),
+            "side": "short",
+            "qty": "-1",
+            "market_value": "-300.0",
+            "unrealized_pl": "50.0",
+        },
+        {
+            "symbol": _occ(30, "P", "00145000"),
+            "side": "long",
+            "qty": "1",
+            "market_value": "100.0",
+            "unrealized_pl": "0.0",
+        },
+    ]
+
+
+async def test_net_value_nets_the_legs_while_market_value_stays_gross() -> None:
+    """Gross is what the summary shows; net is what the structure is worth."""
+    agent, store = _agent(_FakeMcp(positions=_credit_spread_legs()))
+    await agent.step()
+
+    payload = (await store.get_cached_positions())[0]["payload"]
+    assert payload["market_value"] == pytest.approx(400.0)
+    assert payload["net_value"] == pytest.approx(-200.0)
+
+
+async def test_pnl_pct_on_a_credit_spread_is_the_share_of_the_credit() -> None:
+    """net_value -200 with +50 unrealized means the spread was opened for a
+    250 credit and a fifth of it is realised — not 50/400 off the gross."""
+    agent, store = _agent(_FakeMcp(positions=_credit_spread_legs()))
+    await agent.step()
+
+    payload = (await store.get_cached_positions())[0]["payload"]
+    assert payload["pnl_pct"] == pytest.approx(50.0 / 250.0)
+
+
+async def test_min_dte_is_the_nearest_expiry_across_the_legs() -> None:
+    positions = [
+        {"symbol": _occ(45), "side": "long", "qty": "1"},
+        {"symbol": _occ(10), "side": "short", "qty": "-1"},
+    ]
+    agent, store = _agent(_FakeMcp(positions=positions))
+    await agent.step()
+
+    payload = (await store.get_cached_positions())[0]["payload"]
+    assert payload["min_dte"] == 10
+
+
+async def test_min_dte_is_none_for_a_position_with_no_option_leg() -> None:
+    agent, store = _agent(_FakeMcp(positions=[{"symbol": "AAPL", "qty": "100"}]))
+    await agent.step()
+    payload = (await store.get_cached_positions())[0]["payload"]
+    assert payload["min_dte"] is None
+
+
+# ---------------------------------------------------------------------------
+# Strategy resolution
+# ---------------------------------------------------------------------------
+
+
+async def test_the_strategy_is_resolved_from_the_originating_proposal() -> None:
+    """The order carries no strategy name — the proposal behind it does, and
+    that is what tells StrategistAgent which exit thresholds to apply."""
+    symbol = _occ(30)
+    settings = Settings(database_url=None)
+    store = Store(Database(settings))
+    proposal_id = await store.save_proposal(
+        underlying="AAPL",
+        intent={"action": "open", "strategy": "put_credit_spread"},
+        evidence={},
+    )
+    await store.record_order(
+        proposal_id=proposal_id,
+        client_order_id=f"om-{proposal_id}",
+        status="filled",
+        request={"legs": [{"symbol": symbol}]},
+    )
+    mcp = _FakeMcp(positions=[{"symbol": symbol, "qty": "1"}])
+
+    await PositionManagerAgent(settings, mcp, store).step()  # type: ignore[arg-type]
+
+    payload = (await store.get_cached_positions())[0]["payload"]
+    assert payload["proposal_id"] == proposal_id
+    assert payload["strategy"] == "put_credit_spread"
+
+
+async def test_a_position_with_no_proposal_gets_an_empty_strategy() -> None:
+    """Set, not left absent: the lookup is attempted once, and an unresolved
+    position falls back to the symmetric thresholds rather than retrying on
+    every tick."""
+    agent, store = _agent(_FakeMcp(positions=[{"symbol": _occ(30), "qty": "1"}]))
+    await agent.step()
+    payload = (await store.get_cached_positions())[0]["payload"]
+    assert payload["strategy"] == ""
+
+
+def test_compute_pnl_pct_prefers_the_net_over_the_gross() -> None:
+    payload = {"unrealized_pl": 50.0, "market_value": 400.0, "net_value": -200.0}
+    assert _compute_pnl_pct(payload) == pytest.approx(50.0 / 250.0)
+
+
+def test_compute_pnl_pct_falls_back_to_the_gross_for_an_older_payload() -> None:
+    """A row written before net_value existed still marks to market."""
+    assert _compute_pnl_pct(
+        {"unrealized_pl": 500.0, "market_value": 1500.0}
+    ) == pytest.approx(0.50)
