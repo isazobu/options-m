@@ -11,7 +11,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from options_m.agents.strategist import StrategistAgent
+from options_m.agents.strategist import (
+    StrategistAgent,
+    _close_reason,
+    _exit_thresholds,
+)
 from options_m.config import Settings
 from options_m.db import Database
 from options_m.store import Store
@@ -162,3 +166,134 @@ async def test_the_strategist_works_without_a_notifier() -> None:
                                         "pnl_pct": -0.60, "strategy": "long_call"})
     detail = await _agent(store)._evaluate_close_proposals()
     assert detail.get("close_proposals") == 1
+
+
+# ---------------------------------------------------------------------------
+# Exit rules — the ladder in _close_reason
+# ---------------------------------------------------------------------------
+
+
+def _settings(**overrides: Any) -> Settings:
+    return Settings(database_url=None, **overrides)
+
+
+def test_no_condition_met_is_not_an_exit() -> None:
+    payload = {"strategy": "long_call", "pnl_pct": 0.10, "min_dte": 30}
+    assert _close_reason(payload, _settings()) is None
+
+
+def test_a_position_in_its_last_days_is_closed_whatever_it_is() -> None:
+    """Expiry is a hard floor for every family: an ITM option carried into
+    expiration turns into a stock position nobody sized for."""
+    for strategy in ("long_call", "call_debit_spread", "iron_condor"):
+        payload = {"strategy": strategy, "pnl_pct": 0.0, "min_dte": 2}
+        assert _close_reason(payload, _settings()) == "expiry_hard_stop"
+
+
+def test_short_premium_is_closed_at_the_gamma_boundary() -> None:
+    """Read off the setting, not off a literal.
+
+    exit_dte_short_premium has to stay below dte_target_min or a credit
+    structure is born inside its own stop, so the boundary moves whenever the
+    entry window does — a hardcoded 21 here would fail for a config change that
+    is entirely correct.
+    """
+    settings = _settings()
+    payload = {
+        "strategy": "put_credit_spread",
+        "pnl_pct": 0.10,
+        "min_dte": settings.exit_dte_short_premium,
+    }
+    assert _close_reason(payload, settings) == "dte_stop"
+
+
+def test_the_short_premium_stop_stays_below_the_entry_window() -> None:
+    """Otherwise every credit structure opens already tripping its own exit.
+
+    StrategistAgent would propose a close on the first tick after the fill, and
+    the book would pay two spreads to hold nothing.
+    """
+    settings = _settings()
+
+    assert settings.exit_dte_short_premium < settings.dte_target_min
+
+
+def test_the_gamma_boundary_does_not_apply_to_bought_premium() -> None:
+    """A debit or long structure paid for its convexity — being inside the
+    short-premium DTE window is not a reason to hand it back."""
+    settings = _settings()
+    for strategy in ("long_call", "call_debit_spread"):
+        payload = {
+            "strategy": strategy,
+            "pnl_pct": 0.10,
+            "min_dte": settings.exit_dte_short_premium,
+        }
+        assert _close_reason(payload, settings) is None
+
+
+def test_expiry_outranks_a_profit_target() -> None:
+    """Both rungs are tripped; the more urgent one is what gets reported."""
+    payload = {"strategy": "iron_condor", "pnl_pct": 0.90, "min_dte": 1}
+    assert _close_reason(payload, _settings()) == "expiry_hard_stop"
+
+
+def test_a_missing_min_dte_leaves_the_other_rungs_working() -> None:
+    payload = {"strategy": "long_call", "pnl_pct": 1.00}
+    assert _close_reason(payload, _settings()) == "profit_target"
+
+
+def test_each_family_is_measured_against_its_own_thresholds() -> None:
+    settings = _settings()
+    # A credit structure takes half the credit; the same +0.50 is not yet an
+    # exit for a long option, whose target is a double.
+    credit = {"strategy": "put_credit_spread", "pnl_pct": 0.50, "min_dte": 40}
+    long_call = {"strategy": "long_call", "pnl_pct": 0.50, "min_dte": 40}
+    assert _close_reason(credit, settings) == "profit_target"
+    assert _close_reason(long_call, settings) is None
+
+    # And the credit stop is looser than the long one: -0.60 stops a long
+    # position but is still inside a credit structure's 1x-credit stop.
+    assert _close_reason({**credit, "pnl_pct": -0.60}, settings) is None
+    assert _close_reason({**long_call, "pnl_pct": -0.60}, settings) == "stop_loss"
+
+
+def test_debit_verticals_are_recognised_under_either_spelling() -> None:
+    """matrix.py emits call_debit_spread; the legacy name is still accepted by
+    StrategyIntent, so both have to resolve to the same family."""
+    settings = _settings()
+    for strategy in ("call_debit_spread", "debit_call_spread"):
+        assert _exit_thresholds(strategy, settings) == (
+            settings.exit_debit_profit_target_pct,
+            settings.exit_debit_stop_loss_pct,
+        )
+
+
+def test_an_unresolved_strategy_falls_back_to_the_symmetric_pair() -> None:
+    """Enrichment can fail to link a position to its proposal. That position
+    still exits — on the thresholds every position used before families."""
+    settings = _settings()
+    assert _exit_thresholds("", settings) == (
+        settings.exit_profit_target_pct,
+        settings.exit_stop_loss_pct,
+    )
+    assert _close_reason({"strategy": "", "pnl_pct": 0.50}, settings) == "profit_target"
+    assert _close_reason({"pnl_pct": -0.50}, settings) == "stop_loss"
+
+
+def test_the_calendar_stop_still_backstops_everything() -> None:
+    opened = datetime.now(UTC) - timedelta(days=31)
+    payload = {
+        "strategy": "long_call",
+        "pnl_pct": 0.0,
+        "min_dte": 60,
+        "opened_at": opened.isoformat(),
+    }
+    assert _close_reason(payload, _settings()) == "time_stop"
+
+
+def test_the_thresholds_are_configurable() -> None:
+    payload = {"strategy": "iron_condor", "pnl_pct": 0.30, "min_dte": 40}
+    assert _close_reason(payload, _settings()) is None
+    assert _close_reason(payload, _settings(exit_credit_profit_target_pct=0.25)) == (
+        "profit_target"
+    )

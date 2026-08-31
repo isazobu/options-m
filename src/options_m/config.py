@@ -6,6 +6,8 @@ environment. Nothing here is business logic — only knobs the platform sets.
 
 from __future__ import annotations
 
+from datetime import date
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -142,6 +144,103 @@ class Settings(BaseSettings):
     drawdown_halt_pct: float = Field(default=0.08, gt=0.0, le=1.0)
     minutes_before_close_blackout: int = Field(default=15, ge=0)
 
+    # Dynamic position sizing — see sizing.py. Everything here scales a trade
+    # *inside* the hard limits above; max_premium_pct_per_trade remains the
+    # ceiling risk.py enforces independently, and sizing clamps to it.
+    #
+    # The baseline fraction of equity risked on one trade, before any state
+    # scaling. Set below max_premium_pct_per_trade on purpose: the scalars below
+    # multiply out to roughly 3x in the best case, so the *starting* point has
+    # to leave room above it for a high-conviction trade to actually grow into
+    # the ceiling rather than being clamped on every single fill.
+    base_risk_pct_per_trade: float = Field(default=0.015, gt=0.0, le=1.0)
+    # Share of options buying power one trade may tie up. Options are never
+    # marginable, so this is the real portfolio-heat meter: every open
+    # defined-risk structure already holds its max loss as collateral, which
+    # means buying power falling *is* aggregate open risk rising. Well below 1.0
+    # so exits, adjustments and mark-to-market moves on the open book always
+    # have collateral left.
+    buying_power_utilization_cap: float = Field(default=0.50, gt=0.0, le=1.0)
+
+    # Portfolio-level Greeks caps — the two things max_concurrent_positions
+    # cannot see. This universe (SPY, QQQ, IWM + six large-cap tech names)
+    # correlates around 0.8-0.9, and the matrix picks the same structure family
+    # for all of them whenever the IV regime is the same, so five positions are
+    # one bet. See exposure.py.
+    #
+    # Both defaults are derived from drawdown_halt_pct (0.08) rather than picked,
+    # so the caps and the breaker agree on the same worst case:
+    #
+    #   Delta: at 1.00, a maxed book loses ~1% of equity per 1% index move, so a
+    #   5% index gap costs ~5% — inside the halt. Measured on the intended
+    #   5-position credit book at 10 DTE: 73% of equity, so this permits the
+    #   book it was calibrated for with headroom, and blocks roughly a 1.4x one.
+    #
+    #   Vega: at 0.0075, a 10-point vol shock on a maxed book costs ~7.5% of
+    #   equity — the halt, near enough. Measured on the same book: a credit
+    #   structure's long wing offsets most of its short's vega, so a credit book
+    #   sits at 0.07-0.09% and this never binds; a long-strangle book (both legs
+    #   long vega, nothing offsetting) reaches 0.38-0.52%, which is what the cap
+    #   is actually for. Short DTE shrinks vega — it scales with sqrt(T) — which
+    #   is why at a 7-14 DTE window gamma, not vega, is the live risk.
+    #
+    # Both are compared on the absolute value: a book heavily short the index is
+    # as directional as one heavily long, and a book short five vols is as
+    # exposed as one long five.
+    max_beta_weighted_delta_pct: float = Field(default=1.00, gt=0.0)
+    max_net_vega_pct: float = Field(default=0.0075, gt=0.0)
+
+    # Drawdown taper (anti-martingale, and the whole recovery mechanism). Size
+    # scales *down* as equity falls away from its high-water mark, reaching this
+    # floor exactly at drawdown_halt_pct. Sizing up into a drawdown is how an
+    # account dies before the halt ever fires; sizing down is what keeps enough
+    # capital alive to trade the recovery.
+    drawdown_size_floor: float = Field(default=0.35, gt=0.0, le=1.0)
+    # ...and the other direction: profits fund a bigger bet. Reaches the cap
+    # once the campaign is up gain_size_reference_pct. Pressing winners with
+    # house money is the only honest way to compound inside a short window.
+    gain_size_cap: float = Field(default=1.60, ge=1.0)
+    gain_size_reference_pct: float = Field(default=0.04, gt=0.0)
+
+    # Conviction band → size multiplier. Conviction below conviction_floor never
+    # reaches sizing (the matrix forces "hold"), so the live band is
+    # [conviction_floor, 1.0] and it is mapped onto [min_mult, max_mult]:
+    # bet size proportional to stated edge, a coarse discretised Kelly.
+    conviction_size_min_mult: float = Field(default=0.60, gt=0.0)
+    conviction_size_max_mult: float = Field(default=1.50, gt=0.0)
+    # ...and how much that band is trusted. Kelly sizing wants a *calibrated*
+    # probability; what conviction actually is, is a language model's
+    # self-reported confidence, with no prior claim to predicting anything. The
+    # measured correlation between conviction and realised P&L shrinks the
+    # multiplier toward 1.0 — at zero reliability every trade is sized the same,
+    # which is the correct answer when the number turns out to carry no signal.
+    #
+    # The prior applies until there are enough closed trades to measure. It is
+    # 0.5, not 1.0: a short campaign closes something like eight trades, a
+    # correlation over eight points is noise, and assuming full predictive power
+    # on no evidence is the aggressive direction. Raise it to 1.0 to restore
+    # unconditional trust in conviction; set it to 0.0 to size every trade the
+    # same until the data earns otherwise.
+    conviction_reliability_prior: float = Field(default=0.50, ge=0.0, le=1.0)
+    conviction_calibration_min_samples: int = Field(default=20, ge=2)
+
+    # Campaign horizon. Unset start date means "no horizon" — every scalar above
+    # still applies, but nothing paces or closes the window. Set it to run a
+    # fixed-length sprint: capital is front-loaded into the first session, and
+    # new opens stop once too few sessions remain for a position to work.
+    campaign_start_date: date | None = None
+    campaign_days: int = Field(default=3, ge=1)
+    # Neutral by default. Sizing bigger because the calendar is running out is
+    # forced trading, not a professional practice: if the first session offers
+    # no setup, the answer is not to trade the first session. The knob stays so
+    # a deliberate front-load is possible, but it is off unless asked for.
+    campaign_front_load_mult: float = Field(default=1.00, ge=1.0)
+    # New opens are refused while sessions_remaining <= this. At the default a
+    # position always gets at least one full session after the one it opens in:
+    # opening a spread that must be flattened hours later pays the bid/ask twice
+    # for whatever drift happens in between, which is not a strategy.
+    campaign_min_sessions_to_hold: int = Field(default=1, ge=0)
+
     # Dashboard access. A single shared secret, deliberately simpler than a
     # real user-auth system: this guards a judge-facing demo, not a
     # multi-tenant product. Unset means the guarded routes stay open, which
@@ -235,8 +334,27 @@ class Settings(BaseSettings):
     min_reward_risk: float = Field(default=1.0, ge=0.0)
     # DTE window for new structures (distinct from risk_dte_min/max which are
     # the hard account-wide bounds risk.py enforces regardless of intent).
-    dte_target_min: int = Field(default=21, gt=0)
-    dte_target_max: int = Field(default=38, gt=0)
+    #
+    # Matched to the holding period, which is the single biggest lever on a
+    # short-horizon book. Measured on a real SPY 640 / IV 18% chain with this
+    # module's own wing formula, holding a delta-selected credit vertical for
+    # three sessions with spot flat:
+    #
+    #   DTE   captured   % of max profit   net of 2 round-trip spreads   on risk
+    #     7    $45.3          32.8%                 $37.3                 6.42%
+    #    14    $26.9          14.0%                 $18.9                 2.30%
+    #    21    $20.6           8.9%                 $12.6                 1.25%
+    #    30    $16.5           6.1%                 $ 8.5                 0.70%
+    #
+    # At 30 DTE the bid/ask takes half of what three sessions of decay pays, and
+    # exit_credit_profit_target_pct (0.50) needs ~17 sessions to trigger — so a
+    # short campaign would end holding structures that never reached their own
+    # target. The cost of moving in is gamma: at 7-14 DTE a gap through the short
+    # strike reaches max loss far faster, which is why exit_dte_short_premium
+    # below has to be re-based and why sizing (not the DTE stop) becomes the
+    # thing holding the risk.
+    dte_target_min: int = Field(default=7, gt=0)
+    dte_target_max: int = Field(default=14, gt=0)
 
     # Phase 4 — ReflectionAgent.
     reflection_interval_seconds: float = Field(default=3600.0, gt=0)
@@ -244,9 +362,47 @@ class Settings(BaseSettings):
     # Phase 4 — StrategistAgent close-proposal thresholds (deterministic, no LLM).
     # StrategistAgent reads the positions cache and writes a close proposal when
     # any of these conditions is met; ExecutionAgent then executes it.
+    # These two are the fallback pair, used for a position whose originating
+    # strategy could not be resolved — the per-family thresholds below are what
+    # an enriched position is actually measured against.
     exit_profit_target_pct: float = Field(default=0.50, gt=0.0, le=1.0)
     exit_stop_loss_pct: float = Field(default=0.50, gt=0.0, le=1.0)
-    exit_time_stop_days: int = Field(default=30, ge=1)
+    # Holding duration, not DTE. Cut to the campaign's own length so capital is
+    # not still sitting in a structure after the window it was sized for has
+    # closed. This is an approximation of an end-of-campaign flatten, not a
+    # replacement for one — it counts calendar days from the fill, so a position
+    # opened on the first session exits a day after a three-session campaign
+    # ends rather than inside it.
+    exit_time_stop_days: int = Field(default=3, ge=1)
+
+    # Days-to-expiry exits, checked before any P&L threshold. The hard floor
+    # applies to every structure — carrying an ITM option into expiration turns
+    # an options position into an unwanted stock position. The short-premium
+    # rule applies only to credit structures, where gamma dominates P&L in the
+    # final weeks; a debit or long structure is holding convexity it paid for.
+    exit_dte_hard_floor: int = Field(default=2, ge=0)
+    # MUST stay below dte_target_min, or every credit structure is born inside
+    # its own DTE stop and StrategistAgent proposes closing it on the first tick
+    # after the fill — the system would open and immediately close, paying two
+    # spreads for nothing. At a 7-14 DTE entry window the gamma regime is where
+    # the book deliberately lives, so this stops being the gamma guard: the
+    # per-family stop loss and the position size are.
+    exit_dte_short_premium: int = Field(default=3, ge=0)
+
+    # Per-family P&L thresholds, measured on pnl_pct (unrealized P&L over the
+    # net value paid or received at entry). For a credit structure pnl_pct is
+    # literally the share of the credit realised, so 0.50 is the classic "take
+    # half the credit". The credit stop is expressed the same way: 1.00 means a
+    # loss equal to the credit received, i.e. the spread now costs 2x what it
+    # paid. Note that a wide credit (the builder allows up to
+    # max_credit_width_pct of the width) can have a defined max loss smaller
+    # than 1x credit, in which case the structure caps out before this stop.
+    exit_credit_profit_target_pct: float = Field(default=0.50, gt=0.0, le=1.0)
+    exit_credit_stop_loss_pct: float = Field(default=1.00, gt=0.0, le=10.0)
+    exit_debit_profit_target_pct: float = Field(default=0.75, gt=0.0, le=10.0)
+    exit_debit_stop_loss_pct: float = Field(default=0.50, gt=0.0, le=1.0)
+    exit_long_profit_target_pct: float = Field(default=1.00, gt=0.0, le=10.0)
+    exit_long_stop_loss_pct: float = Field(default=0.50, gt=0.0, le=1.0)
 
     # Telegram notifications (outbound only — no bot listener, no commands).
     # Unset token or chat id means "run without notifications", the same

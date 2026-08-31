@@ -19,7 +19,7 @@ from options_m.agents.execution import (
 )
 from options_m.config import Settings
 from options_m.db import Database
-from options_m.models import Rejection
+from options_m.models import Rejection, StrategyIntent
 from options_m.store import Store
 
 
@@ -317,3 +317,78 @@ async def test_the_agent_works_without_a_notifier() -> None:
     await agent._reject(proposal_id, Rejection(proposal_id=proposal_id, reason="x"), "SPY")
     row = await store.get_proposal(proposal_id)
     assert row is not None and row["status"] == "rejected"
+
+
+# ---------------------------------------------------------------------------
+# Closing a position — the limit price comes off the net, not the gross
+# ---------------------------------------------------------------------------
+
+
+class _CloseMcp:
+    """Captures the order the close path submits."""
+
+    def __init__(self) -> None:
+        self.kwargs: dict[str, Any] | None = None
+
+    async def place_option_order(self, **kwargs: Any) -> dict[str, Any]:
+        self.kwargs = kwargs
+        return {"id": "order-1", "status": "new"}
+
+
+def _close_agent(store: Store, mcp: Any) -> ExecutionAgent:
+    settings = Settings(database_url=None, dry_run=False)
+    return ExecutionAgent(settings, mcp, store, MagicMock())
+
+
+def _close_intent() -> Any:
+    return StrategyIntent(
+        action="close",
+        strategy="put_credit_spread",
+        underlying="AAPL",
+        target_delta=0.5,
+        dte_min=0,
+        dte_max=365,
+        conviction=1.0,
+        thesis="profit_target",
+        invalidation="",
+    )
+
+
+async def _close_with(payload: dict[str, Any]) -> dict[str, Any]:
+    store = _store()
+    await store.upsert_position("AAPL", payload)
+    mcp = _CloseMcp()
+    proposal_id = await store.save_proposal(underlying="AAPL", intent={}, evidence={})
+    await _close_agent(store, mcp)._execute_close(
+        proposal_id, _close_intent(), {"submitted": 0, "failed": 0, "rejected": 0}
+    )
+    assert mcp.kwargs is not None
+    return mcp.kwargs
+
+
+async def test_a_spread_is_bought_back_at_its_net_not_its_gross() -> None:
+    """The short leg is worth -300 and the long +100: closing the structure
+    costs 200, i.e. 2.00 per contract. Pricing off the gross 400 would offer
+    twice what the spread can be bought back for."""
+    kwargs = await _close_with(
+        {
+            "market_value": 400.0,
+            "net_value": -200.0,
+            "legs": [
+                {"symbol": "AAPL991231P00150000", "side": "short", "qty": "-1"},
+                {"symbol": "AAPL991231P00145000", "side": "long", "qty": "1"},
+            ],
+        }
+    )
+    assert kwargs["limit_price"] == "2.00"
+
+
+async def test_a_payload_without_a_net_still_prices_off_the_gross() -> None:
+    """Rows written before net_value existed keep their old behaviour."""
+    kwargs = await _close_with(
+        {
+            "market_value": 250.0,
+            "legs": [{"symbol": "AAPL991231C00150000", "side": "long", "qty": "1"}],
+        }
+    )
+    assert kwargs["limit_price"] == "2.50"

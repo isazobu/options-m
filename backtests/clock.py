@@ -32,6 +32,8 @@ _PATCH_TARGETS = (
     "options_m.risk",
     "options_m.evidence.evidence",
     "options_m.agents.execution",
+    # Added for the exit-flow replay: ``_close_reason`` dates the time stop.
+    "options_m.agents.strategist",
 )
 
 

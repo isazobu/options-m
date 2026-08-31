@@ -34,6 +34,7 @@ from typing import Any
 from options_m.config import Settings
 from options_m.llm import FeatherlessLlm, LlmError
 from options_m.prompts import loader as prompt_loader
+from options_m.sizing import conviction_reliability
 from options_m.store import Store
 
 logger = logging.getLogger(__name__)
@@ -90,9 +91,37 @@ class ReflectionAgent:
     async def _run(self) -> dict[str, Any]:
         pass_a_count = await self._pass_a_closed_trades()
         pass_b_count = await self._pass_b_held_rejected()
-        detail = {"pass_a_lessons": pass_a_count, "pass_b_lessons": pass_b_count}
+        detail: dict[str, Any] = {
+            "pass_a_lessons": pass_a_count,
+            "pass_b_lessons": pass_b_count,
+        }
+        detail |= await self._pass_c_conviction_calibration()
         logger.info("reflection pulse", extra=detail)
         return detail
+
+    async def _pass_c_conviction_calibration(self) -> dict[str, Any]:
+        """Measure whether this system's stated conviction predicts its P&L.
+
+        No LLM: it is a correlation over closed trades, and asking a model to
+        judge its own calibration is exactly the circularity the measurement
+        exists to break. Nothing here writes to sizing either —
+        ``sizing.build_sizing_state`` computes the same number from the same
+        store method on every proposal, so this pass exists to make it *visible*
+        in the agent-run detail and the logs. A number that silently shrinks
+        every position is a number nobody will audit.
+        """
+        outcomes = await self._store.conviction_outcomes()
+        reliability, samples = conviction_reliability(
+            [(row["conviction"], row["pnl_pct"]) for row in outcomes], self._settings
+        )
+        calibrated = samples >= self._settings.conviction_calibration_min_samples
+        return {
+            "conviction_samples": samples,
+            "conviction_reliability": round(reliability, 4),
+            # Whether the figure above is measured or still the configured prior.
+            # Without this the two are indistinguishable in a log line.
+            "conviction_calibrated": calibrated,
+        }
 
     async def _pass_a_closed_trades(self) -> int:
         """For each filled order not yet reflected on, generate and save a lesson."""

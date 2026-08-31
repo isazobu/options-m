@@ -16,6 +16,9 @@ from options_m.risk import PortfolioSnapshot, RiskEngine, RiskLimits
 _LIMITS = RiskLimits(
     max_premium_pct_per_trade=0.02,
     max_total_premium_pct=0.15,
+    buying_power_utilization_cap=0.50,
+    max_beta_weighted_delta_pct=1.00,
+    max_net_vega_pct=0.0075,
     max_concurrent_positions=5,
     max_positions_per_underlying=1,
     dte_min=7,
@@ -62,6 +65,9 @@ def _plan(**overrides: Any) -> OrderPlan:
 def _portfolio(**overrides: Any) -> PortfolioSnapshot:
     base: dict[str, Any] = {
         "equity": 100_000.0,
+        "options_buying_power": 100_000.0,
+        "projected_beta_weighted_delta": 0.0,
+        "projected_net_vega": 0.0,
         "start_of_day_equity": 100_000.0,
         "high_water_mark": 100_000.0,
         "concurrent_option_positions": 0,
@@ -230,6 +236,28 @@ def test_unknown_equity_blocks_the_premium_checks() -> None:
     assert "unknown_equity" in verdict.reasons
 
 
+def test_an_order_the_account_cannot_carry_is_rejected() -> None:
+    """Equity is not a substitute for collateral.
+
+    A defined-risk short structure holds its whole width as collateral while
+    leaving equity untouched, so this portfolio passes every equity-denominated
+    check and still cannot carry the order.
+    """
+    plan = _plan(max_loss=1_500.0)
+
+    verdict = _engine().evaluate(plan, _portfolio(options_buying_power=2_000.0))
+
+    assert "insufficient_buying_power" in verdict.reasons
+    assert "premium_per_trade_exceeded" not in verdict.reasons
+
+
+def test_unreadable_buying_power_cannot_approve() -> None:
+    """Unknown is never a passing value — the same rule as unknown equity."""
+    verdict = _engine().evaluate(_plan(), _portfolio(options_buying_power=None))
+
+    assert "unknown_buying_power" in verdict.reasons
+
+
 def test_total_open_premium_over_the_limit_is_rejected() -> None:
     plan = _plan(max_loss=1_000.0)
 
@@ -278,3 +306,45 @@ def test_a_nan_high_water_mark_does_not_permanently_disable_the_drawdown_breaker
     healthy = _portfolio(equity=90_000.0, high_water_mark=100_000.0)
     verdict = engine.evaluate(_plan(), healthy)
     assert any(r.startswith("drawdown_halt") for r in verdict.reasons)
+
+
+def test_a_book_over_its_directional_budget_is_rejected() -> None:
+    """The check max_concurrent_positions cannot do.
+
+    Five correlated positions each hold one slot and each pass every
+    dollar-risk cap; their deltas still add up to one large index bet.
+    """
+    verdict = _engine().evaluate(_plan(), _portfolio(projected_beta_weighted_delta=150_000.0))
+
+    assert "beta_weighted_delta_exceeded" in verdict.reasons
+
+
+def test_a_short_directional_book_is_capped_the_same_as_a_long_one() -> None:
+    """The failure mode does not care which way the index moves."""
+    verdict = _engine().evaluate(_plan(), _portfolio(projected_beta_weighted_delta=-150_000.0))
+
+    assert "beta_weighted_delta_exceeded" in verdict.reasons
+
+
+def test_a_book_over_its_vol_budget_is_rejected() -> None:
+    """Every position correctly sized on max loss, the book still short five vols."""
+    verdict = _engine().evaluate(_plan(), _portfolio(projected_net_vega=-2_000.0))
+
+    assert "net_vega_exceeded" in verdict.reasons
+
+
+def test_a_long_vol_book_is_capped_the_same_as_a_short_one() -> None:
+    verdict = _engine().evaluate(_plan(), _portfolio(projected_net_vega=2_000.0))
+
+    assert "net_vega_exceeded" in verdict.reasons
+
+
+def test_an_unmeasurable_book_cannot_be_approved() -> None:
+    """Unknown greeks are not a hedged book — the same rule as unknown equity."""
+    verdict = _engine().evaluate(
+        _plan(),
+        _portfolio(projected_beta_weighted_delta=None, projected_net_vega=None),
+    )
+
+    assert "unknown_portfolio_delta" in verdict.reasons
+    assert "unknown_portfolio_vega" in verdict.reasons
