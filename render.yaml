@@ -71,7 +71,7 @@ services:
       # Safety defaults. Flip DRY_RUN to false only once the risk engine and
       # the execution agent are in place and tested.
       - key: DRY_RUN
-        value: "true"
+        value: "false"
       - key: KILL_SWITCH
         value: "false"
 
