@@ -15,14 +15,14 @@ from __future__ import annotations
 import json
 import logging
 from collections import deque
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from options_m.db import Database
 from options_m.evidence.occ import parse_occ_symbol
-from options_m.volatility import iv_rank
+from options_m.volatility import iv_percentile, iv_rank
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,18 @@ _SETTLED_ORDER_STATES = frozenset(
 # or a late-evening UTC timestamp can resolve to the wrong agents day.
 _EXCHANGE_TZ = ZoneInfo("America/New_York")
 
+# IV Rank is a *daily* statistic over a *trading year* — the tastytrade
+# definition every options desk quotes: where today's ATM IV sits between the
+# highest and lowest daily ATM IV of the last 252 sessions. Both numbers below
+# are counted in trading days, never in readings: MarketPulseAgent appends a
+# reading every minute, so ranking the last 252 *rows* ranks the last four
+# hours and calls the answer a year. See daily_iv_history.
+IV_RANK_WINDOW_DAYS = 252
+# Below this many distinct sessions the window is not a vol regime, and the
+# honest answer is MISSING. Six months is the shortest span over which a rank
+# still separates a quiet tape from a stressed one.
+IV_RANK_MIN_DAYS = 126
+
 
 def _now() -> datetime:
     return datetime.now(UTC)
@@ -79,6 +91,27 @@ def _maybe_float(value: object) -> float | None:
         return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _session_day(ts: datetime) -> date:
+    """The exchange session a timestamp belongs to.
+
+    A US options session runs 09:30-16:00 New York, which never crosses a UTC
+    midnight — but the pre-open and post-close writes do, so the day is taken
+    in the exchange's zone rather than UTC.
+    """
+    return ts.astimezone(_EXCHANGE_TZ).date()
+
+
+def _calendar_span_for(trading_days: int) -> int:
+    """Calendar days that comfortably contain ``trading_days`` sessions.
+
+    Weekends and holidays mean ~252 sessions span ~365 calendar days. Sized
+    generously (the same idiom as AlpacaMcp.get_stock_bars) so the SQL time
+    bound only exists to keep the scan off the index's tail — the row LIMIT,
+    not this, is what caps the window.
+    """
+    return int(trading_days * 1.6) + 15
 
 
 class Store:
@@ -230,18 +263,24 @@ class Store:
         dte: int | None = None,
         spot: float | None = None,
         payload: dict[str, Any] | None = None,
+        ts: datetime | None = None,
     ) -> None:
         """One near-the-money implied-vol reading for ``symbol``.
 
-        The evidence pack's IV Rank is this symbol's latest reading against its
-        own recent history, so this needs to be written on a regular cadence
-        (once per pull) for the rank to mean anything.
+        Written once per pull, so a symbol accumulates many readings per
+        session. IV Rank collapses them to one observation per session day
+        (see :meth:`daily_iv_history`) — the cadence here only decides how
+        fresh the *current* reading is, never how long the rank's window is.
+
+        ``ts`` dates the reading. It exists for the historical backfill
+        (:mod:`options_m.iv_backfill`), which reconstructs past sessions from
+        option bars; live callers leave it unset and get now.
         """
         symbol = symbol.upper()
         if not self._db.is_enabled:
             self._memory_iv_history.setdefault(symbol, deque(maxlen=_MEMORY_LIMIT)).appendleft(
                 {
-                    "ts": _now(),
+                    "ts": ts or _now(),
                     "symbol": symbol,
                     "iv_atm": iv_atm,
                     "dte": dte,
@@ -252,17 +291,57 @@ class Store:
             return
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO iv_history (symbol, iv_atm, dte, spot, payload) "
-                "VALUES (%s, %s, %s, %s, %s)",
+                "INSERT INTO iv_history (symbol, iv_atm, dte, spot, payload, ts) "
+                "VALUES (%s, %s, %s, %s, %s, COALESCE(%s, now()))",
                 (
                     symbol,
                     _as_decimal(iv_atm),
                     dte,
                     _as_decimal(spot),
                     json.dumps(payload) if payload else None,
+                    ts,
                 ),
             )
             await conn.commit()
+
+    async def append_iv_snapshots(self, symbol: str, readings: list[dict[str, Any]]) -> int:
+        """Bulk-insert dated IV readings. Returns the number written.
+
+        The backfill path: one row per past session, each carrying its own
+        ``ts``. Rows are inserted as given — the caller is responsible for not
+        re-writing a session it already holds (see :meth:`iv_session_days`),
+        because the live writer shares this table and a uniqueness constraint
+        on the session day would reject its second reading of the minute.
+        """
+        if not readings:
+            return 0
+        symbol = symbol.upper()
+        if not self._db.is_enabled:
+            bucket = self._memory_iv_history.setdefault(symbol, deque(maxlen=_MEMORY_LIMIT))
+            # appendleft keeps the deque newest-first, so the oldest reading
+            # has to go in first.
+            for reading in sorted(readings, key=lambda row: cast(datetime, row["ts"])):
+                bucket.appendleft({**reading, "symbol": symbol})
+            return len(readings)
+        rows = [
+            (
+                symbol,
+                _as_decimal(_maybe_float(reading.get("iv_atm"))),
+                reading.get("dte"),
+                _as_decimal(_maybe_float(reading.get("spot"))),
+                json.dumps(reading["payload"]) if reading.get("payload") else None,
+                reading["ts"],
+            )
+            for reading in readings
+        ]
+        async with self._db.connection() as conn, conn.cursor() as cur:
+            await cur.executemany(
+                "INSERT INTO iv_history (symbol, iv_atm, dte, spot, payload, ts) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                rows,
+            )
+            await conn.commit()
+        return len(rows)
 
     async def recent_agent_runs(self, limit: int = 50) -> list[dict[str, Any]]:
         if not self._db.is_enabled:
@@ -292,7 +371,13 @@ class Store:
         )
 
     async def recent_iv(self, symbol: str, limit: int = 252) -> list[dict[str, Any]]:
-        """This symbol's implied-vol readings (from append_iv_snapshot), newest first."""
+        """This symbol's raw implied-vol readings, newest first.
+
+        Every reading, at whatever cadence they were written — so ``limit``
+        counts *rows*, which at a one-minute pulse is minutes, not days. Only
+        the dashboard and diagnostics want that. IV Rank and IV percentile go
+        through :meth:`daily_iv_history` instead.
+        """
         symbol = symbol.upper()
         if not self._db.is_enabled:
             return list(self._memory_iv_history.get(symbol, ()))[:limit]
@@ -302,16 +387,105 @@ class Store:
             (symbol, limit),
         )
 
-    async def iv_rank_for(self, symbol: str, *, window: int = 252) -> float | None:
-        """IV Rank of ``symbol``'s latest reading over its last ``window`` readings.
+    async def daily_iv_history(
+        self, symbol: str, *, days: int = IV_RANK_WINDOW_DAYS
+    ) -> list[dict[str, Any]]:
+        """One ATM-IV observation per exchange session, newest first.
 
-        ``None`` until at least two readings exist. This is the number the
-        volatility analyst reasons about.
+        The last reading of each session day, capped at ``days`` sessions —
+        the daily series IV Rank is defined over. Collapsing to one row per day
+        is what makes the window a year rather than the last few hours: the
+        live writer appends a reading every minute, so 252 rows of
+        :meth:`recent_iv` is 252 minutes.
+
+        Rows with no ``iv_atm`` are skipped: an unsolvable IV is an absent
+        observation, and letting it through would sink the window's minimum.
         """
-        rows = await self.recent_iv(symbol, window)
-        # recent_iv is newest-first; iv_rank wants chronological order.
+        symbol = symbol.upper()
+        if not self._db.is_enabled:
+            latest_per_day: dict[date, dict[str, Any]] = {}
+            # The deque is newest-first, so the first row seen for a day is
+            # that day's last reading.
+            for row in self._memory_iv_history.get(symbol, ()):
+                if _maybe_float(row.get("iv_atm")) is None:
+                    continue
+                day = _session_day(cast(datetime, row["ts"]))
+                if day not in latest_per_day:
+                    latest_per_day[day] = {**row, "session_day": day}
+            return [latest_per_day[day] for day in sorted(latest_per_day, reverse=True)[:days]]
+        # The time bound only keeps the scan off the old end of the index; the
+        # LIMIT is what caps the window at `days` sessions.
+        cutoff = _now() - timedelta(days=_calendar_span_for(days))
+        # ``payload`` is selected so this path returns the same shape as the
+        # in-memory one, provenance included: it is how a judge tells a
+        # reconstructed observation from a live reading.
+        return await self._fetch(
+            "SELECT DISTINCT ON (session_day) "
+            "       session_day, ts, symbol, iv_atm, dte, spot, payload FROM ("
+            "  SELECT (ts AT TIME ZONE 'America/New_York')::date AS session_day,"
+            "         ts, symbol, iv_atm, dte, spot, payload"
+            "  FROM iv_history"
+            "  WHERE symbol = %s AND iv_atm IS NOT NULL AND ts >= %s"
+            ") readings ORDER BY session_day DESC, ts DESC LIMIT %s",
+            (symbol, cutoff, days),
+        )
+
+    async def iv_session_days(self, symbol: str, *, days: int = IV_RANK_WINDOW_DAYS) -> set[date]:
+        """Session days this symbol already has an ATM-IV observation for.
+
+        The backfill reads this to know which sessions it still has to
+        reconstruct, so a restart does not re-fetch and re-insert a year of
+        bars it already holds.
+        """
+        rows = await self.daily_iv_history(symbol, days=days)
+        return {
+            cast(date, row["session_day"])
+            for row in rows
+            if isinstance(row.get("session_day"), date)
+        }
+
+    async def iv_rank_and_percentile(
+        self,
+        symbol: str,
+        *,
+        days: int = IV_RANK_WINDOW_DAYS,
+        min_days: int = IV_RANK_MIN_DAYS,
+    ) -> tuple[float | None, float | None, int]:
+        """``(iv_rank, iv_percentile, sessions_used)`` over the daily series.
+
+        Both statistics come off one read of the same window, which is also
+        what keeps them consistent with each other. Both are ``None`` until the
+        window holds ``min_days`` distinct sessions: a rank computed over a
+        handful of observations swings tens of points on a tick of IV and
+        describes the sample, not the vol regime. ``sessions_used`` is returned
+        either way so the caller can publish the sample size alongside the
+        numbers.
+        """
+        rows = await self.daily_iv_history(symbol, days=days)
+        # daily_iv_history is newest-first; both statistics want chronological
+        # order so the *last* value is the current one.
         values = [_maybe_float(row.get("iv_atm")) for row in reversed(rows)]
-        return iv_rank(values)
+        observations = [value for value in values if value is not None]
+        if len(observations) < max(min_days, 2):
+            return None, None, len(observations)
+        return iv_rank(values), iv_percentile(values), len(observations)
+
+    async def iv_rank_for(
+        self,
+        symbol: str,
+        *,
+        days: int = IV_RANK_WINDOW_DAYS,
+        min_days: int = IV_RANK_MIN_DAYS,
+    ) -> float | None:
+        """IV Rank of ``symbol``'s latest ATM IV over its last ``days`` sessions.
+
+        ``None`` until the daily series holds ``min_days`` sessions. This is the
+        number the volatility analyst reasons about.
+        """
+        rank, _pctile, _sessions = await self.iv_rank_and_percentile(
+            symbol, days=days, min_days=min_days
+        )
+        return rank
 
     async def recent_lessons(self, symbol: str | None = None, n: int = 3) -> list[str]:
         """Most recent lessons for a symbol, or portfolio-wide when symbol is None.
@@ -751,43 +925,12 @@ class Store:
         )
 
     # ---- IV history ----------------------------------------------------
-
-    async def save_iv_history(
-        self,
-        *,
-        symbol: str,
-        iv_atm: float | None,
-        put_call_skew: float | None,
-        term_structure: float | None,
-        median_spread_pct: float | None,
-        total_open_interest: int | None,
-    ) -> None:
-        row = {
-            "ts": _now(),
-            "symbol": symbol,
-            "iv_atm": iv_atm,
-            "put_call_skew": put_call_skew,
-            "term_structure": term_structure,
-            "median_spread_pct": median_spread_pct,
-            "total_open_interest": total_open_interest,
-        }
-        if not self._db.is_enabled:
-            self._memory_iv_history.setdefault(symbol, deque(maxlen=_MEMORY_LIMIT)).appendleft(row)
-            return
-        async with self._db.connection() as conn, conn.cursor() as cur:
-            await cur.execute(
-                "INSERT INTO iv_history (symbol, iv_atm, put_call_skew, term_structure, "
-                "median_spread_pct, total_open_interest) VALUES (%s, %s, %s, %s, %s, %s)",
-                (
-                    symbol,
-                    _as_decimal(iv_atm),
-                    _as_decimal(put_call_skew),
-                    _as_decimal(term_structure),
-                    _as_decimal(median_spread_pct),
-                    total_open_interest,
-                ),
-            )
-            await conn.commit()
+    # Sole writers: EvidenceCollector (live, one reading per pull) and
+    # iv_backfill (historical, one per past session). There was a third,
+    # save_iv_history, which nothing ever called: it wrote a different column
+    # set to the same table -- no dte, no spot -- so a row of its making would
+    # have entered the daily series as an observation that could not be
+    # attributed to a tenor. Removed rather than left waiting to be wired up.
 
     # ---- Market calendar cache ------------------------------------------
     # Sole writer: MarketPulseAgent. Every other agent's "is the market open"

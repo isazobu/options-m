@@ -40,7 +40,7 @@ from options_m.indicators import (
 )
 from options_m.mcp_client import AlpacaMcp, finite_float
 from options_m.store import Store
-from options_m.volatility import implied_vol, iv_percentile
+from options_m.volatility import implied_vol
 
 logger = logging.getLogger(__name__)
 
@@ -332,7 +332,9 @@ class EvidenceCollector:
             self._atm(far_rows, "put", spot_price)[1],
         )
 
-        iv_rank, iv_pctile = await self._persist_and_rank(symbol, iv_atm, atm_dte, spot_price)
+        iv_rank, iv_pctile, iv_sessions = await self._persist_and_rank(
+            symbol, iv_atm, atm_dte, spot_price
+        )
 
         spreads = [row["spread_pct"] for row in rows if isinstance(row["spread_pct"], float)]
         ois = [row["open_interest"] for row in rows if isinstance(row["open_interest"], int)]
@@ -356,6 +358,10 @@ class EvidenceCollector:
             "iv_source": iv_source,
             "iv_rank": _or_missing(_round(iv_rank, 2)),
             "iv_percentile": _or_missing(_round(iv_pctile, 2)),
+            # How many distinct sessions the rank and percentile above were
+            # measured over. Published even when they are MISSING, because the
+            # sample size is what says how much either number is worth.
+            "iv_history_sessions": iv_sessions,
             "realised_vol_20d": _or_missing(_round(realised_vol, 4)),
             "iv_minus_rv": _or_missing(
                 _round(iv_atm - realised_vol, 4)
@@ -501,30 +507,43 @@ class EvidenceCollector:
         iv_atm: float | None,
         atm_dte: int,
         spot_price: float | None,
-    ) -> tuple[float | None, float | None]:
-        """Append today's ATM-IV reading, then rank it against the stored
-        history. IV rank is meaningless on day one and fills in as the service
-        runs — which is why the write happens here, once per pull. ``atm_dte``
-        is stored so the history is a like-for-like series at one tenor."""
+    ) -> tuple[float | None, float | None, int]:
+        """Append this pull's ATM-IV reading, then rank it against the daily
+        series. Returns ``(rank, percentile, sessions_used)``.
+
+        The write happens here, once per pull, so the *current* reading is
+        always fresh. The ranking is a different question: it is measured over
+        one observation per session across a trading year, which is what
+        Store.iv_rank_and_percentile collapses the readings down to. Ranking
+        the raw readings instead ranked the last four hours — the pulse writes
+        one a minute — and called the result a vol regime.
+
+        Until the daily window is deep enough the store returns ``None`` for
+        both, and ``sessions_used`` says how deep it actually is.
+        ``options_m.iv_backfill`` is what fills the window in from historical
+        option bars rather than waiting a year for it.
+
+        ``atm_dte`` is stored so the history is a like-for-like series at one
+        tenor.
+        """
         if iv_atm is None:
-            return None, None
+            return None, None, 0
         try:
             await self._store.append_iv_snapshot(
                 symbol,
                 iv_atm=iv_atm,
                 dte=atm_dte,
                 spot=spot_price,
-                payload={"iv_atm": iv_atm},
+                payload={"iv_atm": iv_atm, "source": "chain_snapshot"},
             )
-            rank = await self._store.iv_rank_for(symbol)
-            history = await self._store.recent_iv(symbol)
+            return await self._store.iv_rank_and_percentile(
+                symbol,
+                days=self._settings.iv_rank_window_days,
+                min_days=self._settings.iv_rank_min_days,
+            )
         except Exception:
             logger.warning("evidence: iv history I/O failed for %s", symbol, exc_info=True)
-            return None, None
-        values = [_f(row.get("iv_atm")) for row in reversed(history)]
-        # Like IV rank, a percentile against a single reading is noise, not data.
-        pctile = iv_percentile(values) if len([v for v in values if v is not None]) >= 2 else None
-        return rank, pctile
+            return None, None, 0
 
     async def _position(self, symbol: str) -> list[dict[str, Any]] | str | None:
         """Any open position in this underlying — equity or option legs.

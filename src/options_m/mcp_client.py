@@ -29,6 +29,7 @@ import logging
 import math
 import os
 import sys
+from collections.abc import Sequence
 from types import TracebackType
 from typing import Any, Self
 
@@ -86,6 +87,11 @@ RISK_EXTERNAL_TEXT = "external_text"
 # live and paper accounts return the same response shape.
 _PAPER_ACCOUNT_PREFIX = "PA"
 _PAPER_ACCOUNT_STATUS = "PAPER_ONLY"
+
+# /v1beta1/options/bars documents "a comma-separated list of contract symbols
+# with a limit of 100". Enforced client-side: past the cap the API drops the
+# tail rather than erroring, which would look like contracts that never traded.
+_OPTION_BARS_SYMBOL_LIMIT = 100
 
 # The command that starts the server. `python -m alpaca_mcp_server.cli` does NOT
 # work: cli.py defines a click command but has no __main__ guard, so -m would
@@ -832,6 +838,80 @@ class AlpacaMcp:
             )
         return snapshots
 
+    async def get_option_bars(
+        self,
+        occ_symbols: Sequence[str],
+        *,
+        start: str,
+        end: str,
+        timeframe: str = "1Day",
+        limit: int = 10_000,
+        max_pages: int = 25,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Historical OHLCV bars per option contract, oldest first.
+
+        The one historical option series Alpaca serves without an OPRA
+        agreement: there is no historical *quote* endpoint, only
+        ``/quotes/latest``, so a past session's option price can only be a
+        trade price. A daily bar's ``c`` is the session's last print and ``n``
+        its trade count — the backfill needs both, the second to judge how far
+        from the close that print may have been.
+
+        The API caps ``symbols`` at 100 per request; batching is the caller's
+        job. Follows ``next_page_token`` so a long window is not silently cut.
+        """
+        if not occ_symbols:
+            return {}
+        if len(occ_symbols) > _OPTION_BARS_SYMBOL_LIMIT:
+            msg = (
+                f"get_option_bars accepts at most {_OPTION_BARS_SYMBOL_LIMIT} symbols, "
+                f"got {len(occ_symbols)}"
+            )
+            raise ValueError(msg)
+
+        args: dict[str, Any] = {
+            "symbols": ",".join(occ_symbols),
+            "timeframe": timeframe,
+            "start": start,
+            "end": end,
+            "limit": limit,
+            "sort": "asc",
+        }
+        bars: dict[str, list[dict[str, Any]]] = {}
+        page_token: str | None = None
+        for _page in range(max_pages):
+            if page_token:
+                args["page_token"] = page_token
+            payload = self._expect_mapping(
+                "get_option_bars", await self.call("get_option_bars", args)
+            )
+            chunk = payload.get("bars")
+            if chunk is None:
+                # A window with no prints at all comes back without the key
+                # rather than with an empty object.
+                break
+            if not isinstance(chunk, dict):
+                msg = "get_option_bars returned no bars object"
+                raise McpProtocolError(msg)
+            for occ, rows in chunk.items():
+                if isinstance(rows, list):
+                    bars.setdefault(occ, []).extend(
+                        row for row in rows if isinstance(row, dict)
+                    )
+            page_token = payload.get("next_page_token")
+            if not page_token:
+                break
+        else:
+            logger.warning(
+                "get_option_bars stopped at the %d-page ceiling for %d symbols; "
+                "the series may be truncated",
+                max_pages,
+                len(occ_symbols),
+            )
+        for rows in bars.values():
+            rows.sort(key=lambda bar: str(bar.get("t") or ""))
+        return bars
+
     async def get_option_contracts(
         self,
         underlying: str,
@@ -841,11 +921,16 @@ class AlpacaMcp:
         expiration_lte: str | None = None,
         strike_gte: float | None = None,
         strike_lte: float | None = None,
+        status: str = "active",
         limit: int = 1000,
         max_pages: int = 25,
     ) -> list[dict[str, Any]]:
         """Reference data for an underlying's contracts — carries open interest,
         which the market-data chain does not.
+
+        ``status`` is ``"active"`` for tradeable contracts and ``"inactive"``
+        for expired ones, which is how the backfill reaches a strike that
+        expired months ago; Alpaca returns only active contracts by default.
 
         Follows ``next_page_token`` to the end of the list so open interest is
         still attached for strikes that fall past the first page.
@@ -853,7 +938,7 @@ class AlpacaMcp:
         args: dict[str, Any] = {
             "underlying_symbols": underlying,
             "limit": limit,
-            "status": "active",
+            "status": status,
         }
         if option_type is not None:
             args["type"] = option_type

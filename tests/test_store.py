@@ -7,7 +7,8 @@ and that the fallback keeps the same contract as the persistent path.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from options_m.config import Settings
 from options_m.db import Database
@@ -102,19 +103,120 @@ async def test_iv_history_is_per_symbol_and_newest_first() -> None:
     assert all(row["symbol"] == "AAPL" for row in rows)
 
 
-async def test_iv_rank_for_ranks_the_latest_reading() -> None:
+def _session_close(day: date) -> datetime:
+    """16:00 New York on ``day``, as UTC — where a daily reading is dated."""
+    return datetime.combine(day, time(hour=16), tzinfo=ZoneInfo("America/New_York")).astimezone(
+        UTC
+    )
+
+
+async def _fill_sessions(store: Store, symbol: str, ivs: list[float]) -> None:
+    """One reading per consecutive calendar day, oldest first."""
+    start = date(2026, 1, 5)
+    for offset, iv in enumerate(ivs):
+        await store.append_iv_snapshot(
+            symbol, iv_atm=iv, dte=30, ts=_session_close(start + timedelta(days=offset))
+        )
+
+
+async def test_iv_rank_for_ranks_the_latest_session_against_the_year() -> None:
     store = _store()
-    for iv in (0.10, 0.20, 0.30):  # ascending -> latest is the max -> rank 100
-        await store.append_iv_snapshot("SPY", iv_atm=iv)
+    # Ascending across enough sessions to clear the minimum -> latest is the
+    # window maximum -> rank 100.
+    await _fill_sessions(store, "SPY", [0.10 + index * 0.001 for index in range(130)])
 
     assert await store.iv_rank_for("SPY") == 100.0
 
 
-async def test_iv_rank_for_is_none_until_two_readings() -> None:
+async def test_iv_rank_is_none_until_the_window_holds_enough_sessions() -> None:
+    """The bug this replaced: 252 *readings* at a one-minute pulse is 252
+    minutes, so a rank appeared within hours of a cold start and swung tens of
+    points per tick. A rank is a daily statistic over a trading year."""
     store = _store()
     assert await store.iv_rank_for("SPY") is None
-    await store.append_iv_snapshot("SPY", iv_atm=0.2)
+
+    # A full session of minute-by-minute readings is still one observation.
+    opened = _session_close(date(2026, 1, 5)) - timedelta(hours=6)
+    for minute in range(400):
+        await store.append_iv_snapshot(
+            "SPY", iv_atm=0.20 + minute * 0.0005, ts=opened + timedelta(minutes=minute)
+        )
+
+    assert len(await store.daily_iv_history("SPY")) == 1
     assert await store.iv_rank_for("SPY") is None
+    rank, pctile, sessions = await store.iv_rank_and_percentile("SPY")
+    assert (rank, pctile, sessions) == (None, None, 1)
+
+
+async def test_the_daily_series_keeps_each_session_s_last_reading() -> None:
+    store = _store()
+    day = date(2026, 1, 5)
+    close = _session_close(day)
+    for offset, iv in ((-120, 0.21), (-60, 0.25), (0, 0.29)):
+        await store.append_iv_snapshot(
+            "SPY", iv_atm=iv, ts=close + timedelta(minutes=offset)
+        )
+    await store.append_iv_snapshot("SPY", iv_atm=0.40, ts=_session_close(day + timedelta(days=1)))
+
+    rows = await store.daily_iv_history("SPY")
+
+    # Newest session first, and each session represented by its close, not its
+    # open and not its intraday extreme.
+    assert [row["iv_atm"] for row in rows] == [0.40, 0.29]
+    assert [row["session_day"] for row in rows] == [day + timedelta(days=1), day]
+
+
+async def test_iv_rank_min_days_is_counted_in_sessions_not_readings() -> None:
+    store = _store()
+    await _fill_sessions(store, "SPY", [0.20 + index * 0.001 for index in range(5)])
+
+    # Five sessions is far short of the default floor.
+    assert await store.iv_rank_for("SPY") is None
+    # Asked over a window it does satisfy, the same data ranks.
+    assert await store.iv_rank_for("SPY", days=252, min_days=5) == 100.0
+
+
+async def test_a_reading_with_no_iv_is_not_an_observation() -> None:
+    """An IV that would not solve must not enter the window: as a null it would
+    be dropped by the rank anyway, but as a *session* it would count toward the
+    minimum and pass the gate on data that is not there."""
+    store = _store()
+    await store.append_iv_snapshot(
+        "SPY",
+        iv_atm=None,  # type: ignore[arg-type]
+        ts=_session_close(date(2026, 1, 5)),
+    )
+
+    assert await store.daily_iv_history("SPY") == []
+    assert await store.iv_rank_and_percentile("SPY") == (None, None, 0)
+
+
+async def test_iv_sessions_report_which_days_are_already_covered() -> None:
+    """What the backfill reads to stay incremental."""
+    store = _store()
+    await _fill_sessions(store, "SPY", [0.20, 0.21, 0.22])
+
+    assert await store.iv_session_days("SPY") == {
+        date(2026, 1, 5),
+        date(2026, 1, 6),
+        date(2026, 1, 7),
+    }
+
+
+async def test_backfilled_readings_land_on_their_own_sessions() -> None:
+    store = _store()
+    written = await store.append_iv_snapshots(
+        "spy",
+        [
+            {"ts": _session_close(date(2026, 1, 5)), "iv_atm": 0.30, "dte": 30, "spot": 100.0},
+            {"ts": _session_close(date(2026, 1, 6)), "iv_atm": 0.20, "dte": 29, "spot": 101.0},
+        ],
+    )
+
+    assert written == 2
+    rows = await store.daily_iv_history("SPY")
+    assert [row["iv_atm"] for row in rows] == [0.20, 0.30]  # newest session first
+    assert await store.iv_rank_for("SPY", min_days=2) == 0.0  # latest is the window low
 
 
 async def test_recent_lessons_is_empty_until_phase_four() -> None:

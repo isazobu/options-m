@@ -93,7 +93,13 @@ templates:
     2. **Volatility regime confirmation.** Does `iv_rank` / `iv_percentile` agree
        with the IV/RV `ratio`? Both rich (ratio ≥ 1.10 and rank ≥ ~50) or both cheap
        is a confirmed regime. Disagreement — e.g. ratio says cheap but rank is high,
-       or vice versa — is a mixed signal and caps conviction.
+       or vice versa — is a mixed signal and caps conviction. Both are measured
+       over one observation per session across `iv_history_sessions` sessions; a
+       full trading year is 252. Below ~200 the window is short of a year and the
+       extremes it ranks against may simply not have happened yet, so treat the
+       agreement test as weaker evidence. Sessions reconstructed from historical
+       option bars are priced off each session's last trade rather than the mid,
+       which makes the window's edges slightly noisier than its centre.
     3. **Term structure and skew.** `term_structure` = `iv_atm_far - iv_atm_near`:
        negative (backwardation) points to near-dated event risk or stress and is a
        warning for any short-premium setup. `put_call_skew` = `iv_put - iv_call`:
