@@ -121,6 +121,10 @@ services:
         value: "0.40"
       - key: STRATEGIST_INTERVAL_SECONDS
         value: "180"
+      - key: LLM_TIMEOUT_SECONDS
+        value: "90"
+      - key: LLM_MAX_TOKENS
+        value: "4096"
       - key: ALLOW_BOUGHT_PREMIUM
         value: "false"
 

@@ -269,8 +269,11 @@ class Settings(BaseSettings):
     featherless_model_deep: str = ""
     chat_max_tool_calls: int = Field(default=4, ge=0)
     chat_timeout_seconds: float = Field(default=30.0, gt=0)
-    llm_timeout_seconds: float = Field(default=30.0, gt=0)
-    llm_max_tokens: int = Field(default=1024, gt=0)
+    # DeepSeek V4 Flash thinking can sit on the socket for >30s and then
+    # return empty content. 90s covers one slow attempt; complete_json also
+    # turns thinking off so the JSON answer is not eaten by CoT.
+    llm_timeout_seconds: float = Field(default=90.0, gt=0)
+    llm_max_tokens: int = Field(default=4096, gt=0)
     # Soft daily token ceiling — only halts StrategistAgent, never
     # PositionManagerAgent (exits must always work).
     llm_daily_token_budget: int = Field(default=100_000, gt=0)

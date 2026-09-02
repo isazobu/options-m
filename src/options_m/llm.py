@@ -5,9 +5,10 @@ Supports two call patterns:
 - :meth:`FeatherlessLlm.chat_completion` — free-form chat with optional tool
   definitions. Used by the dashboard chat.
 - :meth:`FeatherlessLlm.complete_json` — structured output with Pydantic
-  validation and one repair retry. Used by StrategistAgent and ReflectionAgent.
-  Raises :exc:`LlmContractError` on two consecutive failures; never silently
-  falls back to free text for a trade decision.
+  validation and one repair retry. Thinking is turned off so a reasoning
+  model cannot spend the token budget on CoT and return empty content.
+  Used by StrategistAgent. Raises :exc:`LlmContractError` on two consecutive
+  failures; never silently falls back to free text for a trade decision.
 """
 
 from __future__ import annotations
@@ -31,6 +32,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _CONTRACT_PROMPT = prompt_loader.load("llm_contract")
+
+# Structured output is a three-field JSON object. Thinking models (DeepSeek V4
+# Flash in particular) spend the whole max_tokens budget on CoT and return
+# empty content — production recorded that as llm_failed after ~44s.
+_STRUCTURED_OUTPUT_EXTRAS: dict[str, Any] = {
+    "chat_template_kwargs": {
+        "enable_thinking": False,
+        "thinking": False,
+    },
+}
+_THINK_TAG = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -58,6 +70,9 @@ class ToolCall:
 class LlmResult:
     content: str | None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    reasoning_content: str | None = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 class FeatherlessLlm:
@@ -79,6 +94,9 @@ class FeatherlessLlm:
         self._daily_token_budget = daily_token_budget
         self._budget_date: date | None = None
         self._tokens_used_today: int = 0
+        self.last_prompt_tokens: int = 0
+        self.last_completion_tokens: int = 0
+        self.last_error: str | None = None
 
     @property
     def is_enabled(self) -> bool:
@@ -108,6 +126,7 @@ class FeatherlessLlm:
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 800,
         temperature: float = 0.2,
+        extra_body: dict[str, Any] | None = None,
     ) -> LlmResult:
         if not self.is_enabled:
             msg = "Featherless is not configured (missing api key or model)"
@@ -122,6 +141,8 @@ class FeatherlessLlm:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        if extra_body:
+            payload.update(extra_body)
 
         headers = {"Authorization": f"Bearer {self._api_key}"}
         try:
@@ -132,6 +153,7 @@ class FeatherlessLlm:
             response.raise_for_status()
         except httpx.HTTPError as exc:
             msg = f"featherless request failed: {exc}"
+            self.last_error = msg
             raise LlmError(msg) from exc
 
         try:
@@ -139,9 +161,27 @@ class FeatherlessLlm:
             choice = body["choices"][0]["message"]
         except (KeyError, IndexError, ValueError, TypeError) as exc:
             msg = "featherless returned an unreadable response"
+            self.last_error = msg
             raise LlmError(msg) from exc
 
-        return LlmResult(content=choice.get("content"), tool_calls=_parse_tool_calls(choice))
+        usage = body.get("usage") if isinstance(body, dict) else None
+        prompt_tokens = 0
+        completion_tokens = 0
+        if isinstance(usage, dict):
+            prompt_tokens = int(usage.get("prompt_tokens") or 0)
+            completion_tokens = int(usage.get("completion_tokens") or 0)
+            self._charge_tokens(prompt_tokens, completion_tokens)
+        self.last_prompt_tokens = prompt_tokens
+        self.last_completion_tokens = completion_tokens
+        self.last_error = None
+
+        return LlmResult(
+            content=_coerce_text(choice.get("content")),
+            tool_calls=_parse_tool_calls(choice),
+            reasoning_content=_coerce_text(choice.get("reasoning_content")) or None,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
 
 
     async def complete_json(
@@ -185,13 +225,16 @@ class FeatherlessLlm:
             t0 = time.monotonic()
             try:
                 result = await self.chat_completion(
-                    messages, max_tokens=max_tokens, temperature=temperature
+                    messages,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    extra_body=_STRUCTURED_OUTPUT_EXTRAS,
                 )
             except LlmError as exc:
                 last_error = exc
                 continue
 
-            raw_text = result.content or ""
+            raw_text = _visible_text(result)
             json_str = _extract_json(raw_text)
             if json_str is None:
                 last_error = ValueError("no JSON object found in response")
@@ -200,19 +243,46 @@ class FeatherlessLlm:
             try:
                 data = json.loads(json_str)
                 instance = schema.model_validate(data)
-                # Charge tokens on success (best-effort from usage if available).
                 latency_ms = int((time.monotonic() - t0) * 1000)
                 logger.debug(
                     "llm.complete_json succeeded",
                     extra={"schema": schema.__name__, "attempt": attempt, "latency_ms": latency_ms},
                 )
+                self.last_error = None
                 return instance
             except (json.JSONDecodeError, ValidationError) as exc:
                 last_error = exc
 
-        raise LlmContractError(
-            f"LLM failed to produce valid {schema.__name__} after 2 attempts: {last_error}"
-        ) from last_error
+        message = f"LLM failed to produce valid {schema.__name__} after 2 attempts: {last_error}"
+        self.last_error = message
+        raise LlmContractError(message) from last_error
+
+
+def _coerce_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return ""
+
+
+def _strip_think_tags(text: str) -> str:
+    return _THINK_TAG.sub("", text).strip()
+
+
+def _visible_text(result: LlmResult) -> str:
+    text = _strip_think_tags(result.content or "")
+    if text:
+        return text
+    return _strip_think_tags(result.reasoning_content or "")
 
 
 def _extract_json(text: str) -> str | None:

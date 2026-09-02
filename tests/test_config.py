@@ -131,6 +131,8 @@ def test_render_blueprint_contains_the_complete_two_session_campaign_envelope() 
         "MAX_PROPOSALS_PER_DAY": "80",
         "CONVICTION_FLOOR": "0.40",
         "STRATEGIST_INTERVAL_SECONDS": "180",
+        "LLM_TIMEOUT_SECONDS": "90",
+        "LLM_MAX_TOKENS": "4096",
         "ALLOW_BOUGHT_PREMIUM": "false",
         "EXIT_CREDIT_PROFIT_TARGET_PCT": "0.35",
         "EXIT_CREDIT_STOP_LOSS_PCT": "0.75",
