@@ -119,3 +119,80 @@ def test_installing_the_filter_twice_does_not_stack_it() -> None:
         f for f in logger.filters if isinstance(f, logging_config._RepeatedParseErrorFilter)
     ]
     assert len(installed) == 1
+
+
+# ---------------------------------------------------------------------------
+# Bot-token redaction
+#
+# Telegram puts the bot token in the URL path, and httpx logs whole URLs at
+# INFO, so every notification used to print the token into the log stream.
+# ---------------------------------------------------------------------------
+
+_FAKE_BOT = "123456789:FAKE-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_TELEGRAM_URL = f"https://api.telegram.org/bot{_FAKE_BOT}/sendMessage"
+
+
+def test_httpx_request_line_does_not_print_the_bot_token(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The exact leak seen in production: one INFO line per notification."""
+    setup_logging("INFO", fmt="json")
+    logging.getLogger("httpx").info('HTTP Request: POST %s "HTTP/1.1 200 OK"', _TELEGRAM_URL)
+
+    out = capsys.readouterr().out
+    assert _FAKE_BOT not in out
+    assert "api.telegram.org/bot<redacted>/sendMessage" in out
+
+
+def test_text_format_redacts_the_token_too(capsys: pytest.CaptureFixture[str]) -> None:
+    """LOG_FORMAT=text must not be a way around the redaction."""
+    setup_logging("INFO", fmt="text")
+    logging.getLogger("httpx").info("HTTP Request: POST %s", _TELEGRAM_URL)
+
+    out = capsys.readouterr().out
+    assert _FAKE_BOT not in out
+    assert "bot<redacted>" in out
+
+
+def test_a_traceback_carrying_the_url_is_redacted(capsys: pytest.CaptureFixture[str]) -> None:
+    """httpx errors quote the request URL, and notify logs the exception text."""
+    setup_logging("ERROR", fmt="json")
+    try:
+        raise RuntimeError(f"connect error for url '{_TELEGRAM_URL}'")
+    except RuntimeError:
+        logging.getLogger("options_m.notify").exception("telegram send failed")
+
+    record = json.loads(capsys.readouterr().out.strip())
+    assert _FAKE_BOT not in json.dumps(record)
+    assert "bot<redacted>" in record["exception"]
+
+
+def test_extra_fields_are_redacted(capsys: pytest.CaptureFixture[str]) -> None:
+    """notify.py passes the exception through extra={"error": ...}."""
+    setup_logging("WARNING", fmt="json")
+    logging.getLogger("options_m.notify").warning(
+        "telegram send failed", extra={"error": f"ConnectError: {_TELEGRAM_URL}"}
+    )
+
+    out = capsys.readouterr().out
+    assert _FAKE_BOT not in out
+    assert "bot<redacted>" in out
+
+
+def test_unrelated_urls_are_left_alone(capsys: pytest.CaptureFixture[str]) -> None:
+    """Redaction must not blind the useful half of the httpx request log."""
+    setup_logging("INFO", fmt="json")
+    logging.getLogger("httpx").info(
+        'HTTP Request: POST https://api.featherless.ai/v1/chat/completions "HTTP/1.1 200 OK"'
+    )
+
+    record = json.loads(capsys.readouterr().out.strip())
+    assert record["message"] == (
+        'HTTP Request: POST https://api.featherless.ai/v1/chat/completions "HTTP/1.1 200 OK"'
+    )
+
+
+def test_redact_secrets_is_a_no_op_for_ordinary_text() -> None:
+    assert logging_config.redact_secrets("position pulse open_legs=8") == (
+        "position pulse open_legs=8"
+    )
