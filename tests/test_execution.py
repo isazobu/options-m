@@ -45,6 +45,9 @@ class _SnapshotMcp:
     async def get_all_positions(self) -> list[dict[str, Any]]:
         return list(self._positions)
 
+    async def get_option_snapshot(self, symbols: Any) -> dict[str, dict[str, Any]]:
+        return {}
+
 
 async def _snapshot(store: Store, mcp: Any, underlying: str = "SPY", **kwargs: Any) -> Any:
     return await build_portfolio_snapshot(

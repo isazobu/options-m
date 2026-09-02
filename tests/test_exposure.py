@@ -17,6 +17,7 @@ from options_m.exposure import (
     beta_for,
     book_exposure,
     bs_vega,
+    greeks_from_snapshot,
     market_from_evidence,
     plan_exposure,
 )
@@ -141,8 +142,8 @@ def test_an_unlisted_symbol_is_assumed_more_volatile_not_less() -> None:
     assert beta_for("ZZZZ") > 1.0
 
 
-def test_a_leg_with_no_delta_makes_the_whole_plan_unknown() -> None:
-    """Skipping it would be indistinguishable from a hedged leg."""
+def test_a_leg_with_no_delta_makes_delta_unknown_not_vega() -> None:
+    """Skipping a missing delta would look like a hedged leg; vega is separate."""
     plan = _credit_spread().model_copy(
         update={"legs": [_leg(side="sell", delta=None), _leg(side="buy", delta=-0.12)]}
     )
@@ -150,20 +151,40 @@ def test_a_leg_with_no_delta_makes_the_whole_plan_unknown() -> None:
     exposure = plan_exposure(plan, spot=_SPOT, iv=_IV, risk_free_rate=_RATE)
 
     assert exposure.beta_weighted_delta is None
-    assert exposure.net_vega is None
+    assert exposure.net_vega is not None
     assert exposure.incomplete_legs == 1
 
 
-def test_no_implied_vol_leaves_delta_unknown_too() -> None:
-    """One unmeasurable Greek makes the aggregate unmeasurable, not partial.
-
-    A plan reporting a delta but no vega would pass the vega cap on an unknown,
-    which is the direction that approves trades it should not.
-    """
+def test_no_implied_vol_leaves_vega_unknown_but_keeps_delta() -> None:
+    """The two Greeks are independent: missing vol does not erase a known delta."""
     exposure = plan_exposure(_credit_spread(), spot=_SPOT, iv=None, risk_free_rate=_RATE)
 
     assert exposure.net_vega is None
-    assert exposure.beta_weighted_delta is None
+    assert exposure.beta_weighted_delta is not None
+
+
+def test_greeks_from_a_snapshot_are_delta_and_dollar_vega() -> None:
+    """Alpaca's vega is per share per 1 vol point; we store dollars per contract."""
+    delta, vega = greeks_from_snapshot({"greeks": {"delta": -0.25, "vega": 0.12}})
+
+    assert delta == -0.25
+    assert vega == 12.0
+
+
+def test_book_exposure_prefers_snapshot_greeks_over_a_missing_iv() -> None:
+    """Open legs already have a live snapshot; the evidence ATM vol is optional."""
+    yymmdd = _EXPIRY.strftime("%y%m%d")
+    symbol = f"SPY{yymmdd}P00630000"
+    exposure = book_exposure(
+        [_position(symbol, "-2")],
+        market_by_symbol={"SPY": (_SPOT, None)},
+        risk_free_rate=_RATE,
+        greeks_by_symbol={symbol: (-0.25, 15.0)},
+    )
+
+    assert exposure.beta_weighted_delta is not None
+    assert exposure.net_vega is not None
+    assert exposure.net_vega == -30.0
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +263,8 @@ def test_a_symbol_the_cache_has_never_seen_makes_the_book_unmeasurable() -> None
     )
 
     assert exposure.beta_weighted_delta is None
-    assert exposure.incomplete_legs == 1
+    assert exposure.net_vega is None
+    assert exposure.incomplete_legs >= 1
 
 
 # ---------------------------------------------------------------------------

@@ -74,6 +74,23 @@ def beta_for(symbol: str) -> float:
     return _BETA.get(symbol.strip().upper(), _DEFAULT_BETA)
 
 
+def greeks_from_snapshot(snapshot: dict[str, Any]) -> tuple[float | None, float | None]:
+    """``(delta, dollar_vega_per_contract)`` from an Alpaca option snapshot.
+
+    Alpaca's ``greeks.vega`` is per share per one point of IV. The rest of
+    this module stores dollars per contract per point, so the raw figure is
+    multiplied by the contract size. Either field can be absent independently
+    — the OPRA feed often has delta and drops vega on a short-dated weekly.
+    """
+    greeks = snapshot.get("greeks")
+    if not isinstance(greeks, dict):
+        return None, None
+    delta = finite_float(greeks.get("delta"))
+    raw_vega = finite_float(greeks.get("vega"))
+    vega = None if raw_vega is None else raw_vega * _CONTRACT_MULTIPLIER
+    return delta, vega
+
+
 def bs_vega(
     *,
     spot: float,
@@ -159,15 +176,18 @@ def plan_exposure(
     beta = beta_for(plan.underlying)
     dollar_delta = 0.0
     vega = 0.0
+    missing_delta = False
+    missing_vega = False
     incomplete = 0
 
     for leg in plan.legs:
         sign = 1.0 if leg.side == "buy" else -1.0
         contracts = sign * leg.ratio * plan.qty
         if leg.delta is None:
+            missing_delta = True
             incomplete += 1
-            continue
-        dollar_delta += leg.delta * contracts * _CONTRACT_MULTIPLIER * spot * beta
+        else:
+            dollar_delta += leg.delta * contracts * _CONTRACT_MULTIPLIER * spot * beta
         leg_vega = bs_vega(
             spot=spot,
             strike=leg.strike,
@@ -176,13 +196,16 @@ def plan_exposure(
             risk_free_rate=risk_free_rate,
         )
         if leg_vega is None:
+            missing_vega = True
             incomplete += 1
-            continue
-        vega += leg_vega * contracts
+        else:
+            vega += leg_vega * contracts
 
-    if incomplete:
-        return Exposure.unknown(incomplete)
-    return Exposure(beta_weighted_delta=dollar_delta, net_vega=vega, incomplete_legs=0)
+    return Exposure(
+        beta_weighted_delta=None if missing_delta else dollar_delta,
+        net_vega=None if missing_vega else vega,
+        incomplete_legs=incomplete,
+    )
 
 
 def book_exposure(
@@ -191,62 +214,84 @@ def book_exposure(
     market_by_symbol: Mapping[str, tuple[float, float | None]],
     risk_free_rate: float,
     today: date | None = None,
+    greeks_by_symbol: Mapping[str, tuple[float | None, float | None]] | None = None,
 ) -> Exposure:
     """Exposure of the open option book, from the broker's position list.
 
-    ``market_by_symbol`` maps an underlying to ``(spot, iv_atm)``, normally read
-    from the evidence cache — MarketPulseAgent refreshes it every 60 s for every
-    symbol in the universe. Broker positions carry no greeks at all, so strike,
-    expiry and type are parsed back out of each OCC symbol and the greeks are
-    recomputed; the position's own signed quantity carries long/short.
+    ``greeks_by_symbol`` is the live Alpaca option snapshot (delta, dollar
+    vega per contract), keyed by OCC symbol. That is the primary source —
+    ``get_option_snapshot`` already returns both greeks. Black-Scholes from
+    the evidence pack's ATM vol is only a fallback for a missing field.
 
-    An underlying with no market data, or a leg whose OCC symbol will not parse,
-    makes the aggregate unknown. That is the safe direction: a book that cannot
-    be measured must not read as an empty one.
+    Each Greek is independent: a missing vega does not erase a known delta.
+    A field that is still missing after both sources stays ``None``; the
+    risk gate skips that cap rather than rejecting the order.
     """
     reference = today or date.today()
     dollar_delta = 0.0
     vega = 0.0
+    missing_delta = False
+    missing_vega = False
     incomplete = 0
+    snapshots = greeks_by_symbol or {}
 
     for position in positions:
         if position.get("asset_class") != "us_option":
             continue
-        parsed = parse_occ_symbol(str(position.get("symbol") or ""))
+        occ = str(position.get("symbol") or "")
+        parsed = parse_occ_symbol(occ)
         quantity = finite_float(position.get("qty"))
         if parsed is None or quantity is None:
+            missing_delta = True
+            missing_vega = True
             incomplete += 1
             continue
 
+        snap_delta, snap_vega = snapshots.get(occ, (None, None))
         market = market_by_symbol.get(parsed.underlying.upper())
-        if market is None:
-            incomplete += 1
-            continue
-        spot, iv = market
-
+        spot = market[0] if market is not None else None
+        iv = market[1] if market is not None else None
         dte = (parsed.expiry - reference).days
-        delta = _bs_delta(
-            spot=spot,
-            strike=parsed.strike,
-            dte_days=dte,
-            iv=iv,
-            option_type=parsed.option_type,
-            risk_free_rate=risk_free_rate,
-        )
-        leg_vega = bs_vega(
-            spot=spot, strike=parsed.strike, dte_days=dte, iv=iv, risk_free_rate=risk_free_rate
-        )
-        if delta is None or leg_vega is None:
+
+        delta = snap_delta
+        if delta is None and spot is not None:
+            delta = _bs_delta(
+                spot=spot,
+                strike=parsed.strike,
+                dte_days=dte,
+                iv=iv,
+                option_type=parsed.option_type,
+                risk_free_rate=risk_free_rate,
+            )
+        leg_vega = snap_vega
+        if leg_vega is None and spot is not None:
+            leg_vega = bs_vega(
+                spot=spot,
+                strike=parsed.strike,
+                dte_days=dte,
+                iv=iv,
+                risk_free_rate=risk_free_rate,
+            )
+
+        if delta is None or spot is None:
+            missing_delta = True
             incomplete += 1
-            continue
+        else:
+            dollar_delta += delta * quantity * _CONTRACT_MULTIPLIER * spot * beta_for(
+                parsed.underlying
+            )
 
-        beta = beta_for(parsed.underlying)
-        dollar_delta += delta * quantity * _CONTRACT_MULTIPLIER * spot * beta
-        vega += leg_vega * quantity
+        if leg_vega is None:
+            missing_vega = True
+            incomplete += 1
+        else:
+            vega += leg_vega * quantity
 
-    if incomplete:
-        return Exposure.unknown(incomplete)
-    return Exposure(beta_weighted_delta=dollar_delta, net_vega=vega, incomplete_legs=0)
+    return Exposure(
+        beta_weighted_delta=None if missing_delta else dollar_delta,
+        net_vega=None if missing_vega else vega,
+        incomplete_legs=incomplete,
+    )
 
 
 def _bs_delta(

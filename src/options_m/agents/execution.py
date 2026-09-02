@@ -265,6 +265,30 @@ def _group_into_structures(option_positions: list[dict[str, Any]]) -> set[tuple[
     return structures
 
 
+async def _book_greeks_from_snapshots(
+    mcp: AlpacaMcp, option_positions: list[dict[str, Any]]
+) -> dict[str, tuple[float | None, float | None]]:
+    """Live delta/vega for each open OCC symbol, or empty if the feed is down.
+
+    Same call the dashboard already makes. A failure here must not raise: the
+    risk gate skips an unknown Greek instead of treating a snapshot blip as a
+    hard reject.
+    """
+    symbols = [
+        str(row["symbol"])
+        for row in option_positions
+        if row.get("asset_class") == "us_option" and row.get("symbol")
+    ]
+    if not symbols:
+        return {}
+    try:
+        snapshots = await mcp.get_option_snapshot(symbols)
+    except Exception:
+        logger.warning("option snapshot for book greeks failed", exc_info=True)
+        return {}
+    return {occ: exposure.greeks_from_snapshot(snap) for occ, snap in snapshots.items()}
+
+
 async def _projected_exposure(
     option_positions: list[dict[str, Any]],
     plan: OrderPlan | None,
@@ -272,14 +296,14 @@ async def _projected_exposure(
     spot: float | None,
     store: Store,
     settings: Settings,
+    mcp: AlpacaMcp,
 ) -> exposure.Exposure:
     """The open book's exposure plus the plan's, in one figure per Greek.
 
-    Broker positions carry no greeks, so each leg's are recomputed from its OCC
-    symbol against the spot and ATM vol MarketPulseAgent cached for that
-    underlying — one local read per underlying in the book, never a broker call.
-    A symbol the cache has never seen makes the aggregate unknown, which the
-    risk gate treats as "cannot approve" rather than as an unexposed book.
+    Live greeks come from ``get_option_snapshot`` (the same MCP tool the
+    dashboard uses). Evidence-pack ATM vol is only a Black-Scholes fallback.
+    A field that is still missing after both stays unknown and the matching
+    risk cap is skipped, not used as a rejection.
     """
     market: dict[str, tuple[float, float | None]] = {}
     for root in {root for root, _expiry in _group_into_structures(option_positions)}:
@@ -289,7 +313,10 @@ async def _projected_exposure(
             market[root] = found
 
     book = exposure.book_exposure(
-        option_positions, market_by_symbol=market, risk_free_rate=settings.risk_free_rate
+        option_positions,
+        market_by_symbol=market,
+        risk_free_rate=settings.risk_free_rate,
+        greeks_by_symbol=await _book_greeks_from_snapshots(mcp, option_positions),
     )
     if plan is None:
         return book
@@ -358,7 +385,7 @@ async def build_portfolio_snapshot(
     target = underlying.upper()
     options_buying_power, _source = sizing.resolve_options_buying_power(account)
     projected = await _projected_exposure(
-        option_positions, plan, spot=spot, store=store, settings=settings
+        option_positions, plan, spot=spot, store=store, settings=settings, mcp=mcp
     )
     return PortfolioSnapshot(
         equity=finite_float(account.get("equity")),

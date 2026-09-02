@@ -504,7 +504,18 @@ async def build(
         )
         if rejection is not None:
             return rejection
-        legs.append(_leg_from_contract(secondary, side="sell", delta=None, delta_source=None))
+        secondary_effective = _effective_delta(
+            secondary, spot=spot, risk_free_rate=settings.risk_free_rate
+        )
+        if secondary_effective is not None:
+            secondary_delta, secondary_source = secondary_effective
+        else:
+            secondary_delta, secondary_source = None, None
+        legs.append(
+            _leg_from_contract(
+                secondary, side="sell", delta=secondary_delta, delta_source=secondary_source
+            )
+        )
 
     entry_price, rejection = _price(intent, settings, primary, secondary, proposal_id)
     if rejection is not None:
@@ -673,6 +684,8 @@ class _CreditVertical:
     short_delta: float | None
     short_delta_source: Literal["chain", "black_scholes"] | None
     long: NormalizedContract
+    long_delta: float | None
+    long_delta_source: Literal["chain", "black_scholes"] | None
     score: float
 
     @property
@@ -693,7 +706,12 @@ class _CreditVertical:
                 delta=self.short_delta,
                 delta_source=self.short_delta_source,
             ),
-            _leg_from_contract(self.long, side="buy", delta=None, delta_source=None),
+            _leg_from_contract(
+                self.long,
+                side="buy",
+                delta=self.long_delta,
+                delta_source=self.long_delta_source,
+            ),
         ]
 
     def contracts(self) -> tuple[NormalizedContract, NormalizedContract]:
@@ -842,11 +860,21 @@ def _credit_vertical(
     wing = _nearest_listed_strike(wing_side, target, increment=increment)
     if wing is None:
         return None
+    # The wing's delta is not used to pick the strike, but plan_exposure
+    # refuses the whole structure if any leg is missing one. Compute it the
+    # same way as the short so a credit plan is measurable.
+    long_effective = _effective_delta(wing, spot=spot, risk_free_rate=settings.risk_free_rate)
+    if long_effective is not None:
+        long_delta, long_delta_source = long_effective
+    else:
+        long_delta, long_delta_source = None, None
     return _CreditVertical(
         short=short,
         short_delta=short_delta,
         short_delta_source=short_delta_source,
         long=wing,
+        long_delta=long_delta,
+        long_delta_source=long_delta_source,
         score=score,
     )
 

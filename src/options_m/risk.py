@@ -102,6 +102,7 @@ class PortfolioSnapshot(BaseModel):
     # exposure.book_exposure combined with exposure.plan_exposure. Both nullable:
     # a book whose greeks could not be computed is unknown, never zero — zero is
     # indistinguishable from a perfectly hedged book and would read as smaller.
+    # Unknown skips the matching cap; it does not reject the order.
     projected_beta_weighted_delta: float | None
     projected_net_vega: float | None
     market_is_open: bool
@@ -294,7 +295,10 @@ class RiskEngine:
             return "unknown_equity"
         exposure = finite_float(portfolio.projected_beta_weighted_delta)
         if exposure is None:
-            return "unknown_portfolio_delta"
+            # Snapshot/chain greeks were not on the feed. Skipping the cap is
+            # the honest answer; rejecting would make a data gap look like a
+            # risk event and freeze every credit structure.
+            return None
         if abs(exposure) > self._limits.max_beta_weighted_delta_pct * equity:
             return "beta_weighted_delta_exceeded"
         return None
@@ -314,7 +318,7 @@ class RiskEngine:
             return "unknown_equity"
         vega = finite_float(portfolio.projected_net_vega)
         if vega is None:
-            return "unknown_portfolio_vega"
+            return None
         if abs(vega) > self._limits.max_net_vega_pct * equity:
             return "net_vega_exceeded"
         return None

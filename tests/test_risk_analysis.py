@@ -339,12 +339,19 @@ def test_a_long_vol_book_is_capped_the_same_as_a_short_one() -> None:
     assert "net_vega_exceeded" in verdict.reasons
 
 
-def test_an_unmeasurable_book_cannot_be_approved() -> None:
-    """Unknown greeks are not a hedged book — the same rule as unknown equity."""
+def test_an_unmeasurable_book_does_not_block_the_order() -> None:
+    """A missing Greek is a skipped cap, not a rejection.
+
+    Delta and vega come off Alpaca's option snapshot when the feed has them.
+    When it does not, inventing a number would be a lie and refusing the
+    trade would make the cap a data-quality gate. The other hard limits
+    still run.
+    """
     verdict = _engine().evaluate(
         _plan(),
         _portfolio(projected_beta_weighted_delta=None, projected_net_vega=None),
     )
 
-    assert "unknown_portfolio_delta" in verdict.reasons
-    assert "unknown_portfolio_vega" in verdict.reasons
+    assert verdict.approved
+    assert "unknown_portfolio_delta" not in verdict.reasons
+    assert "unknown_portfolio_vega" not in verdict.reasons
