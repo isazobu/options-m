@@ -75,6 +75,75 @@ services:
       - key: KILL_SWITCH
         value: "false"
 
+      # Two-session campaign risk envelope. Keep these values in the Blueprint:
+      # applying it overwrites dashboard-side environment overrides.
+      - key: BASE_RISK_PCT_PER_TRADE
+        value: "0.04"
+      - key: MAX_PREMIUM_PCT_PER_TRADE
+        value: "0.05"
+      - key: MAX_BETA_WEIGHTED_DELTA_PCT
+        value: "3.0"
+      - key: MAX_NET_VEGA_PCT
+        value: "0.03"
+      - key: MAX_TOTAL_PREMIUM_PCT
+        value: "0.40"
+      - key: MAX_CONCURRENT_POSITIONS
+        value: "8"
+      - key: MAX_POSITIONS_PER_UNDERLYING
+        value: "2"
+      - key: DAILY_LOSS_HALT_PCT
+        value: "0.05"
+      - key: DRAWDOWN_HALT_PCT
+        value: "0.10"
+      - key: MAX_SPREAD_ABS
+        value: "0.05"
+
+      - key: CAMPAIGN_START_DATE
+        value: "2026-09-02"
+      - key: CAMPAIGN_DAYS
+        value: "2"
+      - key: CAMPAIGN_MIN_SESSIONS_TO_HOLD
+        value: "0"
+      - key: CAMPAIGN_FRONT_LOAD_MULT
+        value: "1.25"
+      - key: CAMPAIGN_FLATTEN_MINUTES_BEFORE_CLOSE
+        value: "20"
+
+      - key: CONVICTION_RELIABILITY_PRIOR
+        value: "0.8"
+      - key: PROPOSAL_COOLDOWN_SECONDS
+        value: "900"
+      - key: MAX_PROPOSALS_PER_SYMBOL_PER_DAY
+        value: "6"
+      - key: STRATEGIST_INTERVAL_SECONDS
+        value: "180"
+      - key: ALLOW_BOUGHT_PREMIUM
+        value: "false"
+
+      - key: EXIT_CREDIT_PROFIT_TARGET_PCT
+        value: "0.35"
+      - key: EXIT_CREDIT_STOP_LOSS_PCT
+        value: "0.75"
+      - key: EXIT_TIME_STOP_DAYS
+        value: "2"
+      - key: CLOSE_REPRICE_SECONDS
+        value: "30"
+      - key: CLOSE_REPRICE_MAX_ATTEMPTS
+        value: "3"
+
+      - key: DTE_TARGET_MIN
+        value: "1"
+      - key: DTE_TARGET_MAX
+        value: "2"
+      - key: RISK_DTE_MIN
+        value: "1"
+      - key: EXIT_DTE_HARD_FLOOR
+        value: "0"
+      - key: EXIT_DTE_SHORT_PREMIUM
+        value: "0"
+      - key: SPREAD_WIDTH_EXPECTED_MOVE_MULT
+        value: "1.0"
+
       # The dashboard (a separate Next.js app on Vercel) calls the guarded
       # /api/* routes with this bearer token and from this origin.
       #

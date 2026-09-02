@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import yaml
+
 from options_m.config import Settings
 
 # Mirrored from ../alpaca-mcp-server/src/alpaca_mcp_server/toolsets.py, which
@@ -99,3 +101,50 @@ def test_a_credit_stop_may_exceed_one_hundred_percent() -> None:
     assert settings.exit_credit_stop_loss_pct == 2.0
     assert settings.exit_long_profit_target_pct == 3.0
     assert settings.exit_debit_profit_target_pct == 1.5
+
+
+def test_render_blueprint_contains_the_complete_two_session_campaign_envelope() -> None:
+    blueprint = Path(__file__).resolve().parent.parent / "render.yaml"
+    document = yaml.safe_load(blueprint.read_text())
+    env = {
+        item["key"]: str(item["value"]).lower()
+        for item in document["services"][0]["envVars"]
+        if "value" in item
+    }
+    expected = {
+        "DRY_RUN": "false",
+        "BASE_RISK_PCT_PER_TRADE": "0.04",
+        "MAX_PREMIUM_PCT_PER_TRADE": "0.05",
+        "MAX_BETA_WEIGHTED_DELTA_PCT": "3.0",
+        "MAX_NET_VEGA_PCT": "0.03",
+        "MAX_TOTAL_PREMIUM_PCT": "0.40",
+        "MAX_CONCURRENT_POSITIONS": "8",
+        "MAX_POSITIONS_PER_UNDERLYING": "2",
+        "CAMPAIGN_START_DATE": "2026-09-02",
+        "CAMPAIGN_DAYS": "2",
+        "CAMPAIGN_MIN_SESSIONS_TO_HOLD": "0",
+        "CAMPAIGN_FRONT_LOAD_MULT": "1.25",
+        "CAMPAIGN_FLATTEN_MINUTES_BEFORE_CLOSE": "20",
+        "CONVICTION_RELIABILITY_PRIOR": "0.8",
+        "PROPOSAL_COOLDOWN_SECONDS": "900",
+        "MAX_PROPOSALS_PER_SYMBOL_PER_DAY": "6",
+        "STRATEGIST_INTERVAL_SECONDS": "180",
+        "ALLOW_BOUGHT_PREMIUM": "false",
+        "EXIT_CREDIT_PROFIT_TARGET_PCT": "0.35",
+        "EXIT_CREDIT_STOP_LOSS_PCT": "0.75",
+        "EXIT_TIME_STOP_DAYS": "2",
+        "DAILY_LOSS_HALT_PCT": "0.05",
+        "DRAWDOWN_HALT_PCT": "0.10",
+        "MAX_SPREAD_ABS": "0.05",
+        "DTE_TARGET_MIN": "1",
+        "DTE_TARGET_MAX": "2",
+        "RISK_DTE_MIN": "1",
+        "EXIT_DTE_HARD_FLOOR": "0",
+        "EXIT_DTE_SHORT_PREMIUM": "0",
+        "SPREAD_WIDTH_EXPECTED_MOVE_MULT": "1.0",
+        "CLOSE_REPRICE_SECONDS": "30",
+        "CLOSE_REPRICE_MAX_ATTEMPTS": "3",
+    }
+
+    assert {key: env.get(key) for key in expected} == expected
+    assert "REPLAY_LAST_SESSION" not in env

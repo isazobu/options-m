@@ -13,11 +13,11 @@ from typing import Any
 
 from options_m.agents.strategist import (
     StrategistAgent,
-    _close_reason,
-    _exit_thresholds,
 )
 from options_m.config import Settings
 from options_m.db import Database
+from options_m.exits import close_reason as _close_reason
+from options_m.exits import exit_thresholds as _exit_thresholds
 from options_m.store import Store
 
 

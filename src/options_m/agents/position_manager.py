@@ -2,10 +2,9 @@
 
 Runs every minute. Owns the ``positions`` table and nothing else: it fetches
 ``get_all_positions``, groups legs by underlying, marks to market, enriches
-each row with the originating proposal metadata, and persists. Exit decisions
-belong to ``StrategistAgent``, which reads this cache each iteration and writes
-a ``close`` proposal when a threshold is crossed. ``ExecutionAgent`` then acts
-on that proposal exactly as it does for open proposals.
+each row with the originating proposal metadata, persists, and evaluates the
+deterministic exit ladder. ``ExecutionAgent`` then acts on close proposals
+exactly as it does for open proposals.
 
 The derived fields added to each payload -- ``net_value``, ``pnl_pct`` and
 ``min_dte`` -- are the whole input surface of the exit rule, so
@@ -23,7 +22,9 @@ from typing import Any
 
 from options_m.config import Settings
 from options_m.evidence.occ import parse_occ_symbol
+from options_m.exits import evaluate_close_proposals
 from options_m.mcp_client import AlpacaMcp
+from options_m.notify import Notifier, NullNotifier
 from options_m.store import Store
 
 logger = logging.getLogger(__name__)
@@ -34,10 +35,17 @@ _ENRICH_KEYS = ("proposal_id", "entry_price", "opened_at", "strategy")
 class PositionManagerAgent:
     """Sole writer of the local ``positions`` cache."""
 
-    def __init__(self, settings: Settings, mcp: AlpacaMcp, store: Store) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        mcp: AlpacaMcp,
+        store: Store,
+        notifier: Notifier | None = None,
+    ) -> None:
         self._settings = settings
         self._mcp = mcp
         self._store = store
+        self._notifier = notifier or NullNotifier()
 
     @property
     def name(self) -> str:
@@ -124,6 +132,12 @@ class PositionManagerAgent:
         total_market_value = _total_market_value(positions)
 
         await self._store.replace_positions(payload_by_symbol)
+        close_detail = await evaluate_close_proposals(
+            self._store,
+            self._settings,
+            notifier=self._notifier,
+            now=_now_utc(),
+        )
 
         detail: dict[str, Any] = {
             "open_underlyings": len(grouped),
@@ -131,6 +145,7 @@ class PositionManagerAgent:
             "unrealized_pl": round(total_unrealized_pl, 2),
             "market_value": round(total_market_value, 2),
         }
+        detail.update(close_detail)
         logger.info("position pulse", extra=detail)
         return detail
 
