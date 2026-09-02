@@ -15,6 +15,7 @@ import json
 import logging
 import logging.config
 import os
+import re
 import sys
 from datetime import UTC, datetime
 from typing import Any, Final
@@ -79,6 +80,31 @@ class _RepeatedParseErrorFilter(logging.Filter):
         return True
 
 
+# Telegram takes the bot token in the URL path, so the token is part of every
+# request URL -- and httpx logs whole URLs at INFO. That printed the token into
+# the log stream on every notification, where Render keeps it indefinitely and
+# anyone with log access can read it. The token cannot be moved out of the URL,
+# so it is scrubbed on the way out instead.
+#
+# Redaction lives in the formatters rather than in a filter because a filter
+# only sees `record.msg`: httpx errors quote the URL inside the exception text,
+# which is rendered from `exc_info` at format time. Formatting is the one choke
+# point every field passes through -- message, args, extra, and traceback.
+_TELEGRAM_TOKEN_RE: Final[re.Pattern[str]] = re.compile(r"(api\.telegram\.org/bot)[^/\s\"']+")
+_REDACTED: Final[str] = "<redacted>"
+
+
+def redact_secrets(text: str) -> str:
+    """Mask credentials that would otherwise be readable in the log stream.
+
+    Deliberately narrow: it rewrites the token in a Telegram API URL and
+    nothing else. A broad "anything that looks like a secret" pattern would
+    eventually eat a strike price or an order id, and a log line that silently
+    loses real data is its own kind of outage.
+    """
+    return _TELEGRAM_TOKEN_RE.sub(rf"\1{_REDACTED}", text)
+
+
 class JsonFormatter(logging.Formatter):
     """Render log records as single-line JSON for log collectors."""
 
@@ -96,7 +122,19 @@ class JsonFormatter(logging.Formatter):
 
         # Anything passed via `logger.info("...", extra={...})`.
         payload.update({k: v for k, v in record.__dict__.items() if k not in _RESERVED})
-        return json.dumps(payload, default=str, ensure_ascii=False)
+        # Redacting the serialized line covers every field at once. `<redacted>`
+        # carries no JSON metacharacters, so the result stays valid JSON.
+        return redact_secrets(json.dumps(payload, default=str, ensure_ascii=False))
+
+
+class TextFormatter(logging.Formatter):
+    """Human-readable output, redacted like the JSON formatter.
+
+    Exists so that LOG_FORMAT=text is not a way around the scrubbing.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_secrets(super().format(record))
 
 
 def setup_logging(level: str | None = None, *, fmt: str | None = None) -> None:
@@ -115,7 +153,7 @@ def setup_logging(level: str | None = None, *, fmt: str | None = None) -> None:
             "disable_existing_loggers": False,
             "formatters": {
                 "json": {"()": f"{__name__}.JsonFormatter"},
-                "text": {"format": _TEXT_FORMAT},
+                "text": {"()": f"{__name__}.TextFormatter", "format": _TEXT_FORMAT},
             },
             "handlers": {
                 "stdout": {
