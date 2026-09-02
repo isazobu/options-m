@@ -244,6 +244,10 @@ class Settings(BaseSettings):
     # opening a spread that must be flattened hours later pays the bid/ask twice
     # for whatever drift happens in between, which is not a strategy.
     campaign_min_sessions_to_hold: int = Field(default=1, ge=0)
+    # On the campaign's final session, close every open structure this many
+    # minutes before the cached session close. This is a real session-aware
+    # flatten; exit_time_stop_days remains only a calendar-age backstop.
+    campaign_flatten_minutes_before_close: int = Field(default=20, ge=0)
 
     # Dashboard access. A single shared secret, deliberately simpler than a
     # real user-auth system: this guards a judge-facing demo, not a
@@ -423,6 +427,10 @@ class Settings(BaseSettings):
     exit_debit_stop_loss_pct: float = Field(default=0.50, gt=0.0, le=1.0)
     exit_long_profit_target_pct: float = Field(default=1.00, gt=0.0, le=10.0)
     exit_long_stop_loss_pct: float = Field(default=0.50, gt=0.0, le=1.0)
+    # Working close limits are replaced on this cadence, one nudge more
+    # marketable per attempt. Entries are never repriced automatically.
+    close_reprice_seconds: float = Field(default=30.0, gt=0.0)
+    close_reprice_max_attempts: int = Field(default=3, ge=0)
 
     # Telegram notifications (outbound only — no bot listener, no commands).
     # Unset token or chat id means "run without notifications", the same

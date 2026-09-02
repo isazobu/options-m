@@ -21,6 +21,7 @@ is not left blocked by a dead order.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import time
 from datetime import UTC, date, datetime, timedelta
@@ -86,14 +87,35 @@ def _decimal_str(value: float, places: int = 2) -> str:
 
 
 _OCC_RE = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
+_URGENT_CLOSE_REASONS = frozenset(
+    {"stop_loss", "expiry_hard_stop", "dte_stop", "time_stop", "campaign_flatten"}
+)
+
+
+def _close_reason_name(thesis: str) -> str:
+    return thesis.split(":", 1)[0].strip()
+
+
+def _close_limit_price(
+    mark: float,
+    reason: str,
+    *,
+    nudge: float,
+    attempt: int,
+) -> float:
+    """Return a progressively more marketable debit limit for a close."""
+    initial_rung = 1 if reason in _URGENT_CLOSE_REASONS else 0
+    rung = initial_rung + max(0, attempt)
+    return max(0.01, mark * (1.0 + rung * nudge))
 
 
 def _build_closing_legs(option_legs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return legs with sides inverted for a sell_to_close order.
+    """Return legs with sides and position intents set for closing.
 
     Alpaca position sides are ``"long"``/``"short"``; order sides are
     ``"buy"``/``"sell"``. Long → sell to close, short → buy to close.
     """
+    structure_qty = _closing_structure_qty(option_legs)
     result = []
     for leg in option_legs:
         occ = str(leg.get("symbol", "")).upper()
@@ -103,8 +125,28 @@ def _build_closing_legs(option_legs: list[dict[str, Any]]) -> list[dict[str, Any
             qty_int = 1
         entry_side = str(leg.get("side", "long")).lower()
         close_side = "sell" if entry_side == "long" else "buy"
-        result.append({"symbol": occ, "side": close_side, "ratio_qty": str(qty_int)})
+        result.append(
+            {
+                "symbol": occ,
+                "side": close_side,
+                "ratio_qty": str(max(1, qty_int // structure_qty)),
+                "position_intent": (
+                    "sell_to_close" if close_side == "sell" else "buy_to_close"
+                ),
+            }
+        )
     return result
+
+
+def _closing_structure_qty(option_legs: list[dict[str, Any]]) -> int:
+    """Greatest common leg quantity: the parent multiplier for an MLeg close."""
+    quantities: list[int] = []
+    for leg in option_legs:
+        try:
+            quantities.append(max(1, abs(int(float(str(leg.get("qty", "1")))))))
+        except (TypeError, ValueError):
+            quantities.append(1)
+    return math.gcd(*quantities) if quantities else 1
 
 
 def _build_order_request(plan: OrderPlan) -> dict[str, Any]:
@@ -448,13 +490,10 @@ class ExecutionAgent:
             self._settings.kill_switch or await self._store.is_kill_switch_engaged()
         )
         if kill_switch_engaged:
-            await self._store.record_risk_event(
-                proposal_id=None, rule="kill_switch_engaged", detail={}
-            )
             detail["kill_switch"] = True
-            return detail
 
-        for proposal in await self._store.pending_proposals(limit=_PENDING_BATCH_SIZE):
+        pending_limit = 50 if kill_switch_engaged else _PENDING_BATCH_SIZE
+        for proposal in await self._store.pending_proposals(limit=pending_limit):
             await self._process_one(proposal, detail)
             detail["processed"] += 1
 
@@ -475,6 +514,14 @@ class ExecutionAgent:
 
         if intent.action == "close":
             await self._execute_close(proposal_id, intent, detail)
+            return
+
+        if intent.action == "open" and (
+            self._settings.kill_switch or await self._store.is_kill_switch_engaged()
+        ):
+            detail["open_blocked_by_kill_switch"] = (
+                detail.get("open_blocked_by_kill_switch", 0) + 1
+            )
             return
 
         if intent.action != "open":
@@ -623,19 +670,25 @@ class ExecutionAgent:
         net_value = payload.get("net_value")
         raw_value = net_value if net_value is not None else payload.get("market_value")
         mark_value = abs(float(raw_value or 0))
-        try:
-            struct_qty = max(1, abs(int(float(str(option_legs[0].get("qty", "1"))))))
-        except (TypeError, ValueError):
-            struct_qty = 1
+        struct_qty = _closing_structure_qty(option_legs)
         raw_price = mark_value / (struct_qty * 100) if mark_value > 0 else 0.01
-        limit_price = _decimal_str(max(0.01, raw_price))
+        exit_reason = _close_reason_name(intent.thesis)
+        initial_price = _close_limit_price(
+            raw_price,
+            exit_reason,
+            nudge=self._settings.limit_price_spread_nudge_pct,
+            attempt=0,
+        )
+        limit_price = _decimal_str(initial_price)
 
         client_order_id = f"omc-{proposal_id}"
         close_request: dict[str, Any] = {
             "action": "close",
             "underlying": intent.underlying,
             "legs": closing_legs,
-            "exit_reason": intent.thesis,
+            "exit_reason": exit_reason,
+            "mark_price": raw_price,
+            "limit_price": limit_price,
         }
 
         if self._settings.dry_run:
@@ -654,7 +707,7 @@ class ExecutionAgent:
                 "qty": str(struct_qty),
                 "limit_price": limit_price,
                 "client_order_id": client_order_id,
-                "position_intent": "sell_to_close",
+                "position_intent": leg["position_intent"],
                 "symbol": leg["symbol"],
                 "side": leg["side"],
             }
@@ -663,7 +716,6 @@ class ExecutionAgent:
                 "qty": str(struct_qty),
                 "limit_price": limit_price,
                 "client_order_id": client_order_id,
-                "position_intent": "sell_to_close",
                 "legs": closing_legs,
             }
 
@@ -832,11 +884,79 @@ class ExecutionAgent:
         await self._store.update_proposal_status(proposal_id, "submitted")
         detail["submitted"] += 1
 
+    async def _read_active_order(
+        self, order: dict[str, Any], client_order_id: str
+    ) -> dict[str, Any] | None:
+        stored_response = order.get("response")
+        active_order_id = (
+            stored_response.get("_active_order_id")
+            if isinstance(stored_response, dict)
+            else None
+        )
+        if isinstance(active_order_id, str) and active_order_id:
+            return await self._mcp.get_order_by_id(active_order_id)
+        return await self._mcp.get_order_by_client_id(client_order_id)
+
+    async def _maybe_reprice_close(
+        self,
+        order: dict[str, Any],
+        broker_order: dict[str, Any],
+        detail: dict[str, Any],
+    ) -> dict[str, Any]:
+        client_order_id = str(order["client_order_id"])
+        if (
+            not client_order_id.startswith("omc-")
+            or self._settings.close_reprice_max_attempts == 0
+        ):
+            return broker_order
+        request = order.get("request")
+        submitted_at = order.get("submitted_at")
+        if not isinstance(request, dict) or not isinstance(submitted_at, datetime):
+            return broker_order
+        if submitted_at.tzinfo is None:
+            submitted_at = submitted_at.replace(tzinfo=UTC)
+        elapsed = max(0.0, (datetime.now(UTC) - submitted_at).total_seconds())
+        attempt = min(
+            self._settings.close_reprice_max_attempts,
+            int(elapsed // self._settings.close_reprice_seconds),
+        )
+        if attempt <= 0:
+            return broker_order
+
+        mark = finite_float(request.get("mark_price"))
+        reason = str(request.get("exit_reason") or "")
+        order_id = str(broker_order.get("id") or "")
+        if mark is None or mark <= 0 or not order_id:
+            return broker_order
+        target = _close_limit_price(
+            mark,
+            reason,
+            nudge=self._settings.limit_price_spread_nudge_pct,
+            attempt=attempt,
+        )
+        current = finite_float(broker_order.get("limit_price"))
+        if current is not None and current >= target:
+            return broker_order
+
+        replacement = await self._mcp.replace_order_by_id(
+            order_id,
+            limit_price=_decimal_str(target),
+        )
+        if "error" in replacement:
+            logger.warning(
+                "close reprice rejected",
+                extra={"client_order_id": client_order_id, "error": replacement["error"]},
+            )
+            return broker_order
+        replacement["_active_order_id"] = str(replacement.get("id") or order_id)
+        detail["repriced"] = detail.get("repriced", 0) + 1
+        return replacement
+
     async def _reconcile(self, detail: dict[str, Any]) -> None:
         for order in await self._store.orders_in_flight():
             client_order_id = str(order["client_order_id"])
             try:
-                broker_order = await self._mcp.get_order_by_client_id(client_order_id)
+                broker_order = await self._read_active_order(order, client_order_id)
             except Exception:
                 logger.warning(
                     "reconciliation read failed; leaving order status untouched",
@@ -846,6 +966,7 @@ class ExecutionAgent:
                 continue
             if broker_order is None:
                 continue
+            broker_order = await self._maybe_reprice_close(order, broker_order, detail)
             new_status = str(broker_order.get("status", order["status"]))
             filled_qty = finite_float(broker_order.get("filled_qty"))
             await self._store.update_order_status(

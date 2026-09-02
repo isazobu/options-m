@@ -151,3 +151,17 @@ def test_a_level_two_downgrade_cannot_smuggle_a_long_single_through() -> None:
         as_of=_AS_OF,
     )
     assert decision == "hold"
+
+
+def test_missing_iv_or_realised_vol_holds_instead_of_aliasing_to_cheap() -> None:
+    evidence = _up(0.90)
+    for options in (
+        {"iv_atm": "MISSING", "realised_vol_20d": 0.20},
+        {"iv_atm": 0.18, "realised_vol_20d": "MISSING"},
+        {"iv_atm": 0.18, "realised_vol_20d": 0.0},
+    ):
+        evidence["options"] = options
+        assert (
+            matrix.decide(evidence, _REGIME, settings=_settings(), as_of=_AS_OF)
+            == "hold"
+        )

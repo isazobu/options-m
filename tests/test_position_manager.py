@@ -132,6 +132,65 @@ async def test_a_successful_step_is_recorded_with_its_detail() -> None:
     assert run["detail"]["open_underlyings"] == 1
 
 
+async def test_position_manager_creates_close_proposals_on_its_own_tick() -> None:
+    mcp = _FakeMcp(
+        positions=[
+            {
+                "symbol": "AAPL991231C00150000",
+                "qty": "1",
+                "market_value": "1600",
+                "unrealized_pl": "600",
+            }
+        ]
+    )
+    agent, store = _agent(mcp)
+
+    await agent.step()
+
+    proposals = await store.recent_proposals(limit=5, status="pending")
+    assert len(proposals) == 1
+    proposal = await store.get_proposal(proposals[0]["id"])
+    assert proposal is not None
+    assert proposal["intent"]["action"] == "close"
+    assert proposal["intent"]["thesis"].startswith("profit_target")
+
+
+async def test_final_campaign_session_flattens_before_the_close(monkeypatch: Any) -> None:
+    now = datetime(2026, 9, 3, 19, 45, tzinfo=UTC)
+    monkeypatch.setattr("options_m.agents.position_manager._now_utc", lambda: now)
+    mcp = _FakeMcp(positions=[{"symbol": "AAPL991231C00150000", "qty": "1"}])
+    agent, store = _agent(
+        mcp,
+        campaign_start_date=now.date() - timedelta(days=1),
+        campaign_days=2,
+        campaign_flatten_minutes_before_close=20,
+    )
+    await store.upsert_market_calendar(
+        [
+            {
+                "date": now.date() - timedelta(days=1),
+                "open": datetime(2026, 9, 2, 13, 30, tzinfo=UTC),
+                "close": datetime(2026, 9, 2, 20, 0, tzinfo=UTC),
+                "session_type": "full",
+            },
+            {
+                "date": now.date(),
+                "open": datetime(2026, 9, 3, 13, 30, tzinfo=UTC),
+                "close": datetime(2026, 9, 3, 20, 0, tzinfo=UTC),
+                "session_type": "full",
+            },
+        ]
+    )
+
+    await agent.step()
+
+    proposals = await store.recent_proposals(limit=5, status="pending")
+    assert len(proposals) == 1
+    proposal = await store.get_proposal(proposals[0]["id"])
+    assert proposal is not None
+    assert proposal["intent"]["thesis"] == "campaign_flatten"
+
+
 # ---------------------------------------------------------------------------
 # Enrichment and pnl_pct
 # ---------------------------------------------------------------------------

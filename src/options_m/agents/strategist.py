@@ -36,6 +36,7 @@ from typing import Any
 from options_m import matrix, session
 from options_m.config import Settings
 from options_m.earnings import is_earnings_blackout
+from options_m.exits import evaluate_close_proposals
 from options_m.llm import FeatherlessLlm, LlmContractError
 from options_m.models import RegimeRead, StrategyIntent
 from options_m.notify import Notifier, NullNotifier, format_decision
@@ -102,11 +103,7 @@ class StrategistAgent:
     async def _run(self) -> dict[str, Any]:
         detail: dict[str, Any] = {"skipped": None}
 
-        # Close evaluation runs unconditionally — not gated by kill switch or
-        # LLM budget, because exits must work even when new entries are frozen.
         now = datetime.now(UTC)
-        close_detail = await self._evaluate_close_proposals()
-        detail.update(close_detail)
 
         # Local cache read — no MCP call.
         state = await session.current(self._store, self._settings, now)
@@ -271,71 +268,12 @@ class StrategistAgent:
         self._notifier.notify(format_decision(dry_run=self._settings.dry_run, **fields))
 
     async def _evaluate_close_proposals(self) -> dict[str, Any]:
-        """Check every open position for exit conditions; write a close proposal
-        when one is met. Deterministic — no LLM call, no MCP call."""
-        positions = await self._store.get_cached_positions()
-        if not positions:
-            return {}
-
-        # Collect underlyings that already have a pending close proposal so we
-        # don't create duplicates within the same cycle.
-        pending = await self._store.recent_proposals(limit=50, status="pending")
-        pending_close = {
-            str(p.get("underlying", "")).upper()
-            for p in pending
-            if isinstance(p.get("intent"), dict) and p["intent"].get("action") == "close"
-        }
-
-        close_count = 0
-        for row in positions:
-            underlying: str = row["symbol"]
-            if underlying in pending_close:
-                continue
-
-            payload: dict[str, Any] = row.get("payload") or {}
-            reason = _close_reason(payload, self._settings)
-            if reason is None:
-                continue
-
-            pnl_pct: float | None = payload.get("pnl_pct")
-            thesis = (
-                f"{reason}: {pnl_pct:+.1%} unrealized" if pnl_pct is not None else reason
-            )
-
-            # strategy from enrichment — fall back to a valid placeholder so the
-            # StrategyIntent validates; ExecutionAgent reads actual legs from cache.
-            raw_strategy = payload.get("strategy") or ""
-            strategy = raw_strategy if raw_strategy in _VALID_STRATEGIES else "long_call"
-
-            intent = StrategyIntent(
-                action="close",
-                strategy=strategy,  # type: ignore[arg-type]
-                underlying=underlying,
-                target_delta=0.5,
-                dte_min=0,
-                dte_max=365,
-                conviction=1.0,
-                thesis=thesis,
-                invalidation="",
-            )
-            await self._store.save_proposal(
-                underlying=underlying,
-                intent=intent.model_dump(mode="json"),
-                evidence=payload,
-                status="pending",
-            )
-            pending_close.add(underlying)
-            close_count += 1
-            logger.info(
-                "strategist: close proposal",
-                extra={"underlying": underlying, "reason": reason},
-            )
-            self._announce(
-                symbol=underlying, status="close", strategy=strategy,
-                reason=reason, thesis=thesis,
-            )
-
-        return {"close_proposals": close_count} if close_count else {}
+        """Compatibility shim; PositionManager owns the live 60-second path."""
+        return await evaluate_close_proposals(
+            self._store,
+            self._settings,
+            notifier=self._notifier,
+        )
 
     async def _pick_candidate(
         self, now: datetime, detail: dict[str, Any]

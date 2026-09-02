@@ -97,17 +97,18 @@ def _trend_direction(trend: dict[str, Any]) -> Literal["up", "flat", "down"]:
     return "flat"
 
 
-def _iv_regime(options: dict[str, Any]) -> Literal["cheap", "expensive", "very_expensive"]:
+def _iv_regime(
+    options: dict[str, Any],
+) -> Literal["cheap", "expensive", "very_expensive", "unknown"]:
     """Classify IV regime from ATM-IV and realised-vol already in the evidence pack.
 
-    Falls back to "cheap" when data is missing — the conservative direction
-    because it produces debit (defined-loss) structures rather than premium-
-    selling structures into an opaque vol environment.
+    Missing data is not cheap volatility. It is unknown, and ``decide`` holds
+    rather than silently selecting the debit column.
     """
     iv_atm = options.get("iv_atm")
     rv = options.get("realised_vol_20d")
     if not isinstance(iv_atm, (int, float)) or not isinstance(rv, (int, float)) or rv <= 0:
-        return "cheap"
+        return "unknown"
     ratio = iv_atm / rv
     if ratio >= _IV_RV_VERY_EXPENSIVE:
         return "very_expensive"
@@ -146,6 +147,8 @@ def decide(
 
     trend = _trend_direction(trend_block)
     iv_regime_label = _iv_regime(options_block)
+    if iv_regime_label == "unknown":
+        return "hold"
 
     # 4. Matrix lookup.
     strategy = _MATRIX.get((trend, iv_regime_label))

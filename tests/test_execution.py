@@ -8,12 +8,14 @@ it wrong lets a single four-leg condor consume the whole portfolio budget.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 from options_m.agents.execution import (
     ExecutionAgent,
+    _build_closing_legs,
+    _close_limit_price,
     _group_into_structures,
     build_portfolio_snapshot,
 )
@@ -334,6 +336,9 @@ class _CloseMcp:
         self.kwargs = kwargs
         return {"id": "order-1", "status": "new"}
 
+    async def get_order_by_client_id(self, _client_order_id: str) -> dict[str, Any]:
+        return {"id": "order-1", "status": "new", "filled_qty": "0"}
+
 
 def _close_agent(store: Store, mcp: Any) -> ExecutionAgent:
     settings = Settings(database_url=None, dry_run=False)
@@ -357,7 +362,7 @@ def _close_intent() -> Any:
 async def _close_with(payload: dict[str, Any]) -> dict[str, Any]:
     store = _store()
     await store.upsert_position("AAPL", payload)
-    mcp = _CloseMcp()
+    mcp: Any = _CloseMcp()
     proposal_id = await store.save_proposal(underlying="AAPL", intent={}, evidence={})
     await _close_agent(store, mcp)._execute_close(
         proposal_id, _close_intent(), {"submitted": 0, "failed": 0, "rejected": 0}
@@ -392,3 +397,147 @@ async def test_a_payload_without_a_net_still_prices_off_the_gross() -> None:
         }
     )
     assert kwargs["limit_price"] == "2.50"
+
+
+def test_closing_legs_carry_the_intent_matching_their_side() -> None:
+    legs = _build_closing_legs(
+        [
+            {"symbol": "AAPL991231P00150000", "side": "short", "qty": "-1"},
+            {"symbol": "AAPL991231P00145000", "side": "long", "qty": "1"},
+        ]
+    )
+
+    assert legs[0]["side"] == "buy"
+    assert legs[0]["position_intent"] == "buy_to_close"
+    assert legs[1]["side"] == "sell"
+    assert legs[1]["position_intent"] == "sell_to_close"
+
+
+def test_close_leg_ratios_do_not_multiply_the_position_quantity_twice() -> None:
+    legs = _build_closing_legs(
+        [
+            {"symbol": "AAPL991231P00150000", "side": "short", "qty": "-6"},
+            {"symbol": "AAPL991231P00145000", "side": "long", "qty": "6"},
+        ]
+    )
+
+    assert [leg["ratio_qty"] for leg in legs] == ["1", "1"]
+
+
+def test_stop_and_flatten_limits_start_more_aggressively_than_profit_taking() -> None:
+    assert _close_limit_price(2.0, "profit_target", nudge=0.25, attempt=0) == 2.0
+    assert _close_limit_price(2.0, "stop_loss", nudge=0.25, attempt=0) == 2.5
+    assert _close_limit_price(2.0, "campaign_flatten", nudge=0.25, attempt=0) == 2.5
+
+
+def test_each_reprice_ladder_rung_is_more_marketable() -> None:
+    prices = [
+        _close_limit_price(2.0, "profit_target", nudge=0.25, attempt=attempt)
+        for attempt in range(4)
+    ]
+    assert prices == [2.0, 2.5, 3.0, 3.5]
+
+
+async def test_kill_switch_still_executes_a_pending_close() -> None:
+    settings = Settings(database_url=None, dry_run=False, kill_switch=True)
+    store = Store(Database(settings))
+    await store.upsert_position(
+        "AAPL",
+        {
+            "net_value": -200.0,
+            "legs": [
+                {"symbol": "AAPL991231P00150000", "side": "short", "qty": "-1"},
+                {"symbol": "AAPL991231P00145000", "side": "long", "qty": "1"},
+            ],
+        },
+    )
+    await store.save_proposal(
+        underlying="AAPL",
+        intent=_close_intent().model_dump(mode="json"),
+        evidence={},
+    )
+    mcp: Any = _CloseMcp()
+    agent = ExecutionAgent(settings, mcp, store, MagicMock())
+
+    detail = await agent._run()
+
+    assert detail["submitted"] == 1
+    assert mcp.kwargs is not None
+
+
+async def test_kill_switch_leaves_an_open_proposal_pending() -> None:
+    settings = Settings(database_url=None, dry_run=False, kill_switch=True)
+    store = Store(Database(settings))
+    proposal_id = await store.save_proposal(
+        underlying="AAPL",
+        intent={
+            **_close_intent().model_dump(mode="json"),
+            "action": "open",
+        },
+        evidence={},
+    )
+    agent = ExecutionAgent(settings, MagicMock(), store, MagicMock())
+
+    detail = await agent._run()
+
+    assert detail["submitted"] == 0
+    proposal = await store.get_proposal(proposal_id)
+    assert proposal is not None
+    assert proposal["status"] == "pending"
+
+
+async def test_reconcile_reprices_a_stale_close_order_up_the_ladder() -> None:
+    settings = Settings(
+        database_url=None,
+        dry_run=False,
+        close_reprice_seconds=1,
+        close_reprice_max_attempts=3,
+    )
+    store = Store(Database(settings))
+    proposal_id = await store.save_proposal(
+        underlying="AAPL",
+        intent=_close_intent().model_dump(mode="json"),
+        evidence={},
+        status="submitted",
+    )
+    await store.record_order(
+        proposal_id=proposal_id,
+        client_order_id=f"omc-{proposal_id}",
+        status="new",
+        request={
+            "action": "close",
+            "underlying": "AAPL",
+            "exit_reason": "profit_target",
+            "mark_price": 2.0,
+            "limit_price": "2.00",
+        },
+    )
+    store._memory_orders[f"omc-{proposal_id}"]["submitted_at"] = (
+        datetime.now(UTC) - timedelta(seconds=2.1)
+    )
+    mcp = MagicMock()
+    mcp.get_order_by_client_id = AsyncMock(
+        return_value={
+            "id": "broker-1",
+            "status": "new",
+            "filled_qty": "0",
+            "limit_price": "2.00",
+        }
+    )
+    mcp.replace_order_by_id = AsyncMock(
+        return_value={
+            "id": "broker-2",
+            "status": "new",
+            "filled_qty": "0",
+            "limit_price": "3.00",
+        }
+    )
+    agent = ExecutionAgent(settings, mcp, store, MagicMock())
+    detail: dict[str, Any] = {"reconciled": 0, "broker_rejected": 0}
+
+    await agent._reconcile(detail)
+
+    mcp.replace_order_by_id.assert_awaited_once_with(
+        "broker-1", limit_price="3.00"
+    )
+    assert detail["repriced"] == 1

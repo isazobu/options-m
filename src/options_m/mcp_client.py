@@ -653,6 +653,28 @@ class AlpacaMcp:
             raise
         return self._expect_mapping("get_order_by_client_id", payload)
 
+    async def get_order_by_id(self, order_id: str) -> dict[str, Any] | None:
+        """Read an active replacement order by its broker order ID."""
+        try:
+            payload = await self.call("get_order_by_id", {"order_id": order_id})
+        except ToolError as exc:
+            if _looks_like_not_found(str(exc)):
+                return None
+            raise
+        return self._expect_mapping("get_order_by_id", payload)
+
+    async def replace_order_by_id(
+        self, order_id: str, *, limit_price: str
+    ) -> dict[str, Any]:
+        """Move one working limit order to a more marketable price."""
+        return self._expect_mapping(
+            "replace_order_by_id",
+            await self.call(
+                "replace_order_by_id",
+                {"order_id": order_id, "limit_price": limit_price},
+            ),
+        )
+
     async def close_position(
         self, symbol: str, *, qty: str | None = None, percentage: str | None = None
     ) -> dict[str, Any]:

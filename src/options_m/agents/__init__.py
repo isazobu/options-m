@@ -85,7 +85,7 @@ def build_agents(
     )
     agents: list[Agent] = [
         MarketPulseAgent(settings, mcp, store),
-        PositionManagerAgent(settings, mcp, store),
+        PositionManagerAgent(settings, mcp, store, notifier=_notifier),
         ExecutionAgent(settings, mcp, store, risk_engine, notifier=_notifier),
         StrategistAgent(settings, store, _llm, notifier=_notifier),
         ReflectionAgent(settings, store, _llm),

@@ -354,6 +354,17 @@ def _fake_server() -> tuple[FastMCP, dict[str, int]]:
         )
 
     @server.tool
+    def get_order_by_id(order_id: str) -> dict[str, Any]:
+        return _wrap({"id": order_id, "status": "new"}, "get_order_by_id")
+
+    @server.tool
+    def replace_order_by_id(order_id: str, limit_price: str) -> dict[str, Any]:
+        return _wrap(
+            {"id": f"{order_id}-replacement", "limit_price": limit_price, "status": "new"},
+            "replace_order_by_id",
+        )
+
+    @server.tool
     def close_position(
         symbol_or_asset_id: str, qty: str | None = None, percentage: str | None = None
     ) -> dict[str, Any]:
@@ -1171,6 +1182,22 @@ async def test_get_order_by_client_id_returns_the_order_when_found() -> None:
         await mcp.close()
 
     assert order == {"client_order_id": "om-1", "status": "filled"}
+
+
+async def test_replacement_order_wrappers_preserve_string_prices() -> None:
+    server, _calls = _fake_server()
+    mcp = await _connected(_settings(dry_run=False), server)
+    mcp._paper_corroborated = True
+    try:
+        current = await mcp.get_order_by_id("broker-1")
+        replacement = await mcp.replace_order_by_id(
+            "broker-1", limit_price="2.50"
+        )
+    finally:
+        await mcp.close()
+
+    assert current == {"id": "broker-1", "status": "new"}
+    assert replacement["limit_price"] == "2.50"
 
 
 async def test_place_option_order_sends_every_numeric_as_a_string() -> None:
