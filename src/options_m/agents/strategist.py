@@ -194,13 +194,15 @@ class StrategistAgent:
             )
             raise
         finally:
+            failed = detail.get("status") == "llm_failed"
             await self._store.record_llm_call(
                 agent=self.name,
                 model=self._settings.featherless_model_deep,
-                prompt_tokens=0,
-                completion_tokens=0,
+                prompt_tokens=self._llm.last_prompt_tokens,
+                completion_tokens=self._llm.last_completion_tokens,
                 latency_ms=int((time.monotonic() - t0) * 1000),
-                ok="status" not in detail or detail.get("status") != "llm_failed",
+                ok=not failed,
+                error=self._llm.last_error if failed else None,
             )
 
         decision = matrix.decide(pack, regime, settings=self._settings, as_of=now.date())

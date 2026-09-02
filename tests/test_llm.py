@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
+from pydantic import BaseModel
 
-from options_m.llm import FeatherlessLlm, LlmError
+from options_m.llm import FeatherlessLlm, LlmContractError, LlmError
+
+
+class _Regime(BaseModel):
+    thesis: str
+    invalidation: str
+    conviction: float
+
+
+_VALID_JSON = json.dumps({"thesis": "range-bound", "invalidation": "break", "conviction": 0.7})
 
 # Captured before any test monkeypatches httpx.AsyncClient, so the patched
 # factory below can still construct a real client around a mock transport.
@@ -113,3 +125,112 @@ async def test_an_unreadable_response_raises_llm_error(monkeypatch: pytest.Monke
 
     with pytest.raises(LlmError):
         await llm.chat_completion([{"role": "user", "content": "hi"}])
+
+
+def _patch_client(monkeypatch: pytest.MonkeyPatch, handler: object) -> None:
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kw: _RealAsyncClient(transport=httpx.MockTransport(handler))
+    )
+
+
+def _deepseek() -> FeatherlessLlm:
+    return FeatherlessLlm(
+        api_key="key",
+        base_url="https://featherless.test/v1",
+        model="deepseek-ai/DeepSeek-V4-Flash-0731",
+        timeout_seconds=5.0,
+    )
+
+
+async def test_complete_json_turns_thinking_off_for_structured_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DeepSeek V4 thinks by default. Thinking burns max_tokens=1024 and
+    leaves content empty, which production recorded as llm_failed after 44s."""
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": _VALID_JSON}}]})
+
+    _patch_client(monkeypatch, handler)
+    parsed = await _deepseek().complete_json(
+        schema=_Regime, system="s", user="u", max_tokens=1024, temperature=0.2
+    )
+
+    kwargs = captured.get("chat_template_kwargs")
+    assert isinstance(kwargs, dict)
+    assert kwargs.get("enable_thinking") is False
+    assert parsed.conviction == 0.7
+
+
+async def test_complete_json_reads_json_from_reasoning_content_when_content_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "reasoning_content": _VALID_JSON,
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 80, "completion_tokens": 900},
+            },
+        )
+
+    _patch_client(monkeypatch, handler)
+    llm = _deepseek()
+    parsed = await llm.complete_json(
+        schema=_Regime, system="s", user="u", max_tokens=1024, temperature=0.2
+    )
+
+    assert parsed.thesis == "range-bound"
+    assert llm.last_prompt_tokens == 80
+    assert llm.last_completion_tokens == 900
+
+
+async def test_complete_json_strips_think_tags_before_extracting_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": f"<think>I will emit {{not json}}</think>\n{_VALID_JSON}",
+                        }
+                    }
+                ]
+            },
+        )
+
+    _patch_client(monkeypatch, handler)
+    parsed = await _deepseek().complete_json(
+        schema=_Regime, system="s", user="u", max_tokens=1024, temperature=0.2
+    )
+
+    assert parsed.invalidation == "break"
+
+
+async def test_complete_json_records_the_error_when_both_attempts_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": "not json"}}]})
+
+    _patch_client(monkeypatch, handler)
+    llm = _deepseek()
+    with pytest.raises(LlmContractError):
+        await llm.complete_json(
+            schema=_Regime, system="s", user="u", max_tokens=1024, temperature=0.2
+        )
+
+    assert llm.last_error is not None
+    assert "no JSON" in llm.last_error
