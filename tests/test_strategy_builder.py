@@ -13,6 +13,7 @@ from typing import Any
 
 from options_m import strategy_builder
 from options_m.config import Settings
+from options_m.exposure import plan_exposure
 from options_m.models import OrderPlan, Rejection, StrategyIntent
 from options_m.sizing import SizingState
 
@@ -286,6 +287,23 @@ async def test_an_iron_butterfly_puts_both_shorts_on_one_strike() -> None:
     assert len({leg.strike for leg in shorts}) == 1
     # ...and that strike is the one nearest spot, not a delta-selected one.
     assert next(iter({leg.strike for leg in shorts})) == _SPOT
+
+
+async def test_every_credit_leg_carries_a_delta() -> None:
+    """The portfolio-Greeks gate cannot measure a plan that is missing a delta.
+
+    The builder used to leave the protective wing's delta unset — it only
+    needed the short's for strike selection. Alpaca's chain snapshot already
+    has the wing's greeks; copy them onto the plan so the book-level caps
+    can use the same numbers the dashboard shows.
+    """
+    for strategy in ("put_credit_spread", "call_credit_spread", "iron_condor", "iron_butterfly"):
+        result = await _build(_credit_intent(strategy))
+        assert isinstance(result, OrderPlan), getattr(result, "reason", None)
+        assert all(leg.delta is not None for leg in result.legs), strategy
+        measured = plan_exposure(result, spot=_SPOT, iv=0.25, risk_free_rate=0.045)
+        assert measured.beta_weighted_delta is not None, strategy
+        assert measured.net_vega is not None, strategy
 
 
 async def test_every_short_leg_is_paired_with_a_wing_of_its_own_type() -> None:
