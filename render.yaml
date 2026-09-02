@@ -115,6 +115,10 @@ services:
         value: "900"
       - key: MAX_PROPOSALS_PER_SYMBOL_PER_DAY
         value: "6"
+      - key: MAX_PROPOSALS_PER_DAY
+        value: "80"
+      - key: CONVICTION_FLOOR
+        value: "0.40"
       - key: STRATEGIST_INTERVAL_SECONDS
         value: "180"
       - key: ALLOW_BOUGHT_PREMIUM

@@ -84,14 +84,31 @@ async def test_a_symbol_at_its_per_day_cap_is_skipped_even_past_the_cooldown() -
     await _seed_candidates(store, "SPY", "QQQ", "IWM")
     now = datetime.now(UTC)
     for _ in range(3):  # max_proposals_per_symbol_per_day default
+        # rejected is a trade attempt that does not hold the active slot.
         proposal_id = await store.save_proposal(underlying="SPY", intent={}, evidence={})
-        await store.update_proposal_status(proposal_id, "no_action")
+        await store.update_proposal_status(proposal_id, "rejected")
         store._memory_proposals[proposal_id]["ts"] = now - timedelta(hours=5)
 
     candidate = await _agent(store)._pick_candidate(now, _detail())
 
     assert candidate is not None
     assert candidate["symbol"] == "QQQ"
+
+
+async def test_holds_on_one_symbol_do_not_hit_its_per_day_cap() -> None:
+    store = _store()
+    await _seed_candidates(store, "SPY", "QQQ", "IWM")
+    now = datetime.now(UTC)
+    for _ in range(6):
+        proposal_id = await store.save_proposal(
+            underlying="SPY", intent={"action": "hold"}, evidence={}, status="no_action"
+        )
+        store._memory_proposals[proposal_id]["ts"] = now - timedelta(hours=5)
+
+    candidate = await _agent(store)._pick_candidate(now, _detail())
+
+    assert candidate is not None
+    assert candidate["symbol"] == "SPY"
 
 
 async def test_the_global_per_day_cap_stops_all_work_and_records_the_reason() -> None:
@@ -109,6 +126,32 @@ async def test_the_global_per_day_cap_stops_all_work_and_records_the_reason() ->
 
     assert candidate is None
     assert detail["skipped"] == "proposal_cap"
+
+
+async def test_holds_and_llm_failures_do_not_consume_the_daily_cap() -> None:
+    """A day of no_action / llm_failed used to silence the strategist.
+
+    Production hit max_proposals_per_day=40 around 15:51 UTC after two hours
+    of 180s ticks that mostly wrote holds. The rest of the session then
+    skipped with proposal_cap — no more looks, not even at names the matrix
+    still wanted. The cap is for trade attempts, not for 'I looked and held'.
+    """
+    store = _store()
+    await _seed_candidates(store, "SPY", "QQQ", "IWM")
+    now = datetime.now(UTC)
+    for index in range(8):
+        proposal_id = await store.save_proposal(
+            underlying=f"H{index}", intent={"action": "hold"}, evidence={}, status="no_action"
+        )
+        store._memory_proposals[proposal_id]["ts"] = now - timedelta(hours=3)
+    failed = await store.save_proposal(underlying="QQQ", intent={}, evidence={}, status="llm_failed")
+    store._memory_proposals[failed]["ts"] = now - timedelta(hours=3)
+
+    detail: dict[str, Any] = {"skipped": None}
+    candidate = await _agent(store, max_proposals_per_day=5)._pick_candidate(now, detail)
+
+    assert candidate is not None
+    assert detail["skipped"] is None
 
 
 async def test_an_active_proposal_blocks_its_underlying_regardless_of_age() -> None:

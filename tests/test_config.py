@@ -128,6 +128,8 @@ def test_render_blueprint_contains_the_complete_two_session_campaign_envelope() 
         "CONVICTION_RELIABILITY_PRIOR": "0.8",
         "PROPOSAL_COOLDOWN_SECONDS": "900",
         "MAX_PROPOSALS_PER_SYMBOL_PER_DAY": "6",
+        "MAX_PROPOSALS_PER_DAY": "80",
+        "CONVICTION_FLOOR": "0.40",
         "STRATEGIST_INTERVAL_SECONDS": "180",
         "ALLOW_BOUGHT_PREMIUM": "false",
         "EXIT_CREDIT_PROFIT_TARGET_PCT": "0.35",

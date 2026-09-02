@@ -50,6 +50,10 @@ logger = logging.getLogger(__name__)
 # we stop reasoning over data that might be genuinely unavailable.
 _EVIDENCE_STALENESS_FACTOR = 2.0
 
+# Statuses that are a look, not a trade attempt. Counting them against
+# max_proposals_per_day silenced the live strategist after ~2h of holds.
+_NON_ACTIONABLE_PROPOSAL_STATUSES: frozenset[str] = frozenset({"no_action", "llm_failed"})
+
 
 class StrategistAgent:
     """Reads the evidence cache, calls the LLM once, runs the matrix, persists."""
@@ -302,7 +306,12 @@ class StrategistAgent:
         # the whole session — under DRY_RUN it never becomes an open position,
         # so nothing else stops it.
         recent = await self._store.proposals_since(now - timedelta(days=1))
-        if len(recent) >= self._settings.max_proposals_per_day:
+        actionable = [
+            row
+            for row in recent
+            if str(row.get("status") or "") not in _NON_ACTIONABLE_PROPOSAL_STATUSES
+        ]
+        if len(actionable) >= self._settings.max_proposals_per_day:
             detail["skipped"] = "proposal_cap"
             return None
 
@@ -311,7 +320,9 @@ class StrategistAgent:
         cooling_down: set[str] = set()
         for row in recent:
             sym = str(row.get("underlying", "")).upper()
-            per_symbol_today[sym] = per_symbol_today.get(sym, 0) + 1
+            status = str(row.get("status") or "")
+            if status not in _NON_ACTIONABLE_PROPOSAL_STATUSES:
+                per_symbol_today[sym] = per_symbol_today.get(sym, 0) + 1
             ts = row.get("ts")
             if isinstance(ts, datetime):
                 ts_aware = ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
