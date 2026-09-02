@@ -74,6 +74,10 @@ class Settings(BaseSettings):
     alpaca_toolsets: str = "account,trading,assets,options-data,stock-data,news"
     mcp_call_timeout_seconds: float = Field(default=30.0, gt=0)
     mcp_max_retries: int = Field(default=2, ge=0)
+    # Optional JSON list of runtime profiles. Unset runs a single default from
+    # the keys above; see options_m.runtime. Read here so it works from .env
+    # as well as from a real environment variable.
+    profiles: str | None = None
 
     # Local market-calendar cache (2026-08-29 design change): MarketPulseAgent
     # fetches get_calendar once for this forward window and refreshes once the

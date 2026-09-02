@@ -24,6 +24,22 @@ async def test_store_reports_that_it_is_not_persisting() -> None:
     assert _store().is_persistent is False
 
 
+async def test_stores_with_distinct_ids_keep_separate_state() -> None:
+    """Two Store instances with different ids do not see each other's rows."""
+    db = Database(Settings(database_url=None))
+    one = Store(db, account_id="one")
+    two = Store(db, account_id="two")
+
+    await one.record_agent_run("market_pulse", duration_ms=1, ok=True)
+    await one.append_equity(equity=100.0, cash=100.0, buying_power=100.0, positions_count=0)
+    await two.append_equity(equity=200.0, cash=200.0, buying_power=200.0, positions_count=0)
+
+    assert len(await one.recent_agent_runs()) == 1
+    assert await two.recent_agent_runs() == []
+    assert [p["equity"] for p in await one.recent_equity()] == [100.0]
+    assert [p["equity"] for p in await two.recent_equity()] == [200.0]
+
+
 async def test_agent_runs_are_returned_newest_first() -> None:
     store = _store()
     for index in range(3):

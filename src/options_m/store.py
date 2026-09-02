@@ -117,8 +117,11 @@ def _calendar_span_for(trading_days: int) -> int:
 class Store:
     """Repository over :class:`~options_m.db.Database`."""
 
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, *, account_id: str = "default") -> None:
         self._db = db
+        # Tags every row this instance writes and filters every row it reads.
+        # The in-memory fallback needs no tag — it is per-instance already.
+        self._acct = account_id
         self._memory_agent_runs: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
         self._memory_equity: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
         self._memory_snapshots: deque[dict[str, Any]] = deque(maxlen=_MEMORY_LIMIT)
@@ -183,9 +186,16 @@ class Store:
             return
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO agent_runs (agent, duration_ms, ok, error, detail) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (agent, duration_ms, ok, error, json.dumps(detail) if detail else None),
+                "INSERT INTO agent_runs (account_id, agent, duration_ms, ok, error, detail) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (
+                    self._acct,
+                    agent,
+                    duration_ms,
+                    ok,
+                    error,
+                    json.dumps(detail) if detail else None,
+                ),
             )
             await conn.commit()
 
@@ -214,9 +224,11 @@ class Store:
             return
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO equity_curve (equity, cash, buying_power, positions_count) "
-                "VALUES (%s, %s, %s, %s)",
+                "INSERT INTO equity_curve "
+                "(account_id, equity, cash, buying_power, positions_count) "
+                "VALUES (%s, %s, %s, %s, %s)",
                 (
+                    self._acct,
                     _as_decimal(equity),
                     _as_decimal(cash),
                     _as_decimal(buying_power),
@@ -231,8 +243,8 @@ class Store:
             return
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO market_snapshots (payload) VALUES (%s)",
-                (json.dumps(payload),),
+                "INSERT INTO market_snapshots (account_id, payload) VALUES (%s, %s)",
+                (self._acct, json.dumps(payload)),
             )
             await conn.commit()
 
@@ -250,6 +262,7 @@ class Store:
             return
         rows = [
             (
+                self._acct,
                 candidate["symbol"],
                 candidate.get("reason"),
                 _as_decimal(candidate.get("score")),
@@ -259,7 +272,8 @@ class Store:
         ]
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.executemany(
-                "INSERT INTO candidates (symbol, reason, score, payload) VALUES (%s, %s, %s, %s)",
+                "INSERT INTO candidates (account_id, symbol, reason, score, payload) "
+                "VALUES (%s, %s, %s, %s, %s)",
                 rows,
             )
             await conn.commit()
@@ -300,9 +314,11 @@ class Store:
             return
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO iv_history (symbol, iv_atm, dte, spot, payload, ts) "
-                "VALUES (%s, %s, %s, %s, %s, COALESCE(%s, now()))",
+                "INSERT INTO iv_history "
+                "(account_id, symbol, iv_atm, dte, spot, payload, ts) "
+                "VALUES (%s, %s, %s, %s, %s, %s, COALESCE(%s, now()))",
                 (
+                    self._acct,
                     symbol,
                     _as_decimal(iv_atm),
                     dte,
@@ -334,6 +350,7 @@ class Store:
             return len(readings)
         rows = [
             (
+                self._acct,
                 symbol,
                 _as_decimal(_maybe_float(reading.get("iv_atm"))),
                 reading.get("dte"),
@@ -345,8 +362,9 @@ class Store:
         ]
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.executemany(
-                "INSERT INTO iv_history (symbol, iv_atm, dte, spot, payload, ts) "
-                "VALUES (%s, %s, %s, %s, %s, %s)",
+                "INSERT INTO iv_history "
+                "(account_id, symbol, iv_atm, dte, spot, payload, ts) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
                 rows,
             )
             await conn.commit()
@@ -357,8 +375,8 @@ class Store:
             return list(self._memory_agent_runs)[:limit]
         return await self._fetch(
             "SELECT agent, started_at, duration_ms, ok, error, detail "
-            "FROM agent_runs ORDER BY started_at DESC LIMIT %s",
-            (limit,),
+            "FROM agent_runs WHERE account_id = %s ORDER BY started_at DESC LIMIT %s",
+            (self._acct, limit),
         )
 
     async def recent_equity(self, limit: int = 200) -> list[dict[str, Any]]:
@@ -366,8 +384,8 @@ class Store:
             return list(self._memory_equity)[:limit]
         return await self._fetch(
             "SELECT ts, equity, cash, buying_power, positions_count "
-            "FROM equity_curve ORDER BY ts DESC LIMIT %s",
-            (limit,),
+            "FROM equity_curve WHERE account_id = %s ORDER BY ts DESC LIMIT %s",
+            (self._acct, limit),
         )
 
     async def recent_candidates(self, limit: int = 20) -> list[dict[str, Any]]:
@@ -375,8 +393,8 @@ class Store:
             return list(self._memory_candidates)[:limit]
         return await self._fetch(
             "SELECT ts, symbol, reason, score, payload "
-            "FROM candidates ORDER BY ts DESC LIMIT %s",
-            (limit,),
+            "FROM candidates WHERE account_id = %s ORDER BY ts DESC LIMIT %s",
+            (self._acct, limit),
         )
 
     async def recent_iv(self, symbol: str, limit: int = 252) -> list[dict[str, Any]]:
@@ -392,8 +410,8 @@ class Store:
             return list(self._memory_iv_history.get(symbol, ()))[:limit]
         return await self._fetch(
             "SELECT ts, symbol, iv_atm, dte, spot "
-            "FROM iv_history WHERE symbol = %s ORDER BY ts DESC LIMIT %s",
-            (symbol, limit),
+            "FROM iv_history WHERE account_id = %s AND symbol = %s ORDER BY ts DESC LIMIT %s",
+            (self._acct, symbol, limit),
         )
 
     async def daily_iv_history(
@@ -434,9 +452,9 @@ class Store:
             "  SELECT (ts AT TIME ZONE 'America/New_York')::date AS session_day,"
             "         ts, symbol, iv_atm, dte, spot, payload"
             "  FROM iv_history"
-            "  WHERE symbol = %s AND iv_atm IS NOT NULL AND ts >= %s"
+            "  WHERE account_id = %s AND symbol = %s AND iv_atm IS NOT NULL AND ts >= %s"
             ") readings ORDER BY session_day DESC, ts DESC LIMIT %s",
-            (symbol, cutoff, days),
+            (self._acct, symbol, cutoff, days),
         )
 
     async def iv_session_days(self, symbol: str, *, days: int = IV_RANK_WINDOW_DAYS) -> set[date]:
@@ -509,20 +527,23 @@ class Store:
             return [str(r["lesson"]) for r in rows[:n]]
         if symbol is not None:
             rows = await self._fetch(
-                "SELECT lesson FROM lessons WHERE symbol = %s ORDER BY ts DESC LIMIT %s",
-                (symbol.upper(), n),
+                "SELECT lesson FROM lessons WHERE account_id = %s AND symbol = %s "
+                "ORDER BY ts DESC LIMIT %s",
+                (self._acct, symbol.upper(), n),
             )
         else:
             rows = await self._fetch(
-                "SELECT lesson FROM lessons ORDER BY ts DESC LIMIT %s",
-                (n,),
+                "SELECT lesson FROM lessons WHERE account_id = %s ORDER BY ts DESC LIMIT %s",
+                (self._acct, n),
             )
         return [str(row["lesson"]) for row in rows]
 
     async def is_kill_switch_engaged(self) -> bool:
         if not self._db.is_enabled:
             return self._memory_kill_switch[0]
-        rows = await self._fetch("SELECT engaged FROM kill_switch WHERE id = 1", ())
+        rows = await self._fetch(
+            "SELECT engaged FROM kill_switch WHERE account_id = %s", (self._acct,)
+        )
         if not rows:
             return False
         return bool(rows[0]["engaged"])
@@ -539,7 +560,8 @@ class Store:
             engaged, reason = self._memory_kill_switch
             return {"engaged": engaged, "reason": reason, "updated_at": None}
         rows = await self._fetch(
-            "SELECT engaged, reason, updated_at FROM kill_switch WHERE id = 1", ()
+            "SELECT engaged, reason, updated_at FROM kill_switch WHERE account_id = %s",
+            (self._acct,),
         )
         if not rows:
             return {"engaged": False, "reason": None, "updated_at": None}
@@ -556,11 +578,11 @@ class Store:
             return
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO kill_switch (id, engaged, reason, updated_at) "
-                "VALUES (1, %s, %s, now()) "
-                "ON CONFLICT (id) DO UPDATE SET engaged = EXCLUDED.engaged, "
+                "INSERT INTO kill_switch (account_id, engaged, reason, updated_at) "
+                "VALUES (%s, %s, %s, now()) "
+                "ON CONFLICT (account_id) DO UPDATE SET engaged = EXCLUDED.engaged, "
                 "reason = EXCLUDED.reason, updated_at = now()",
-                (engaged, reason),
+                (self._acct, engaged, reason),
             )
             await conn.commit()
 
@@ -574,8 +596,9 @@ class Store:
             return rows[:limit]
         return await self._fetch(
             "SELECT id, ts, underlying, status, intent, evidence, arguments, verdict, plan, error "
-            "FROM proposals WHERE status = 'pending' ORDER BY ts ASC LIMIT %s",
-            (limit,),
+            "FROM proposals WHERE account_id = %s AND status = 'pending' "
+            "ORDER BY ts ASC LIMIT %s",
+            (self._acct, limit),
         )
 
     async def recent_proposals(
@@ -613,16 +636,17 @@ class Store:
                 "(arguments IS NOT NULL) AS has_arguments, "
                 "(verdict IS NOT NULL) AS has_verdict, "
                 "COALESCE((evidence->>'mock')::boolean, false) AS is_mock "
-                "FROM proposals WHERE status = %s ORDER BY ts DESC LIMIT %s",
-                (status, limit),
+                "FROM proposals WHERE account_id = %s AND status = %s "
+                "ORDER BY ts DESC LIMIT %s",
+                (self._acct, status, limit),
             )
         return await self._fetch(
             "SELECT id, ts, underlying, status, "
             "(arguments IS NOT NULL) AS has_arguments, "
             "(verdict IS NOT NULL) AS has_verdict, "
             "COALESCE((evidence->>'mock')::boolean, false) AS is_mock "
-            "FROM proposals ORDER BY ts DESC LIMIT %s",
-            (limit,),
+            "FROM proposals WHERE account_id = %s ORDER BY ts DESC LIMIT %s",
+            (self._acct, limit),
         )
 
     async def proposals_since(self, since: datetime) -> list[dict[str, Any]]:
@@ -642,8 +666,9 @@ class Store:
             rows.sort(key=lambda row: row["ts"], reverse=True)
             return rows
         return await self._fetch(
-            "SELECT underlying, ts, status FROM proposals WHERE ts >= %s ORDER BY ts DESC",
-            (since,),
+            "SELECT underlying, ts, status FROM proposals "
+            "WHERE account_id = %s AND ts >= %s ORDER BY ts DESC",
+            (self._acct, since),
         )
 
     async def conviction_outcomes(self, limit: int = 200) -> list[dict[str, Any]]:
@@ -710,8 +735,9 @@ class Store:
         else:
             candidates = await self._fetch(
                 "SELECT underlying, ts, evidence, intent FROM proposals "
-                "WHERE intent->>'action' = 'close' ORDER BY ts DESC LIMIT %s",
-                (limit,),
+                "WHERE account_id = %s AND intent->>'action' = 'close' "
+                "ORDER BY ts DESC LIMIT %s",
+                (self._acct, limit),
             )
 
         result: list[dict[str, Any]] = []
@@ -751,8 +777,8 @@ class Store:
             ]
         else:
             rows = await self._fetch(
-                "SELECT id, intent FROM proposals WHERE id = ANY(%s)",
-                (list(proposal_ids),),
+                "SELECT id, intent FROM proposals WHERE account_id = %s AND id = ANY(%s)",
+                (self._acct, list(proposal_ids)),
             )
         convictions: dict[int, float] = {}
         for row in rows:
@@ -784,14 +810,15 @@ class Store:
             }
         if exclude_proposal_id is None:
             rows = await self._fetch(
-                "SELECT DISTINCT underlying FROM proposals WHERE status = ANY(%s)",
-                (list(_ACTIVE_PROPOSAL_STATUSES),),
+                "SELECT DISTINCT underlying FROM proposals "
+                "WHERE account_id = %s AND status = ANY(%s)",
+                (self._acct, list(_ACTIVE_PROPOSAL_STATUSES)),
             )
         else:
             rows = await self._fetch(
                 "SELECT DISTINCT underlying FROM proposals "
-                "WHERE status = ANY(%s) AND id <> %s",
-                (list(_ACTIVE_PROPOSAL_STATUSES), exclude_proposal_id),
+                "WHERE account_id = %s AND status = ANY(%s) AND id <> %s",
+                (self._acct, list(_ACTIVE_PROPOSAL_STATUSES), exclude_proposal_id),
             )
         return {str(row["underlying"]).upper() for row in rows}
 
@@ -800,8 +827,8 @@ class Store:
             return self._memory_proposals.get(proposal_id)
         rows = await self._fetch(
             "SELECT id, ts, underlying, status, intent, evidence, arguments, verdict, plan, error "
-            "FROM proposals WHERE id = %s",
-            (proposal_id,),
+            "FROM proposals WHERE account_id = %s AND id = %s",
+            (self._acct, proposal_id),
         )
         return rows[0] if rows else None
 
@@ -835,13 +862,14 @@ class Store:
                 "UPDATE proposals SET status = %s, "
                 "plan = COALESCE(%s, plan), verdict = COALESCE(%s, verdict), "
                 "arguments = COALESCE(%s, arguments), error = COALESCE(%s, error) "
-                "WHERE id = %s",
+                "WHERE account_id = %s AND id = %s",
                 (
                     status,
                     json.dumps(plan) if plan is not None else None,
                     json.dumps(verdict) if verdict is not None else None,
                     json.dumps(arguments) if arguments is not None else None,
                     error,
+                    self._acct,
                     proposal_id,
                 ),
             )
@@ -854,8 +882,9 @@ class Store:
             return self._memory_orders.get(client_order_id)
         rows = await self._fetch(
             "SELECT id, proposal_id, client_order_id, submitted_at, status, request, "
-            "response, filled_qty, filled_avg_price, error FROM orders WHERE client_order_id = %s",
-            (client_order_id,),
+            "response, filled_qty, filled_avg_price, error FROM orders "
+            "WHERE account_id = %s AND client_order_id = %s",
+            (self._acct, client_order_id),
         )
         return rows[0] if rows else None
 
@@ -895,9 +924,10 @@ class Store:
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.execute(
                 "INSERT INTO orders "
-                "(proposal_id, client_order_id, status, request, response, error) "
-                "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (client_order_id) DO NOTHING",
+                "(account_id, proposal_id, client_order_id, status, request, response, error) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (client_order_id) DO NOTHING",
                 (
+                    self._acct,
                     proposal_id,
                     client_order_id,
                     status,
@@ -938,13 +968,14 @@ class Store:
                 "UPDATE orders SET status = %s, response = COALESCE(%s, response), "
                 "filled_qty = COALESCE(%s, filled_qty), "
                 "filled_avg_price = COALESCE(%s, filled_avg_price), "
-                "error = COALESCE(%s, error) WHERE client_order_id = %s",
+                "error = COALESCE(%s, error) WHERE account_id = %s AND client_order_id = %s",
                 (
                     status,
                     json.dumps(response) if response is not None else None,
                     _as_decimal(filled_qty),
                     _as_decimal(filled_avg_price),
                     error,
+                    self._acct,
                     client_order_id,
                 ),
             )
@@ -961,8 +992,8 @@ class Store:
         return await self._fetch(
             "SELECT id, proposal_id, client_order_id, submitted_at, status, request, "
             "response, filled_qty, filled_avg_price, error FROM orders "
-            "WHERE proposal_id = %s ORDER BY submitted_at ASC",
-            (proposal_id,),
+            "WHERE account_id = %s AND proposal_id = %s ORDER BY submitted_at ASC",
+            (self._acct, proposal_id),
         )
 
     async def recent_orders(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -975,8 +1006,8 @@ class Store:
         return await self._fetch(
             "SELECT id, proposal_id, client_order_id, submitted_at, status, request, "
             "response, filled_qty, filled_avg_price, error FROM orders "
-            "ORDER BY submitted_at DESC LIMIT %s",
-            (limit,),
+            "WHERE account_id = %s ORDER BY submitted_at DESC LIMIT %s",
+            (self._acct, limit),
         )
 
     async def orders_in_flight(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -1000,8 +1031,9 @@ class Store:
         return await self._fetch(
             "SELECT id, proposal_id, client_order_id, submitted_at, status, request, "
             "response, filled_qty, filled_avg_price, error FROM orders "
-            "WHERE lower(status) <> ALL(%s) ORDER BY submitted_at ASC LIMIT %s",
-            (list(_SETTLED_ORDER_STATES), limit),
+            "WHERE account_id = %s AND lower(status) <> ALL(%s) "
+            "ORDER BY submitted_at ASC LIMIT %s",
+            (self._acct, list(_SETTLED_ORDER_STATES), limit),
         )
 
     async def working_order_underlyings(self) -> set[str]:
@@ -1038,8 +1070,9 @@ class Store:
             return
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO risk_events (proposal_id, rule, detail) VALUES (%s, %s, %s)",
-                (proposal_id, rule, json.dumps(detail)),
+                "INSERT INTO risk_events (account_id, proposal_id, rule, detail) "
+                "VALUES (%s, %s, %s, %s)",
+                (self._acct, proposal_id, rule, json.dumps(detail)),
             )
             await conn.commit()
 
@@ -1047,8 +1080,9 @@ class Store:
         if not self._db.is_enabled:
             return list(self._memory_risk_events)[:limit]
         return await self._fetch(
-            "SELECT ts, proposal_id, rule, detail FROM risk_events ORDER BY ts DESC LIMIT %s",
-            (limit,),
+            "SELECT ts, proposal_id, rule, detail FROM risk_events "
+            "WHERE account_id = %s ORDER BY ts DESC LIMIT %s",
+            (self._acct, limit),
         )
 
     # ---- IV history ----------------------------------------------------
@@ -1073,14 +1107,20 @@ class Store:
                 self._memory_calendar[row["date"]] = row
             return
         payload = [
-            (row["date"], row["open"], row["close"], row.get("session_type", "full"))
+            (
+                self._acct,
+                row["date"],
+                row["open"],
+                row["close"],
+                row.get("session_type", "full"),
+            )
             for row in rows
         ]
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.executemany(
-                "INSERT INTO market_calendar (date, open, close, session_type) "
-                "VALUES (%s, %s, %s, %s) "
-                "ON CONFLICT (date) DO UPDATE SET open = EXCLUDED.open, "
+                "INSERT INTO market_calendar (account_id, date, open, close, session_type) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON CONFLICT (account_id, date) DO UPDATE SET open = EXCLUDED.open, "
                 "close = EXCLUDED.close, session_type = EXCLUDED.session_type",
                 payload,
             )
@@ -1096,7 +1136,10 @@ class Store:
         """
         if not self._db.is_enabled:
             return max(self._memory_calendar) if self._memory_calendar else None
-        rows = await self._fetch("SELECT max(date) AS max_date FROM market_calendar", ())
+        rows = await self._fetch(
+            "SELECT max(date) AS max_date FROM market_calendar WHERE account_id = %s",
+            (self._acct,),
+        )
         value = rows[0]["max_date"] if rows else None
         return cast("date | None", value)
 
@@ -1110,7 +1153,10 @@ class Store:
         """
         if not self._db.is_enabled:
             return min(self._memory_calendar) if self._memory_calendar else None
-        rows = await self._fetch("SELECT min(date) AS min_date FROM market_calendar", ())
+        rows = await self._fetch(
+            "SELECT min(date) AS min_date FROM market_calendar WHERE account_id = %s",
+            (self._acct,),
+        )
         value = rows[0]["min_date"] if rows else None
         return cast("date | None", value)
 
@@ -1129,8 +1175,9 @@ class Store:
         if not self._db.is_enabled:
             return sum(1 for day in self._memory_calendar if start <= day <= end)
         rows = await self._fetch(
-            "SELECT count(*) AS sessions FROM market_calendar WHERE date BETWEEN %s AND %s",
-            (start, end),
+            "SELECT count(*) AS sessions FROM market_calendar "
+            "WHERE account_id = %s AND date BETWEEN %s AND %s",
+            (self._acct, start, end),
         )
         return int(rows[0]["sessions"]) if rows else 0
 
@@ -1147,7 +1194,8 @@ class Store:
             row = self._memory_calendar.get(local_date)
         else:
             rows = await self._fetch(
-                "SELECT open, close FROM market_calendar WHERE date = %s", (local_date,)
+                "SELECT open, close FROM market_calendar WHERE account_id = %s AND date = %s",
+                (self._acct, local_date),
             )
             row = rows[0] if rows else None
         if row is None:
@@ -1169,8 +1217,9 @@ class Store:
             closes = [row["close"] for row in self._memory_calendar.values() if row["open"] <= at]
             return max(closes) if closes else None
         rows = await self._fetch(
-            "SELECT close FROM market_calendar WHERE open <= %s ORDER BY open DESC LIMIT 1",
-            (at,),
+            "SELECT close FROM market_calendar WHERE account_id = %s AND open <= %s "
+            "ORDER BY open DESC LIMIT 1",
+            (self._acct, at),
         )
         if not rows:
             return None
@@ -1200,12 +1249,13 @@ class Store:
             return
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO account (id, equity, cash, buying_power, "
-                "options_trading_level, updated_at) VALUES (1, %s, %s, %s, %s, now()) "
-                "ON CONFLICT (id) DO UPDATE SET equity = EXCLUDED.equity, "
+                "INSERT INTO account (account_id, equity, cash, buying_power, "
+                "options_trading_level, updated_at) VALUES (%s, %s, %s, %s, %s, now()) "
+                "ON CONFLICT (account_id) DO UPDATE SET equity = EXCLUDED.equity, "
                 "cash = EXCLUDED.cash, buying_power = EXCLUDED.buying_power, "
                 "options_trading_level = EXCLUDED.options_trading_level, updated_at = now()",
                 (
+                    self._acct,
                     _as_decimal(equity),
                     _as_decimal(cash),
                     _as_decimal(buying_power),
@@ -1220,8 +1270,8 @@ class Store:
             return self._memory_account
         rows = await self._fetch(
             "SELECT equity, cash, buying_power, options_trading_level, updated_at "
-            "FROM account WHERE id = 1",
-            (),
+            "FROM account WHERE account_id = %s",
+            (self._acct,),
         )
         return rows[0] if rows else None
 
@@ -1236,11 +1286,11 @@ class Store:
             return
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO positions (symbol, payload, updated_at) "
-                "VALUES (%s, %s, now()) "
-                "ON CONFLICT (symbol) DO UPDATE SET payload = EXCLUDED.payload, "
+                "INSERT INTO positions (account_id, symbol, payload, updated_at) "
+                "VALUES (%s, %s, %s, now()) "
+                "ON CONFLICT (account_id, symbol) DO UPDATE SET payload = EXCLUDED.payload, "
                 "updated_at = now()",
-                (symbol, json.dumps(payload)),
+                (self._acct, symbol, json.dumps(payload)),
             )
             await conn.commit()
 
@@ -1249,7 +1299,10 @@ class Store:
             self._memory_positions.pop(symbol, None)
             return
         async with self._db.connection() as conn, conn.cursor() as cur:
-            await cur.execute("DELETE FROM positions WHERE symbol = %s", (symbol,))
+            await cur.execute(
+                "DELETE FROM positions WHERE account_id = %s AND symbol = %s",
+                (self._acct, symbol),
+            )
             await conn.commit()
 
     async def get_cached_positions(self) -> list[dict[str, Any]]:
@@ -1265,7 +1318,9 @@ class Store:
                 for symbol, payload in sorted(self._memory_positions.items())
             ]
         rows = await self._fetch(
-            "SELECT symbol, payload, updated_at FROM positions ORDER BY symbol", ()
+            "SELECT symbol, payload, updated_at FROM positions "
+            "WHERE account_id = %s ORDER BY symbol",
+            (self._acct,),
         )
         return rows
 
@@ -1295,11 +1350,11 @@ class Store:
             return
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO evidence (symbol, payload, updated_at) "
-                "VALUES (%s, %s, now()) "
-                "ON CONFLICT (symbol) DO UPDATE SET payload = EXCLUDED.payload, "
+                "INSERT INTO evidence (account_id, symbol, payload, updated_at) "
+                "VALUES (%s, %s, %s, now()) "
+                "ON CONFLICT (account_id, symbol) DO UPDATE SET payload = EXCLUDED.payload, "
                 "updated_at = now()",
-                (symbol, json.dumps(payload)),
+                (self._acct, symbol, json.dumps(payload)),
             )
             await conn.commit()
 
@@ -1313,8 +1368,9 @@ class Store:
         if not self._db.is_enabled:
             return self._memory_evidence.get(symbol)
         rows = await self._fetch(
-            "SELECT symbol, payload, updated_at FROM evidence WHERE symbol = %s",
-            (symbol,),
+            "SELECT symbol, payload, updated_at FROM evidence "
+            "WHERE account_id = %s AND symbol = %s",
+            (self._acct, symbol),
         )
         return rows[0] if rows else None
 
@@ -1344,9 +1400,9 @@ class Store:
             return
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO lessons (symbol, lesson, source, reflected_on) "
-                "VALUES (%s, %s, %s, %s) ON CONFLICT (reflected_on) DO NOTHING",
-                (row["symbol"], lesson, source, reflected_on),
+                "INSERT INTO lessons (account_id, symbol, lesson, source, reflected_on) "
+                "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (account_id, reflected_on) DO NOTHING",
+                (self._acct, row["symbol"], lesson, source, reflected_on),
             )
             await conn.commit()
 
@@ -1383,10 +1439,11 @@ class Store:
             return proposal_id
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO proposals (underlying, intent, evidence, status, "
+                "INSERT INTO proposals (account_id, underlying, intent, evidence, status, "
                 "llm_read, matrix_verdict) "
-                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
                 (
+                    self._acct,
                     underlying,
                     json.dumps(intent),
                     json.dumps(evidence),
@@ -1428,9 +1485,19 @@ class Store:
             return
         async with self._db.connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO llm_calls (agent, model, prompt_tokens, completion_tokens, "
-                "latency_ms, ok, error) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                (agent, model, prompt_tokens, completion_tokens, latency_ms, ok, error),
+                "INSERT INTO llm_calls (account_id, agent, model, prompt_tokens, "
+                "completion_tokens, latency_ms, ok, error) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    self._acct,
+                    agent,
+                    model,
+                    prompt_tokens,
+                    completion_tokens,
+                    latency_ms,
+                    ok,
+                    error,
+                ),
             )
             await conn.commit()
 
@@ -1477,8 +1544,8 @@ class Store:
         return await self._fetch(
             "SELECT id, proposal_id, client_order_id, submitted_at, status, request, "
             "response, filled_qty, filled_avg_price, error FROM orders "
-            "ORDER BY submitted_at DESC",
-            (),
+            "WHERE account_id = %s ORDER BY submitted_at DESC",
+            (self._acct,),
         )
 
     async def _fetch(self, sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
