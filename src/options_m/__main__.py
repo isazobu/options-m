@@ -8,24 +8,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import AsyncExitStack
 
 from options_m import __version__, migrate
-from options_m.agents import build_agents, run_agents
+from options_m.agents import run_agents
 from options_m.api import create_app
 from options_m.config import Settings
 from options_m.db import Database
 from options_m.lifecycle import install_signal_handlers
 from options_m.llm import FeatherlessLlm
 from options_m.logging_config import setup_logging
-from options_m.mcp_client import AlpacaMcp, LiveTradingRefused, assert_paper_intent
+from options_m.mcp_client import LiveTradingRefused, assert_paper_intent
 from options_m.notify import (
     TelegramNotifier,
     build_notifier,
     install_error_notifier,
     remove_error_notifier,
 )
+from options_m.runtime import assemble
 from options_m.server import build_server, serve
-from options_m.store import Store
 
 logger = logging.getLogger(__name__)
 
@@ -78,17 +79,35 @@ async def run(settings: Settings) -> None:
     )
 
     try:
-        async with Database(settings) as db, AlpacaMcp(settings) as mcp:
+        async with Database(settings) as db, AsyncExitStack() as stack:
             await migrate.apply(db)
-            store = Store(db)
-            agents = build_agents(settings, mcp, store, llm, notifier=notifier)
+            runners = await assemble(settings, db, llm, notifier, stack)
+            many = len(runners) > 1
+
+            first = runners[0]
             server = build_server(
-                create_app(db, agents, mcp=mcp, store=store, settings=settings), settings
+                create_app(
+                    db,
+                    first.agents,
+                    mcp=first.mcp,
+                    store=first.store,
+                    settings=settings,
+                ),
+                settings,
             )
 
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(serve(server, shutdown, settings), name="http")
-                tg.create_task(run_agents(agents, settings, shutdown), name="agents")
+                for runner in runners:
+                    tg.create_task(
+                        run_agents(
+                            runner.agents,
+                            settings,
+                            shutdown,
+                            label=runner.name if many else None,
+                        ),
+                        name=f"agents:{runner.name}" if many else "agents",
+                    )
     finally:
         # Detach the bridge first: shutdown-path errors must not queue messages
         # onto a notifier that is already draining for the last time.
