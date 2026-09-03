@@ -56,6 +56,12 @@ _STRIKE_BAND = 0.25
 _TERMINAL_UNFILLED_STATES = frozenset(
     {"canceled", "cancelled", "expired", "rejected", "replaced", "done_for_day"}
 )
+# Alpaca accepts a replace only against an order that is still working; every
+# other state answers with a 422 "order is not open". An allowlist rather than
+# a denylist of the terminal states: a status we do not recognise must skip the
+# reprice, because the cost of skipping one rung is a slower exit, while the
+# cost of a wrong replace is a broker rejection in the reconcile path.
+_REPLACEABLE_ORDER_STATES = frozenset({"new", "accepted", "partially_filled", "held"})
 # Keys an Alpaca order object may carry an explanation under. None is standard,
 # so this is best-effort — the status string is the fallback.
 _BROKER_REASON_KEYS = ("reason", "reject_reason", "rejected_reason", "cancel_reason")
@@ -936,6 +942,9 @@ class ExecutionAgent:
             or self._settings.close_reprice_max_attempts == 0
         ):
             return broker_order
+        status = str(broker_order.get("status") or "").strip().lower()
+        if status not in _REPLACEABLE_ORDER_STATES:
+            return broker_order
         request = order.get("request")
         submitted_at = order.get("submitted_at")
         if not isinstance(request, dict) or not isinstance(submitted_at, datetime):
@@ -965,10 +974,23 @@ class ExecutionAgent:
         if current is not None and current >= target:
             return broker_order
 
-        replacement = await self._mcp.replace_order_by_id(
-            order_id,
-            limit_price=_decimal_str(target),
-        )
+        try:
+            replacement = await self._mcp.replace_order_by_id(
+                order_id,
+                limit_price=_decimal_str(target),
+            )
+        except Exception:
+            # The order can fill or cancel between the read above and this
+            # write, and the broker refuses the replace. Reconciliation must
+            # continue regardless: the status just read still has to be
+            # persisted, or the row stays in flight and the next tick sends
+            # the same doomed replace again, forever.
+            logger.warning(
+                "close reprice failed",
+                extra={"client_order_id": client_order_id, "order_id": order_id},
+                exc_info=True,
+            )
+            return broker_order
         if "error" in replacement:
             logger.warning(
                 "close reprice rejected",

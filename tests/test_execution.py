@@ -12,6 +12,8 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+from fastmcp.exceptions import ToolError
+
 from options_m.agents.execution import (
     ExecutionAgent,
     _build_closing_legs,
@@ -489,13 +491,17 @@ async def test_kill_switch_leaves_an_open_proposal_pending() -> None:
     assert proposal["status"] == "pending"
 
 
-async def test_reconcile_reprices_a_stale_close_order_up_the_ladder() -> None:
-    settings = Settings(
+def _reprice_settings() -> Settings:
+    return Settings(
         database_url=None,
         dry_run=False,
         close_reprice_seconds=1,
         close_reprice_max_attempts=3,
     )
+
+
+async def _stale_close_order(settings: Settings) -> tuple[Store, str]:
+    """A close order old enough that reconcile owes it one rung of reprice."""
     store = Store(Database(settings))
     proposal_id = await store.save_proposal(
         underlying="AAPL",
@@ -503,9 +509,10 @@ async def test_reconcile_reprices_a_stale_close_order_up_the_ladder() -> None:
         evidence={},
         status="submitted",
     )
+    client_order_id = f"omc-{proposal_id}"
     await store.record_order(
         proposal_id=proposal_id,
-        client_order_id=f"omc-{proposal_id}",
+        client_order_id=client_order_id,
         status="new",
         request={
             "action": "close",
@@ -515,9 +522,15 @@ async def test_reconcile_reprices_a_stale_close_order_up_the_ladder() -> None:
             "limit_price": "2.00",
         },
     )
-    store._memory_orders[f"omc-{proposal_id}"]["submitted_at"] = (
-        datetime.now(UTC) - timedelta(seconds=2.1)
+    store._memory_orders[client_order_id]["submitted_at"] = datetime.now(UTC) - timedelta(
+        seconds=2.1
     )
+    return store, client_order_id
+
+
+async def test_reconcile_reprices_a_stale_close_order_up_the_ladder() -> None:
+    settings = _reprice_settings()
+    store, _client_order_id = await _stale_close_order(settings)
     mcp = MagicMock()
     mcp.get_order_by_client_id = AsyncMock(
         return_value={
@@ -544,3 +557,65 @@ async def test_reconcile_reprices_a_stale_close_order_up_the_ladder() -> None:
         "broker-1", limit_price="3.00"
     )
     assert detail["repriced"] == 1
+
+
+async def test_reconcile_does_not_reprice_an_order_that_is_no_longer_open() -> None:
+    """Alpaca answers a replace against a settled order with a 422.
+
+    Repricing on elapsed time alone sent that replace to a filled order, and
+    the 422 escaped before the fill was written — so the row stayed in flight
+    and every later tick replayed the same dead replace.
+    """
+    settings = _reprice_settings()
+    store, client_order_id = await _stale_close_order(settings)
+    mcp = MagicMock()
+    mcp.get_order_by_client_id = AsyncMock(
+        return_value={
+            "id": "broker-1",
+            "status": "filled",
+            "filled_qty": "1",
+            "filled_avg_price": "2.05",
+            "limit_price": "2.00",
+        }
+    )
+    mcp.replace_order_by_id = AsyncMock()
+    agent = ExecutionAgent(settings, mcp, store, MagicMock())
+
+    await agent._reconcile({"reconciled": 0, "broker_rejected": 0})
+
+    mcp.replace_order_by_id.assert_not_awaited()
+    assert store._memory_orders[client_order_id]["status"] == "filled"
+    assert await store.orders_in_flight() == []
+
+
+async def test_reconcile_still_records_the_order_when_a_reprice_is_refused() -> None:
+    """The order can settle between the read and the replace.
+
+    Losing that race is not a reconcile failure: the status just read still
+    has to reach the store, or the order never leaves the in-flight list.
+    """
+    settings = _reprice_settings()
+    store, client_order_id = await _stale_close_order(settings)
+    mcp = MagicMock()
+    mcp.get_order_by_client_id = AsyncMock(
+        return_value={
+            "id": "broker-1",
+            "status": "new",
+            "filled_qty": "0",
+            "limit_price": "2.00",
+        }
+    )
+    mcp.replace_order_by_id = AsyncMock(
+        side_effect=ToolError(
+            "HTTP error 422: Unprocessable Entity - "
+            "{'code': 42210000, 'message': 'order is not open'}"
+        )
+    )
+    agent = ExecutionAgent(settings, mcp, store, MagicMock())
+    detail: dict[str, Any] = {"reconciled": 0, "broker_rejected": 0}
+
+    await agent._reconcile(detail)
+
+    assert detail["reconciled"] == 1
+    assert detail.get("repriced", 0) == 0
+    assert store._memory_orders[client_order_id]["status"] == "new"
