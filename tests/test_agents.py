@@ -89,22 +89,7 @@ async def test_run_agents_waits_when_none_registered() -> None:
     await asyncio.wait_for(task, timeout=1)
 
 
-async def test_a_label_namespaces_the_agent_logger(caplog: pytest.LogCaptureFixture) -> None:
-    """A label prefixes the logger child and the telemetry extra."""
-    agent = _CountingAgent("market_pulse")
-    shutdown = asyncio.Event()
-    with caplog.at_level(logging.INFO, logger="options_m.agents"):
-        task = asyncio.create_task(run_agent(agent, _settings(), shutdown, label="b"))
-        await asyncio.sleep(0.03)
-        shutdown.set()
-        await asyncio.wait_for(task, timeout=1)
-
-    records = [r for r in caplog.records if r.name == "options_m.agents.b.market_pulse"]
-    assert records, "expected log records under the labelled child logger"
-    assert any(getattr(r, "profile", None) == "b" for r in records)
-
-
-async def test_no_label_keeps_the_original_logger_name(caplog: pytest.LogCaptureFixture) -> None:
+async def test_uses_the_agent_name_as_the_logger_child(caplog: pytest.LogCaptureFixture) -> None:
     agent = _CountingAgent("market_pulse")
     shutdown = asyncio.Event()
     with caplog.at_level(logging.INFO, logger="options_m.agents"):

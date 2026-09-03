@@ -95,19 +95,10 @@ def build_agents(
     return agents
 
 
-async def run_agent(
-    agent: Agent, settings: Settings, shutdown: asyncio.Event, *, label: str | None = None
-) -> None:
-    """Drive one agent until shutdown, isolating and backing off on errors.
-
-    ``label``, when given, prefixes the logger child and the telemetry
-    ``extra`` so concurrent stacks stay distinguishable in the logs. Unset
-    leaves the output exactly as it was.
-    """
-    log = logger.getChild(f"{label}.{agent.name}" if label else agent.name)
+async def run_agent(agent: Agent, settings: Settings, shutdown: asyncio.Event) -> None:
+    """Drive one agent until shutdown, isolating and backing off on errors."""
+    log = logger.getChild(agent.name)
     extra_base: dict[str, object] = {"agent": agent.name}
-    if label is not None:
-        extra_base["profile"] = label
     consecutive_failures = 0
     log.info(
         "agent started",
@@ -149,27 +140,13 @@ async def run_agent(
     log.info("agent stopped", extra=extra_base)
 
 
-async def run_agents(
-    agents: list[Agent],
-    settings: Settings,
-    shutdown: asyncio.Event,
-    *,
-    label: str | None = None,
-) -> None:
-    """Run every agent concurrently until shutdown is requested.
-
-    ``label`` is an optional identifier for this group, threaded into each
-    :func:`run_agent` and the task names.
-    """
+async def run_agents(agents: list[Agent], settings: Settings, shutdown: asyncio.Event) -> None:
+    """Run every agent concurrently until shutdown is requested."""
     if not agents:
-        logger.warning("no agents registered", extra={"profile": label} if label else None)
+        logger.warning("no agents registered")
         await shutdown.wait()
         return
 
-    prefix = f"agent:{label}:" if label else "agent:"
     async with asyncio.TaskGroup() as tg:
         for agent in agents:
-            tg.create_task(
-                run_agent(agent, settings, shutdown, label=label),
-                name=f"{prefix}{agent.name}",
-            )
+            tg.create_task(run_agent(agent, settings, shutdown), name=f"agent:{agent.name}")

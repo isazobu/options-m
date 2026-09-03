@@ -1,4 +1,4 @@
-"""Print one summary line per profile from the database.
+"""Print a one-line account summary from the database.
 
 Read-only. Needs DATABASE_URL pointed at the same Postgres the service uses
 (the in-memory fallback is per-process and not visible here).
@@ -9,12 +9,10 @@ Usage: python scripts/summary.py
 from __future__ import annotations
 
 import asyncio
-import os
 from typing import Any
 
 from options_m.config import Settings
 from options_m.db import Database
-from options_m.runtime import load_profiles
 
 
 async def _one(cur: Any, sql: str, params: tuple[Any, ...]) -> tuple[Any, ...] | None:
@@ -23,8 +21,6 @@ async def _one(cur: Any, sql: str, params: tuple[Any, ...]) -> tuple[Any, ...] |
 
 
 async def _names(cur: Any) -> list[str]:
-    """Profile order first (from PROFILES), then any other ids present."""
-    ordered = [profile.name for profile in load_profiles(Settings())]
     await cur.execute(
         "SELECT DISTINCT account_id FROM ("
         "  SELECT account_id FROM equity_curve"
@@ -32,9 +28,7 @@ async def _names(cur: Any) -> list[str]:
         "  UNION SELECT account_id FROM proposals"
         ") s"
     )
-    seen = {row[0] for row in await cur.fetchall()}
-    tail = sorted(seen - set(ordered))
-    return [name for name in [*ordered, *tail] if name in seen or name in ordered]
+    return sorted(row[0] for row in await cur.fetchall())
 
 
 def _pct(first: float | None, last: float | None) -> str:
@@ -113,9 +107,6 @@ async def main() -> None:
                 f"{fills:>6} {open_count:>5} {_money(unreal):>12} "
                 f"{float(closed_sum):>+11.3f} (n={closed_n})"
             )
-
-    if os.environ.get("PROFILES") is None:
-        print("\n(PROFILES unset — 'default' only)")
 
 
 if __name__ == "__main__":
