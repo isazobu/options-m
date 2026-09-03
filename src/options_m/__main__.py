@@ -83,6 +83,12 @@ async def run(settings: Settings) -> None:
             await migrate.apply(db)
             runners = await assemble(settings, db, llm, notifier, stack)
             many = len(runners) > 1
+            if many:
+                logger.warning(
+                    "multiple PROFILES configured; the dashboard and admin API only see "
+                    "the first profile's positions, orders and kill switch",
+                    extra={"profiles": [runner.name for runner in runners]},
+                )
 
             first = runners[0]
             server = build_server(
@@ -102,7 +108,7 @@ async def run(settings: Settings) -> None:
                     tg.create_task(
                         run_agents(
                             runner.agents,
-                            settings,
+                            runner.settings,
                             shutdown,
                             label=runner.name if many else None,
                         ),
