@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "options-m"
 version = "0.1.0"
-description = "Options-M application skeleton."
+description = "Autonomous options-trading agent: five async agents evaluate, decide, execute, and review options trades end-to-end."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Proprietary" }
@@ -73,7 +73,10 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101"]
+# S105/S106: fixture strings like "S2" or "BASESECRET" trip bandit's
+# hardcoded-password heuristic, but they are dummy test credentials, not
+# real secrets.
+"tests/*" = ["S101", "S105", "S106"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -81,9 +84,10 @@ strict = true
 warn_unreachable = true
 files = ["src", "tests"]
 
-# fastmcp is a large surface and not fully typed; keep the exemption narrow.
+# fastmcp and alpaca-mcp-server are large surfaces and not fully typed; keep
+# the exemption narrow.
 [[tool.mypy.overrides]]
-module = ["fastmcp.*", "mcp.*"]
+module = ["fastmcp.*", "mcp.*", "alpaca_mcp_server.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

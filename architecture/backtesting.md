@@ -1,23 +1,24 @@
 # Backtesting Guide
 
-## Yaklaşım: Pipeline Replay
+## Approach: Pipeline Replay
 
-options-m'nin backtest yöntemi **pipeline replay**'dir — stratejiyi sıfırdan
-yeniden yazmak yerine, üretim kodunun kendisini geçmiş veriye karşı çalıştırır.
+options-m's backtest method is **pipeline replay** — instead of rewriting the
+strategy from scratch, it runs the production code itself against historical
+data.
 
 ```
 run.py
   │
   ├── AsOfMcp (backtests/asof.py)
-  │     AlpacaMcp'nin read interface'ini implement eder
-  │     MCP çağrıları yerine Alpaca tarihsel API'sinden önbelleğe alınmış
-  │     veri döndürür — EvidenceCollector ve strategy_builder bunu bilmez
+  │     Implements AlpacaMcp's read interface.
+  │     Returns cached data from Alpaca's historical API instead of live MCP
+  │     calls — EvidenceCollector and strategy_builder have no idea.
   │
-  ├── frozen_clock (backtests/clock.py)
-  │     strategy_builder, risk, evidence ve execution içindeki date.today() /
-  │     datetime.now() çağrılarını replay tarihine sabitler
+  ├── frozen_at (backtests/clock.py)
+  │     Pins every date.today() / datetime.now() call inside strategy_builder,
+  │     risk, evidence, execution, and strategist to the replay date.
   │
-  └── Çalıştırılan üretim kodu (hiçbiri değiştirilmez):
+  └── Production code that runs unchanged:
         EvidenceCollector.collect()
         matrix.decide()
         fetch_chain_window()
@@ -25,270 +26,286 @@ run.py
         RiskEngine.evaluate()
 ```
 
-**Neden bu önemli:** Pipelini yeniden yazan bir backtest, yeniden yazmayı
-ölçer. Burada ölçülen şey gerçek üretim kararıdır.
+**Why this matters:** a backtest that rewrites the pipeline measures the
+rewrite. What's measured here is the actual production decision.
 
 ---
 
-## Hızlı Başlangıç
+## Quick Start
+
+Each run directory's `raw/` folder (historical stock bars, option contracts,
+and option bars) is gitignored — it's ~13MB of cached Alpaca CLI output,
+re-fetchable from the parameters and SHA-256 digests recorded in that run's
+`data_fingerprint.json`. Re-fetch it with the same `alpaca` CLI and parameters
+before running an existing replay on a fresh clone.
 
 ```bash
-# 1. Alpaca credentials'larını ayarla
-export ALPACA_API_KEY=...
-export ALPACA_SECRET_KEY=...
-
-# 2. Var olan replay çalıştır
+# Results are written as JSON; analyse.py reads them and prints a table
 python backtests/runs/2026-08-30_universe_agent-replay_1Day/run.py
 python backtests/runs/2026-08-30_universe_agent-replay_1Day/analyse.py
-
-# 3. Sonuçlar JSON olarak yazılır; analyse.py bunları okur ve tablo basar
 ```
 
-Ham veriler ve SHA-256 parmak izleri `raw/` ve `data_fingerprint.json`
-dosyalarına yazılır. Fetch adımından sonra ağ çağrısı olmaz.
+Once `raw/` is populated, `run.py` makes no network calls at all — `AsOfMcp`
+reads straight from the cached JSON files.
 
 ---
 
-## Yeni Bir Replay Çalıştırmak
+## Running a New Replay
 
-### Yapı
+### Layout
 
 ```
-backtests/runs/<YYYY-MM-DD>_<açıklama>/
-├── run.py          # veri çekme + pipeline + sonuçları kaydet
-├── analyse.py      # kaydedilmiş sonuçları oku + rapor yazdır
-└── notes.md        # varsayımlar, sapmalar, yorumlar
+backtests/runs/<YYYY-MM-DD>_<description>/
+├── run.py          # fetch data + run pipeline + save results
+├── analyse.py      # read saved results + print report
+└── notes.md        # assumptions, deviations, observations
 ```
 
-### run.py'de minimum yapı
+### Minimum structure for run.py
 
 ```python
 from datetime import date
-from backtests.asof import AsOfMcp
-from backtests.clock import frozen_clock
+from pathlib import Path
+from backtests.asof import AsOfMcp, StubStore
+from backtests.clock import frozen_at
 from options_m.evidence.evidence import EvidenceCollector
 from options_m.matrix import decide
-from options_m.agents.execution import fetch_chain_window
 from options_m import strategy_builder
 from options_m.risk import RiskEngine
 from options_m.config import Settings
 from options_m.models import RegimeRead
 
+RAW_DIR = Path(__file__).resolve().parent / "raw"  # populated ahead of time
 REPLAY_DATES = [date(2026, 8, 25), date(2026, 8, 26), ...]
-SPREAD_PCT = 0.02  # modellenen bid/ask yarı-yayılım
+SPREAD_PCT = 0.02  # modelled bid/ask half-spread
 SETTINGS = Settings()
+STORE = StubStore()
 
 for replay_date in REPLAY_DATES:
-    mcp = AsOfMcp(replay_date, spread_pct=SPREAD_PCT)
-    await mcp.fetch(SETTINGS.universe_symbols)   # Alpaca'dan veri çek + cache'le
+    mcp = AsOfMcp(RAW_DIR, as_of=replay_date, spread_pct=SPREAD_PCT)
 
-    with frozen_clock(replay_date):
-        evidence = EvidenceCollector(SETTINGS, mcp, store)
+    with frozen_at(replay_date):
+        evidence = EvidenceCollector(SETTINGS, mcp, STORE)
         for symbol in SETTINGS.universe_symbols:
             pack = await evidence.collect(symbol, ...)
             regime = RegimeRead(thesis="...", invalidation="...", conviction=0.70)  # LLM stub
             decision = decide(pack, regime, settings=SETTINGS, as_of=replay_date)
             if hasattr(decision, 'strategy'):
-                # strategy_builder + RiskEngine + kayıt...
+                # strategy_builder + RiskEngine + persist...
 ```
 
-### Kritik kurallar
+### Critical rules
 
-- `AsOfMcp` her replay gününden önce `fetch()` ile ısıtılmalıdır — bu Alpaca'yı çağırır
-- `frozen_clock` context manager, strateji ve risk kodu çalışırken aktif olmalıdır
-- LLM çağrısı ya sabitlenmeli (üretim-dışı conviction ile) ya da gerçekten çalıştırılmalıdır.
-  Sabitlemek kararlılık sağlar ve üretim sonuçlarının üst sınırını verir
-- `AsOfMcp` yalnızca read metodlarını implement eder: `place_option_order` yok
+- `AsOfMcp` reads synchronously from the cached JSON files in `raw/` at
+  construction time — it makes no network calls itself, so `raw/` must
+  already be populated before the replay starts.
+- The `frozen_at` context manager must be active while strategy and risk
+  code runs.
+- The LLM call must either be stubbed (with an off-production conviction) or
+  actually executed. Stubbing gives repeatability and measures an upper bound
+  on production results.
+- `AsOfMcp` implements only read methods: there is no `place_option_order`.
 
 ---
 
-## Veri Kısıtları ve Etkileri
+## Data Constraints and Their Effects
 
-Bu kısıtlar veri kaynağının doğasından gelir — bunları düzeltmek mümkün değil.
+These constraints come from the nature of the data source — they cannot be
+fixed.
 
-### 1. Tarihsel opsiyon kotasyonu yok — spread modellenmek zorunda
+### 1. No historical option quotes — spread must be modelled
 
-Alpaca tarihsel opsiyon **bar** ve **trade** verisi sağlar ama geçmiş
-**quote** verisi yoktur. `AsOfMcp` şunu yapar:
+Alpaca provides historical option **bar** and **trade** data, but no
+historical **quote** data. `AsOfMcp` does the following:
 
 ```
-mid  = o günkü opsiyon bar kapanışı
+mid  = that day's option bar close
 bid  = mid × (1 − spread_pct)
 ask  = mid × (1 + spread_pct)
 ```
 
-Her ikisi de gerçek tick grid'e yuvarlanır (3.00$'ın altında $0.01, üstünde $0.05).
+Both are rounded to the real tick grid ($0.01 below $3.00, $0.05 above).
 
-**Pratik etki:** `MAX_SPREAD_PCT` kapısı bir varsayımı filtreler. Bu nedenle
-çalıştırmalar `spread_pct`'yi sabit bir değer kullanmak yerine **süpürür**:
+**Practical effect:** the `MAX_SPREAD_PCT` gate filters on an assumption. For
+that reason, runs **sweep** `spread_pct` rather than using a single fixed
+value:
 
-| `spread_pct` | Yapılan işlem | P&L |
+| `spread_pct` | Trades made | P&L |
 |---|---|---|
 | 0.5% | 5 | +$2,057 |
-| 2% (başlık) | 5 | +$1,993 |
+| 2% (headline) | 5 | +$1,993 |
 | 5% | 5 | +$1,755 |
 | 10% | 5 | +$404 |
 
-Tablo 0.5%–5% arası kararlıysa sonuç güvenilirdir.
+If the table is stable across 0.5%–5%, the result is reliable.
 
-### 2. IV ve delta modellenir, alınmaz
+### 2. IV and delta are modelled, not observed
 
-Tarihsel snapshotlar IV veya greeks taşımaz — üretim feed'inin de taşımadığı
-gibi. Her ikisi de `None` olarak gelir ve projenin kendi Black-Scholes çözücüsü
-devreye girer. Bu, üretim kodu yolunun aynısıdır, backtest'e özel bir kısayol değil.
+Historical snapshots carry no IV or greeks — neither does the production
+feed. Both come back as `None`, and the project's own Black-Scholes solver
+takes over. This is the same production code path, not a backtest-only
+shortcut.
 
-### 3. Açık faiz nokta-in-zamanlı değil (hafif ileriye bakış)
+### 3. Open interest is not point-in-time (slight look-ahead)
 
-`open_interest` Alpaca'nın contracts endpoint'inden gelir ve tek bir
-`open_interest_date` damgası taşır (birkaç gün öncesinden). Bugün için `OI` filtresi
-birkaç günlük ileriye bakış içerir. Açık faiz yavaş hareket ettiği için
-distorsiyon küçüktür ama gerçek ve kaldırılabilir değildir.
+`open_interest` comes from Alpaca's contracts endpoint and carries a single
+`open_interest_date` stamp (a few days stale). The `OI` filter for today
+includes a few days of look-ahead. Because open interest moves slowly the
+distortion is small, but it is real and cannot be removed.
 
-### 4. İşlem yapılmayan kontrat o günün chain'inde yok
+### 4. A contract with no trades that day is absent from that day's chain
 
-15.684 kontratın 11.888'i pencerede bar taşır. Günde işlem yapılmaması, quote
-kaynağı olmadığı anlamına gelir; bu hem ham bir likidite filtresi hem de seçilebilir
-kümeyi likit strike'lara doğru önyargılar.
+11,888 of 15,684 contracts carry a bar within the window. No trade on a given
+day means no quote source; this is both a raw liquidity filter and a bias in
+the selectable set toward liquid strikes.
 
-### 5. Günlük granülarite
+### 5. Daily granularity
 
-Çalışma günde bir kez değerlendirme yapar. Gün içi girişler, gün içi kapı
-değişiklikleri ve aynı gün çıkışlar günlük barlarla temsil edilemez.
+A run evaluates once per day. Intraday entries, intraday gate changes, and
+same-day exits cannot be represented with daily bars.
 
 ---
 
-## LLM Backtesting Seçenekleri
+## LLM Backtesting Options
 
-### Seçenek A — Sabitle (önerilen)
+### Option A — Stub it (recommended)
 
 ```python
 regime = RegimeRead(thesis="stubbed", invalidation="stubbed", conviction=0.70)
 ```
 
-- **Avantaj:** Tamamen tekrarlanabilir; ağ çağrısı yok; üst sınır ölçülür
-- **Dezavantaj:** Conviction veto göz ardı edilir; 0.70 seçimi sonuçları etkiler
-- **Ne zaman kullanılır:** Matris mantığını, strateji inşasını veya risk
-  limitlerini test ederken
+- **Pro:** fully repeatable; no network calls; measures an upper bound.
+- **Con:** the conviction veto is bypassed; the 0.70 choice affects results.
+- **When to use:** when testing matrix logic, strategy construction, or risk
+  limits.
 
-### Seçenek B — Gerçek LLM
+### Option B — Real LLM
 
-`RegimeRead` döndürmek için asıl `StrategistAgent._run()` çağrısını kullanın
-(LLM etkin, bir API anahtarıyla).
+Call the actual `StrategistAgent._run()` to produce `RegimeRead` (LLM
+enabled, with an API key).
 
-- **Avantaj:** Conviction dağılımı gerçekçi; sistem daha bütünsel test edilir
-- **Dezavantaj:** Token maaliyeti; farklı çalıştırmalarda farklı sonuçlar;
-  LLM'nin "bugün" varsayımıyla halüsinasyon riski var
-- **Ne zaman kullanılır:** Tam uçtan uca doğrulamada; çıktıları loglayarak
+- **Pro:** conviction distribution is realistic; the system is tested more
+  holistically.
+- **Con:** token cost; different results across runs; hallucination risk from
+  the LLM's assumption of "today".
+- **When to use:** for full end-to-end validation, logging the outputs.
 
 ---
 
-## En Etkili Backtest Nasıl Yapılır
+## How to Run the Most Effective Backtest
 
-### Güvenilir bulgular için minimum çubuk
+### Minimum bar for reliable findings
 
-| Gereksinim | Neden |
+| Requirement | Why |
 |---|---|
-| **≥ 50 karar** | İstatistiksel anlam için — birkaç işlem "win rate" değil ögrenme |
-| **Birden fazla piyasa rejimi** | Yalnızca trend veya yalnızca yatay; her ikisi de gerekli |
-| **`spread_pct` süpürün** | Spread varsayımının sonuçları değiştirip değiştirmediğini anlayın |
-| **Sabit LLM conviction** | Belirsizlik kaynaklarını izole edin; önce determinizmi test edin |
+| **≥ 50 decisions** | For statistical meaning — a handful of trades is not a "win rate", it's noise. |
+| **More than one market regime** | Trend-only or range-only isn't enough; both are needed. |
+| **Sweep `spread_pct`** | Shows whether the spread assumption changes the results. |
+| **Fixed LLM conviction** | Isolates sources of uncertainty; test determinism first. |
 
-### Parametre hassasiyeti
+### Parameter sensitivity
 
-Konfigürasyon değerlerini değiştirirken her değişken için ayrı çalıştırmalar
-yapın. Aşağıdakiler en etkili kaldıraçlardır:
+Run separate replays per variable when changing configuration values. The
+following are the most effective levers:
 
 ```python
-# Matris sinyal kalitesi
-CONVICTION_FLOOR          # düşürmek → daha fazla işlem, daha gürültülü sinyal
-# Yeterince test edilmemiş: IV nötr band henüz yok (bkz. Kısıtlamalar)
+# Matrix signal quality
+CONVICTION_FLOOR          # lower -> more trades, noisier signal
+# Not well tested yet: no IV-neutral band (see Constraints)
 
-# Risk limitleri
-MAX_CONCURRENT_POSITIONS  # 5'ten büyük = kötü deselerden kaçınılmaz
-MAX_PREMIUM_PCT_PER_TRADE # boyutlandırma etkisi
-DAILY_LOSS_HALT_PCT       # ne kadar agresif durduruluyor
+# Risk limits
+MAX_CONCURRENT_POSITIONS  # above 5 = bad days become unavoidable
+MAX_PREMIUM_PCT_PER_TRADE # sizing effect
+DAILY_LOSS_HALT_PCT       # how aggressively trading halts
 
-# Yapı parametreleri
-DTE_TARGET_MIN/MAX        # 21-38 şu an; daha kısa/uzun ne değiştirir
-SHORT_DELTA_DEFAULT       # 0.25 şu an; 0.20 vs 0.30
+# Structure parameters
+DTE_TARGET_MIN/MAX        # currently 7-14; what shorter/longer changes
+SHORT_DELTA_DEFAULT       # currently 0.25; 0.20 vs 0.30
 ```
 
-### Walk-forward testi
+### Walk-forward testing
 
-Tek bir tarih aralığı için optimize etmek overfit eder. Bunun yerine:
+Optimizing for a single date range overfits. Instead:
 
 ```
-Eğitim penceresi: [tarih_A, tarih_B]  ← parametre seçimi
-Test penceresi:   [tarih_B, tarih_C]  ← eğitimde görmeden değerlendirme
+Training window: [date_A, date_B]  ← parameter selection
+Test window:     [date_B, date_C]  ← evaluation without having seen it in training
 ```
 
-Mevcut harness bunu doğal olarak destekler — farklı tarih listeleriyle iki
-ayrı çalıştırma yapın.
+The current harness supports this naturally — run two separate replays with
+different date lists.
 
-### Çıkış mantığı gerçek bir kontratla çerçevelemenin önünde
+### Exit logic
 
-Şu anda çalıştırmalar pozisyonları kapanışta işaret eder, çünkü
-`PositionManagerAgent` henüz sadece kar hedefi/stop-loss tetikçileri üzerinden
-çıkışları yönetiyor. Her çalıştırma **giriş kararlarını** test eder; **sistem
-çıkış kararlarını** değil.
+The `2026-08-30_universe_agent-replay_1Day` run marks positions at the close
+and tests only **entry decisions**, not exits — profits there are understated
+(the closing half-spread is not deducted) and holding-period realism is
+limited.
 
-Bu, karların hafife alındığı anlamına gelir (kapanış yarı-yayılımı
-düşürülmemiştir) ve taşıma süresinin gerçekçi olmadığı anlamına gelir.
+The `exit-flow` and `exit-rules-v2` runs extend the harness to also replay the
+five-rung exit ladder in `options_m/exits.py` (expiry, DTE stop, stop-loss,
+profit target, time stop) day by day, so a proposed close can actually fill on
+the next session's open. See those runs' `notes.md` for the caveats specific
+to exit replay (n=1 per week, no historical option quotes, Friday closes never
+get a fill day in the window).
 
 ---
 
-## Sonuçları Yorumlama
+## Interpreting Results
 
-### Her zaman raporlanması gerekenler
+### Always report these
 
-| Metrik | Neden |
+| Metric | Why |
 |---|---|
-| Karar sayısı | Gözlem başına istatistik güvenilirliğini sınırlandırır |
-| `spread_pct` süpürme tablosu | Spread varsayımı etkisini gösterir |
-| Yapı ailesi döküm | Hangi strateji türleri seçildi |
-| Reddedilen → neden | Hangi kapılar ateşlendi |
-| Ileriye bakış uyarısı | OI ve spread modeli her ikisi de |
+| Number of decisions | Bounds statistical confidence per observation. |
+| `spread_pct` sweep table | Shows the spread assumption's effect. |
+| Structure family breakdown | Which strategy types were chosen. |
+| Rejected → why | Which gates fired. |
+| Look-ahead disclosure | Both the OI and spread model. |
 
-### Güvenilir olmayan şeyler
+### What not to trust
 
-- Kesin P&L rakamları (spread modeli ± komisyonlar)
-- Sharpe oranı (günlük granülaritede birkaç gözlemden)
-- "Bu parametre daha iyidir" sonuçları tek bir haftalık pencere üzerinden
+- Exact P&L figures (spread model ± commissions).
+- Sharpe ratio (from a handful of daily-granularity observations).
+- "This parameter is better" conclusions from a single one-week window.
 
-### Güvenilir olan şeyler
+### What to trust
 
-- Hangi kapılar ateşlendi ve ne sıklıkla
-- Belirli konfigürasyonlarla kaç işlem yapılır
-- Hangi reddetme nedenleri baskın (kötü sinyal kalitesini tanımlar)
-- `spread_pct` 0.5%–5% arasında istikrarlıysa, spread modeli dominant değildir
-
----
-
-## Mevcut Açık Backtest Soruları
-
-Bu konular doğrudan harness üzerinde yanıtlanabilir:
-
-1. **IV nötr band etkisi** — IV/RV'nin 0.85–1.10 arasındaki kararlar için bir
-   "hold" bölgesi eklemek `long_strangle` seçimini ne kadar azaltır?
-
-2. **Kanat yakalama toleransı** — Yerel yerine global minimum gap düzeltilirse
-   kaç ek yapı inşa edilebilir? (AMD bunu haftalık olarak etkiliyordu)
-
-3. **Conviction eşiği kalibrasyonu** — 0.55 uygun mu yoksa daha yüksek mi
-   olmalı? Gerçek LLM conviction dağılımını sabit stub değil, bir aralıkta
-   süpürerek ölçün
-
-4. **Çıkış simülasyonu** — Basit kar hedefi/stop (örn. %50 kazanınca çık,
-   -%100'de çık) kodu yokken bile harness'ta simüle edilebilir ve giriş
-   kararları üzerindeki etkiyi gösterir
+- Which gates fired, and how often.
+- How many trades a given configuration makes.
+- Which rejection reasons dominate (defines poor signal quality).
+- If `spread_pct` is stable across 0.5%–5%, the spread model is not dominant.
 
 ---
 
-## Önemli Açıklama
+## Current Open Backtest Questions
 
-> Bu backtest hipotetik bir tarihsel simülasyondur ve gerçek işlem
-> performansını temsil etmez. Geçmişe yönelik sonuçlar gelecekteki sonuçları
-> garanti etmez. Sonuçlar; piyasa verisi kalitesi, veri akışı seçimi,
-> kurumsal eylem işleme, ücretler, kayma, likidite, vergi, yürütme
-> varsayımları ve uygulama ayrıntılarına bağlıdır. Bu materyal yalnızca
-> araştırma ve eğitim amaçlıdır.
+These can be answered directly on the harness:
+
+1. **IV-neutral band effect** — how much does adding a "hold" zone for
+   decisions where IV/RV sits between 0.85–1.10 reduce `long_strangle`
+   selection?
+
+2. **Wing-snap tolerance** — if the local minimum gap is corrected to a
+   global one instead, how many additional structures can be built? (AMD hit
+   this weekly.)
+
+3. **Conviction threshold calibration** — is 0.55 right, or should it be
+   higher? Measure by sweeping a real LLM conviction distribution over a
+   range, not a fixed stub.
+
+4. **Exit rule tuning** — now that `exit-flow`/`exit-rules-v2` replay the exit
+   ladder, sweep `EXIT_CREDIT_PROFIT_TARGET_PCT` / `EXIT_CREDIT_STOP_LOSS_PCT`
+   / `EXIT_TIME_STOP_DAYS` against a longer window to see which rung dominates
+   outcomes.
+
+---
+
+## Important Disclosure
+
+> This backtest is a hypothetical historical simulation and does not
+> represent actual trading performance. Past results do not guarantee future
+> results. Results depend on market data quality, data feed selection,
+> corporate action handling, fees, slippage, liquidity, taxes, execution
+> assumptions, and implementation details. This material is for research and
+> educational purposes only.

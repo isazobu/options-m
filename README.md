@@ -1,8 +1,17 @@
 # options-m
 
-A long-running Python service: several agent loops running concurrently
-alongside an admin HTTP interface, in a single asyncio process, shutting down
-cleanly on SIGTERM. No business logic yet — this is the base to build on.
+An autonomous options-trading agent. Five specialised agents run concurrently
+in a single asyncio process, sharing state through Postgres: one watches the
+market and scores candidates, one tracks open positions, one reasons about
+market regime and picks a strategy, one executes and manages risk, and one
+reviews outcomes to feed lessons back into future decisions. No orchestration
+framework — the supervisor is a small, generic loop; all trading logic lives
+in the agent modules.
+
+Every decision — trade or no-trade — is stored with its full reasoning, so any
+outcome can be traced back step by step. See `architecture/business.md` for
+the product-level walkthrough and `architecture/technical.md` for the data
+flow and cache tables.
 
 ## Requirements
 
@@ -16,18 +25,33 @@ cleanly on SIGTERM. No business logic yet — this is the base to build on.
 options-m/
 ├── src/options_m/
 │   ├── __main__.py          # entry point: starts agents + HTTP together
-│   ├── agents.py            # agent protocol, supervision, retry/backoff
-│   ├── api.py               # /health, /ready, admin dashboard
-│   ├── config.py            # env-driven settings
-│   ├── db.py                # Postgres connection pool
-│   ├── healthcheck.py       # container probe (no dependencies)
-│   ├── lifecycle.py         # signal handling, interruptible sleep
-│   ├── logging_config.py    # logging setup (JSON / text)
-│   ├── server.py            # uvicorn wired to the shutdown signal
-│   ├── iv_backfill.py       # daily ATM-IV history rebuilt from option bars
-│   └── volatility.py        # Black-Scholes greeks + IV Rank (pure stdlib)
+│   ├── agents/               # agent protocol + supervision, and each agent
+│   │   ├── __init__.py       #   build_agents(), retry/backoff supervisor
+│   │   ├── market_pulse.py   #   scores the universe, no AI
+│   │   ├── position_manager.py  # marks open positions, no AI
+│   │   ├── strategist.py     #   one LLM call/cycle, picks a strategy
+│   │   ├── execution.py      #   builds orders, applies risk limits
+│   │   ├── reflection.py     #   reviews outcomes, writes lessons
+│   │   └── telegram_reporter.py
+│   ├── evidence/             # collects and caches the per-symbol data pack
+│   ├── prompts/              # LLM prompt templates (YAML)
+│   ├── api.py                # /health, /ready, admin dashboard
+│   ├── config.py             # env-driven settings
+│   ├── db.py                 # Postgres connection pool
+│   ├── matrix.py             # deterministic trend/IV → strategy table
+│   ├── strategy_builder.py   # picks contracts, builds the order plan
+│   ├── risk.py               # pre-trade risk checks
+│   ├── exits.py              # deterministic exit-condition ladder
+│   ├── healthcheck.py        # container probe (no dependencies)
+│   ├── lifecycle.py          # signal handling, interruptible sleep
+│   ├── logging_config.py     # logging setup (JSON / text)
+│   ├── server.py             # uvicorn wired to the shutdown signal
+│   ├── iv_backfill.py        # daily ATM-IV history rebuilt from option bars
+│   └── volatility.py         # Black-Scholes greeks + IV Rank (pure stdlib)
+├── architecture/             # product overview, technical reference, backtesting guide
+├── backtests/                # pipeline-replay backtesting harness
 ├── tests/
-├── pyproject.toml           # deps, build, ruff, mypy, pytest config
+├── pyproject.toml            # deps, build, ruff, mypy, pytest config
 ├── Dockerfile
 └── .env.example
 ```
@@ -39,7 +63,7 @@ never against a stray copy on the current working directory.
 
 One process, one event loop, two concerns:
 
-- **Agents** (`agents.py`) — each agent runs its own independent loop. Every
+- **Agents** (`agents/`) — each agent runs its own independent loop. Every
   iteration is isolated: an exception is logged and retried with exponential
   backoff, never propagated. A failing agent cannot take down its siblings or
   the process, because a crash-restart cycle is far more expensive than a
