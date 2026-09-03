@@ -159,6 +159,16 @@ def _looks_like_not_found(message: str) -> bool:
     return any(phrase in lowered for phrase in ("does not exist", "not found"))
 
 
+def _looks_like_settled_order(message: str) -> bool:
+    """Whether a ToolError means the order has already left the open state.
+
+    Alpaca answers a replace against a filled, canceled or expired order with
+    a 422 carrying this phrase. It is a verdict, not a fault: no number of
+    retries can make that order open again.
+    """
+    return "order is not open" in message.lower()
+
+
 def finite_float(value: object) -> float | None:
     """Coerce a broker numeric to a float, or ``None`` when unusable.
 
@@ -447,8 +457,11 @@ class AlpacaMcp:
                 # (bad credentials, a rejected parameter, a rate limit).
                 # Respawning it would fix nothing and costs a subprocess.
                 last_error = exc
-                not_found = _looks_like_not_found(str(exc))
-                permanent = not_found or _is_unknown_tool(exc)
+                message = str(exc)
+                not_found = _looks_like_not_found(message)
+                permanent = (
+                    not_found or _is_unknown_tool(exc) or _looks_like_settled_order(message)
+                )
                 # "position does not exist" is an answer, not a fault: it is how
                 # get_open_position reports flat. Logging it at WARNING made a
                 # normal flat symbol look like a broker incident.
@@ -465,8 +478,9 @@ class AlpacaMcp:
                 )
                 # A tool the server never registered will not appear on the
                 # next attempt: the toolset allowlist is fixed for the life of
-                # the subprocess. Neither will a position that does not exist —
-                # retrying either only adds backoff to every caller.
+                # the subprocess. Neither will a position that does not exist,
+                # nor an order that is no longer open — retrying any of them
+                # only adds backoff to every caller.
                 if permanent:
                     break
                 if attempt < self._max_retries:
