@@ -242,11 +242,6 @@ def format_error(record: logging.LogRecord, *, dry_run: bool) -> str:
     agent = getattr(record, "agent", None)
     if agent:
         lines.append(_kv("Agent", agent))
-    # Set by run_agent whenever more than one profile is running. Without it two
-    # accounts failing the same way are one message, deduped down to one.
-    profile = getattr(record, "profile", None)
-    if profile:
-        lines.append(_kv("Profile", profile))
     return "\n".join(lines)
 
 
@@ -267,28 +262,6 @@ class NullNotifier:
 
     def notify(self, text: str) -> None:
         return None
-
-
-class ProfileNotifier:
-    """Names the profile a message came from, in front of the message.
-
-    One chat carries every profile's stream, so an untagged snapshot cannot be
-    attributed to an account: two accounts, one holding a book and one flat,
-    read as one account contradicting itself. The tag also makes each message
-    textually distinct, which matters because
-    :meth:`TelegramNotifier._is_duplicate` keys on the text — without it, two
-    accounts reporting the same thing inside the dedupe window arrive once.
-    """
-
-    def __init__(self, notifier: Notifier, profile: str) -> None:
-        self._notifier = notifier
-        self._prefix = f"👤 *{escape(profile)}*\n"
-
-    def notify(self, text: str) -> None:
-        """Queue one message under this profile's name. Never raises."""
-        if not text:
-            return
-        self._notifier.notify(self._prefix + text)
 
 
 class TelegramNotifier:
