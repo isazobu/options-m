@@ -359,6 +359,12 @@ def _fake_server() -> tuple[FastMCP, dict[str, int]]:
 
     @server.tool
     def replace_order_by_id(order_id: str, limit_price: str) -> dict[str, Any]:
+        if order_id == "settled":
+            msg = (
+                "HTTP error 422: Unprocessable Entity - "
+                "{'code': 42210000, 'message': 'order is not open'}"
+            )
+            raise ToolError(msg)
         return _wrap(
             {"id": f"{order_id}-replacement", "limit_price": limit_price, "status": "new"},
             "replace_order_by_id",
@@ -1198,6 +1204,35 @@ async def test_replacement_order_wrappers_preserve_string_prices() -> None:
 
     assert current == {"id": "broker-1", "status": "new"}
     assert replacement["limit_price"] == "2.50"
+
+
+async def test_a_replace_against_a_settled_order_is_not_retried() -> None:
+    """An order that is no longer open cannot become open on the next attempt.
+
+    Alpaca's 422 "order is not open" is a verdict, not a fault, so spending
+    three attempts plus backoff on it only delays every other caller.
+    """
+    server, _calls = _fake_server()
+    mcp = await _connected(_settings(dry_run=False, mcp_max_retries=2), server)
+    mcp._paper_corroborated = True
+    mcp._reconnect_quietly = _noop  # type: ignore[method-assign]
+
+    attempts = 0
+    inner = mcp._client.call_tool  # type: ignore[union-attr]
+
+    async def _counting(*args: Any, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        return await inner(*args, **kwargs)
+
+    mcp._client.call_tool = _counting  # type: ignore[union-attr, method-assign]
+    try:
+        with pytest.raises(ToolError):
+            await mcp.replace_order_by_id("settled", limit_price="2.50")
+    finally:
+        await mcp.close()
+
+    assert attempts == 1
 
 
 async def test_place_option_order_sends_every_numeric_as_a_string() -> None:
