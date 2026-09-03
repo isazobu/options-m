@@ -81,22 +81,14 @@ async def run(settings: Settings) -> None:
     try:
         async with Database(settings) as db, AsyncExitStack() as stack:
             await migrate.apply(db)
-            runners = await assemble(settings, db, llm, notifier, stack)
-            many = len(runners) > 1
-            if many:
-                logger.warning(
-                    "multiple PROFILES configured; the dashboard and admin API only see "
-                    "the first profile's positions, orders and kill switch",
-                    extra={"profiles": [runner.name for runner in runners]},
-                )
+            runner = await assemble(settings, db, llm, notifier, stack)
 
-            first = runners[0]
             server = build_server(
                 create_app(
                     db,
-                    first.agents,
-                    mcp=first.mcp,
-                    store=first.store,
+                    runner.agents,
+                    mcp=runner.mcp,
+                    store=runner.store,
                     settings=settings,
                 ),
                 settings,
@@ -104,16 +96,9 @@ async def run(settings: Settings) -> None:
 
             async with asyncio.TaskGroup() as tg:
                 tg.create_task(serve(server, shutdown, settings), name="http")
-                for runner in runners:
-                    tg.create_task(
-                        run_agents(
-                            runner.agents,
-                            runner.settings,
-                            shutdown,
-                            label=runner.name if many else None,
-                        ),
-                        name=f"agents:{runner.name}" if many else "agents",
-                    )
+                tg.create_task(
+                    run_agents(runner.agents, runner.settings, shutdown), name="agents"
+                )
     finally:
         # Detach the bridge first: shutdown-path errors must not queue messages
         # onto a notifier that is already draining for the last time.
