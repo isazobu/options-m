@@ -2,7 +2,7 @@
 
 Same window, same cached data and same fingerprint as
 ``2026-08-30_universe_exit-flow_1Day`` -- this run exists to isolate one
-change: ``_close_reason`` is no longer a single +50/-50/30d rule. It now reads
+change: ``exits.close_reason`` is no longer a single +50/-50/30d rule. It now reads
 a five-rung ladder (expiry, short-premium DTE, then P&L against the position's
 own family, then the calendar backstop), so the harness has to hand it the
 fields the shipped ``PositionManagerAgent`` now writes: ``net_value`` and
@@ -17,7 +17,7 @@ Same replay as ``2026-08-30_universe_agent-replay_1Day`` — the real
 that run did not have:
 
 The exit rule under test is the shipped one: this harness calls
-``_compute_pnl_pct`` and ``_close_reason`` directly rather than restating any
+``_compute_pnl_pct`` and ``exits.close_reason`` directly rather than restating any
 threshold, so a change to either is picked up here without editing this file.
 
 Timing, kept deliberately separate:
@@ -38,7 +38,7 @@ import json
 import logging
 import sys
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -58,11 +58,11 @@ from options_m import matrix, strategy_builder  # noqa: E402
 from options_m.agents.execution import fetch_chain_window  # noqa: E402
 
 # The exit rule under test. Imported, not restated: the thresholds live in
-# Settings and the precedence between them lives in _close_reason.
+# Settings and the precedence between them lives in exits.close_reason.
 from options_m.agents.position_manager import _compute_pnl_pct  # noqa: E402
-from options_m.agents.strategist import _close_reason  # noqa: E402
 from options_m.config import Settings  # noqa: E402
 from options_m.evidence.evidence import EvidenceCollector  # noqa: E402
+from options_m.exits import close_reason  # noqa: E402
 from options_m.models import OrderPlan, RegimeRead, Rejection  # noqa: E402
 from options_m.risk import PortfolioSnapshot, RiskEngine, RiskLimits  # noqa: E402
 
@@ -134,7 +134,7 @@ def stub_regime(symbol: str, conviction: float) -> RegimeRead:
     """A fixed regime read, standing in for the Featherless call.
 
     Note this stub only covers the *entry* leg. The close path does not consult
-    the LLM at all — ``_close_reason`` is pure arithmetic over the position
+    the LLM at all — ``exits.close_reason`` is pure arithmetic over the position
     cache — so exits in this replay are the real decision, not a stand-in.
     """
     return RegimeRead(
@@ -406,8 +406,9 @@ async def run(
                 if mark is None:
                     continue
                 payload = position_payload(position, mark, day)
-                with frozen_at(day):
-                    reason = _close_reason(payload, settings)
+                reason = close_reason(
+                    payload, settings, now=datetime.combine(day, time(20, 0), tzinfo=UTC)
+                )
                 if reason is None:
                     continue
                 position.close_signal_date = day

@@ -144,7 +144,9 @@ async def test_holds_and_llm_failures_do_not_consume_the_daily_cap() -> None:
             underlying=f"H{index}", intent={"action": "hold"}, evidence={}, status="no_action"
         )
         store._memory_proposals[proposal_id]["ts"] = now - timedelta(hours=3)
-    failed = await store.save_proposal(underlying="QQQ", intent={}, evidence={}, status="llm_failed")
+    failed = await store.save_proposal(
+        underlying="QQQ", intent={}, evidence={}, status="llm_failed"
+    )
     store._memory_proposals[failed]["ts"] = now - timedelta(hours=3)
 
     detail: dict[str, Any] = {"skipped": None}
