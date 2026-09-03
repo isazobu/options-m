@@ -13,6 +13,11 @@ outcome can be traced back step by step. See `architecture/business.md` for
 the product-level walkthrough and `architecture/technical.md` for the data
 flow and cache tables.
 
+## Live Deployment
+
+- **Dashboard**: [options-m-dashboard.vercel.app](https://options-m-dashboard.vercel.app)
+- **Dashboard source**: [github.com/isazobu/options-m-dashboard](https://github.com/isazobu/options-m-dashboard) (separate Next.js repo; talks to this service's guarded `/api/*` routes)
+
 ## Requirements
 
 - Python 3.12+
@@ -110,11 +115,34 @@ Run it:
 
 ```bash
 cp .env.example .env
-python -m options_m          # or: options-m
+python -m options_m
 ```
 
 The admin dashboard is then on <http://localhost:8080>. `DATABASE_URL` may be
 left unset locally — the app boots without a database and `/ready` reports it.
+
+## CLI
+
+`options-m` (installed alongside the package) is a separate, second entry
+point: a set of one-shot commands against the same Alpaca account and
+database the running service uses, useful for poking at the live system
+without waiting for an agent's next tick.
+
+```bash
+options-m status                                   # market clock + account info
+options-m positions                                 # all current positions
+options-m chain --symbol SPY                        # raw option chain
+options-m trace --symbol SPY                        # walk the full decision chain; never submits
+options-m plan --symbol SPY --strategy put_credit_spread --delta 0.25 --dte 30
+                                                     # build + risk-check a plan; never submits
+options-m trade --once                              # run one ExecutionAgent iteration
+```
+
+Add `--json` before the subcommand for machine-readable output. `plan` and
+`trace` never call `place_option_order` — there is no call site for it
+anywhere on either path — so both are safe to run against a live account.
+Every subcommand needs the same Alpaca/database credentials as the service
+(see `.env.example`).
 
 ## Endpoints
 
