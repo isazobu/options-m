@@ -16,8 +16,8 @@ from options_m.runtime import (
 def _base() -> Settings:
     return Settings(
         database_url=None,
-        alpaca_api_key="BASEKEY",  # noqa: S106
-        alpaca_secret_key="BASESECRET",  # noqa: S106
+        alpaca_api_key="BASEKEY",
+        alpaca_secret_key="BASESECRET",
     )
 
 
@@ -42,8 +42,8 @@ def test_the_settings_field_is_read_too(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.delenv("PROFILES", raising=False)
     settings = Settings(
         database_url=None,
-        alpaca_api_key="BASEKEY",  # noqa: S106
-        alpaca_secret_key="BASESECRET",  # noqa: S106
+        alpaca_api_key="BASEKEY",
+        alpaca_secret_key="BASESECRET",
         profiles='[{"name":"a"},{"name":"b"}]',
     )
     assert [p.name for p in load_profiles(settings)] == ["a", "b"]
@@ -86,8 +86,8 @@ def test_settings_for_applies_overrides_and_credentials() -> None:
     base = _base()
     profile = Profile(
         name="b",
-        alpaca_api_key="K2",  # noqa: S106
-        alpaca_secret_key="S2",  # noqa: S106
+        alpaca_api_key="K2",
+        alpaca_secret_key="S2",
         overrides={"base_risk_pct_per_trade": 0.03, "dte_target_max": 21},
     )
     derived = _settings_for(base, profile)
@@ -103,13 +103,13 @@ def test_settings_for_applies_overrides_and_credentials() -> None:
 
 
 def test_settings_for_rejects_an_unknown_override() -> None:
-    profile = Profile("x", "k", "s", {"not_a_real_setting": 1})  # noqa: S106
+    profile = Profile("x", "k", "s", {"not_a_real_setting": 1})
     with pytest.raises(ProfileError):
         _settings_for(_base(), profile)
 
 
 def test_settings_for_rejects_an_out_of_range_override() -> None:
     # base_risk_pct_per_trade is constrained to (0, 1].
-    profile = Profile("x", "k", "s", {"base_risk_pct_per_trade": 5.0})  # noqa: S106
+    profile = Profile("x", "k", "s", {"base_risk_pct_per_trade": 5.0})
     with pytest.raises(ValidationError):
         _settings_for(_base(), profile)

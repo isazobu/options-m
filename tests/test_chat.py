@@ -73,7 +73,13 @@ class _StubLlm:
         self.calls: list[list[dict[str, Any]]] = []
 
     async def chat_completion(
-        self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None = None
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        max_tokens: int = 800,
+        temperature: float = 0.2,
+        extra_body: dict[str, Any] | None = None,
     ) -> LlmResult:
         self.calls.append(messages)
         if len(self.calls) == 1:

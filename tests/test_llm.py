@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 
 import httpx
 import pytest
@@ -127,7 +128,9 @@ async def test_an_unreadable_response_raises_llm_error(monkeypatch: pytest.Monke
         await llm.chat_completion([{"role": "user", "content": "hi"}])
 
 
-def _patch_client(monkeypatch: pytest.MonkeyPatch, handler: object) -> None:
+def _patch_client(
+    monkeypatch: pytest.MonkeyPatch, handler: Callable[[httpx.Request], httpx.Response]
+) -> None:
     monkeypatch.setattr(
         httpx, "AsyncClient", lambda **kw: _RealAsyncClient(transport=httpx.MockTransport(handler))
     )

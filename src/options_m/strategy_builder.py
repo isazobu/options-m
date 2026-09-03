@@ -249,6 +249,19 @@ def _reject(proposal_id: int, reason: str, **detail: Any) -> Rejection:
     return Rejection(proposal_id=proposal_id, reason=reason, detail=detail)
 
 
+def _expect[T](value: T | None, message: str) -> T:
+    """Narrow an ``Optional`` that preceding logic already guarantees is set.
+
+    A bare ``assert`` would do the same narrowing for mypy, but silently
+    disappears when Python runs with ``-O``. This stays enforced either way,
+    and turns "this can never happen" into a real, readable error instead of
+    a confusing ``TypeError``/``AttributeError`` a few lines later.
+    """
+    if value is None:
+        raise RuntimeError(message)
+    return value
+
+
 def _leg_from_contract(
     contract: NormalizedContract,
     *,
@@ -520,14 +533,14 @@ async def build(
     entry_price, rejection = _price(intent, settings, primary, secondary, proposal_id)
     if rejection is not None:
         return rejection
-    assert entry_price is not None
+    entry_price = _expect(entry_price, "_price returned no rejection but no entry_price")
 
     max_loss, max_profit, breakeven, rejection = _risk_profile(
         intent, proposal_id, primary, secondary, entry_price, spot, existing_position, settings
     )
     if rejection is not None:
         return rejection
-    assert max_loss is not None
+    max_loss = _expect(max_loss, "_risk_profile returned no rejection but no max_loss")
 
     decision = size_position(
         strategy=intent.strategy,
@@ -626,11 +639,21 @@ def _build_long_strangle(
         if rejection is not None:
             return rejection
 
-    assert call_contract.bid is not None and call_contract.ask is not None
-    assert put_contract.bid is not None and put_contract.ask is not None
-    call_mid = (call_contract.bid + call_contract.ask) / 2
-    put_mid = (put_contract.bid + put_contract.ask) / 2
-    width = (call_contract.ask - call_contract.bid) + (put_contract.ask - put_contract.bid)
+    call_bid = _expect(
+        call_contract.bid, "call_contract must be priced (bid) after the liquidity gate"
+    )
+    call_ask = _expect(
+        call_contract.ask, "call_contract must be priced (ask) after the liquidity gate"
+    )
+    put_bid = _expect(
+        put_contract.bid, "put_contract must be priced (bid) after the liquidity gate"
+    )
+    put_ask = _expect(
+        put_contract.ask, "put_contract must be priced (ask) after the liquidity gate"
+    )
+    call_mid = (call_bid + call_ask) / 2
+    put_mid = (put_bid + put_ask) / 2
+    width = (call_ask - call_bid) + (put_ask - put_bid)
     entry_price = call_mid + put_mid + settings.limit_price_spread_nudge_pct * width
 
     max_loss = entry_price * _CONTRACT_MULTIPLIER
@@ -891,9 +914,10 @@ def _net_credit(verticals: list[_CreditVertical], settings: Settings) -> float:
     spread_total = 0.0
     for vertical in verticals:
         for contract, sign in ((vertical.short, 1.0), (vertical.long, -1.0)):
-            assert contract.bid is not None and contract.ask is not None
-            credit += sign * (contract.bid + contract.ask) / 2
-            spread_total += contract.ask - contract.bid
+            bid = _expect(contract.bid, f"{contract.symbol} must be priced (bid) to net a credit")
+            ask = _expect(contract.ask, f"{contract.symbol} must be priced (ask) to net a credit")
+            credit += sign * (bid + ask) / 2
+            spread_total += ask - bid
     return credit - settings.limit_price_spread_nudge_pct * spread_total
 
 
@@ -1189,24 +1213,34 @@ def _price(
 ) -> tuple[float | None, Rejection | None]:
     """Net entry price: a positive number either way — the sign that matters
     (debit vs. credit) is implied by ``primary_side``, not stored twice."""
-    assert primary.bid is not None and primary.ask is not None
-    primary_mid = (primary.bid + primary.ask) / 2
+    primary_bid = _expect(
+        primary.bid, "primary must be priced (bid) before entry price is computed"
+    )
+    primary_ask = _expect(
+        primary.ask, "primary must be priced (ask) before entry price is computed"
+    )
+    primary_mid = (primary_bid + primary_ask) / 2
     nudge = settings.limit_price_spread_nudge_pct
 
     if secondary is not None:
-        assert secondary.bid is not None and secondary.ask is not None
-        secondary_mid = (secondary.bid + secondary.ask) / 2
+        secondary_bid = _expect(
+            secondary.bid, "secondary must be priced (bid) before entry price is computed"
+        )
+        secondary_ask = _expect(
+            secondary.ask, "secondary must be priced (ask) before entry price is computed"
+        )
+        secondary_mid = (secondary_bid + secondary_ask) / 2
         net_mid = primary_mid - secondary_mid
         if net_mid <= 0:
             return None, _reject(proposal_id, "not_a_debit", net_mid=net_mid)
-        width = (primary.ask - primary.bid) + (secondary.ask - secondary.bid)
+        width = (primary_ask - primary_bid) + (secondary_ask - secondary_bid)
         return net_mid + nudge * width, None
 
     if intent.strategy in _SHORT_ONLY_STRATEGIES:
         # Selling: the aggressive side is a lower price, closer to the bid.
-        return primary_mid - nudge * (primary.ask - primary.bid), None
+        return primary_mid - nudge * (primary_ask - primary_bid), None
 
-    return primary_mid + nudge * (primary.ask - primary.bid), None
+    return primary_mid + nudge * (primary_ask - primary_bid), None
 
 
 def _risk_profile(
@@ -1232,7 +1266,9 @@ def _risk_profile(
         return max_loss, None, breakeven, None
 
     if strategy in _VERTICAL_STRATEGIES:
-        assert secondary is not None
+        secondary = _expect(
+            secondary, f"{strategy} is a vertical strategy but has no secondary leg"
+        )
         # The realised distance between the two strikes, not the width the
         # intent asked for: the second leg snapped to a listed strike and the
         # two can differ by up to one increment. Every dollar figure below has

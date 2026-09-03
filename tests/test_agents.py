@@ -165,7 +165,7 @@ def test_the_reporter_is_not_registered_without_telegram() -> None:
 
 def test_the_reporter_is_registered_when_telegram_is_configured() -> None:
     settings = Settings(
-        database_url=None, telegram_bot_token="1:A", telegram_chat_id="-1"  # noqa: S106
+        database_url=None, telegram_bot_token="1:A", telegram_chat_id="-1"
     )
     store = Store(Database(settings))
     from options_m.notify import build_notifier

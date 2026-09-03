@@ -204,7 +204,7 @@ def test_build_notifier_is_null_without_a_token() -> None:
 
 
 def test_build_notifier_is_null_with_a_token_but_no_chat_id() -> None:
-    settings = Settings(telegram_bot_token="123:ABC")  # noqa: S106
+    settings = Settings(telegram_bot_token="123:ABC")
     assert isinstance(build_notifier(settings), NullNotifier)
 
 
