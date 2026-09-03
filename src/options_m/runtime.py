@@ -21,7 +21,7 @@ from options_m.config import Settings
 from options_m.db import Database
 from options_m.llm import FeatherlessLlm
 from options_m.mcp_client import AlpacaMcp
-from options_m.notify import Notifier
+from options_m.notify import Notifier, NullNotifier, ProfileNotifier
 from options_m.store import Store
 
 #: Profile name used when ``PROFILES`` is unset, and the schema default for the
@@ -162,12 +162,26 @@ async def assemble(
     Each runner gets its own :class:`~options_m.mcp_client.AlpacaMcp` entered on
     ``stack`` and a :class:`~options_m.store.Store` tagged with the profile name;
     the agents are built by :func:`~options_m.agents.build_agents` unchanged.
+
+    Past one profile every notification is wrapped in a
+    :class:`~options_m.notify.ProfileNotifier`, so the single chat the profiles
+    share stays readable. One profile is left exactly as it was — the same rule
+    the log labels follow in ``__main__``.
     """
+    profiles = load_profiles(base)
+    many = len(profiles) > 1
+
     runners: list[Runner] = []
-    for profile in load_profiles(base):
+    for profile in profiles:
         settings = _settings_for(base, profile)
         mcp = await stack.enter_async_context(AlpacaMcp(settings))
         store = Store(db, account_id=profile.name)
-        agents = build_agents(settings, mcp, store, llm, notifier=notifier)
+        # A null sink is left bare: wrapped, it stops reading as "no Telegram
+        # configured", and build_agents would register a reporter agent that
+        # reports to nobody.
+        sink = notifier
+        if many and notifier is not None and not isinstance(notifier, NullNotifier):
+            sink = ProfileNotifier(notifier, profile.name)
+        agents = build_agents(settings, mcp, store, llm, notifier=sink)
         runners.append(Runner(profile.name, settings, mcp, store, agents))
     return runners

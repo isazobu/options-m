@@ -18,6 +18,7 @@ from options_m.config import Settings
 from options_m.notify import (
     MESSAGE_LIMIT,
     NullNotifier,
+    ProfileNotifier,
     TelegramNotifier,
     build_notifier,
     escape,
@@ -194,6 +195,15 @@ def test_format_error_includes_the_exception_but_not_the_traceback() -> None:
     assert "Traceback" not in text
 
 
+def test_format_error_names_the_profile_that_produced_it() -> None:
+    record = logging.LogRecord(
+        "options_m.agents", logging.ERROR, __file__, 1, "agent step failed", None, None
+    )
+    record.agent = "execution"
+    record.profile = "rukiyeaslan"
+    assert "rukiyeaslan" in format_error(record, dry_run=False)
+
+
 # ---------------------------------------------------------------------------
 # build_notifier
 # ---------------------------------------------------------------------------
@@ -347,6 +357,40 @@ async def test_start_is_idempotent() -> None:
 
 async def test_aclose_without_start_is_safe() -> None:
     await TelegramNotifier(_settings(), client=_client(_Recorder())).aclose()
+
+
+# ---------------------------------------------------------------------------
+# ProfileNotifier
+# ---------------------------------------------------------------------------
+
+
+async def test_two_profiles_saying_the_same_thing_both_arrive() -> None:
+    # The dedupe window keys on the message text, so two accounts that happen
+    # to read alike — both flat, both holding the same name — would collapse
+    # into a single message attributed to neither.
+    recorder = _Recorder()
+    async with TelegramNotifier(
+        _settings(telegram_dedupe_seconds=60), client=_client(recorder)
+    ) as notifier:
+        ProfileNotifier(notifier, "isazobu").notify("📊 *Portfolio snapshot*")
+        ProfileNotifier(notifier, "rukiyeaslan").notify("📊 *Portfolio snapshot*")
+        await _flush(notifier)
+    sent = [request["text"] for request in recorder.requests]
+    assert len(sent) == 2
+    assert "isazobu" in sent[0]
+    assert "rukiyeaslan" in sent[1]
+
+
+def test_profile_notifier_keeps_the_body_and_escapes_the_name() -> None:
+    collector = _Collector()
+    ProfileNotifier(collector, "rukiye-aslan").notify("📊 *Portfolio snapshot*")
+    assert collector.messages == ["👤 *rukiye\\-aslan*\n📊 *Portfolio snapshot*"]
+
+
+def test_profile_notifier_still_drops_an_empty_message() -> None:
+    collector = _Collector()
+    ProfileNotifier(collector, "isazobu").notify("")
+    assert collector.messages == []
 
 
 # ---------------------------------------------------------------------------

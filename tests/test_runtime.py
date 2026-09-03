@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+from contextlib import AsyncExitStack
+
 import pytest
 from pydantic import ValidationError
 
+from options_m.agents import Agent
 from options_m.config import Settings
+from options_m.db import Database
+from options_m.notify import NullNotifier, ProfileNotifier
 from options_m.runtime import (
     DEFAULT_PROFILE,
     Profile,
     ProfileError,
     _settings_for,
+    assemble,
     load_profiles,
 )
 
@@ -113,3 +119,64 @@ def test_settings_for_rejects_an_out_of_range_override() -> None:
     profile = Profile("x", "k", "s", {"base_risk_pct_per_trade": 5.0})  # noqa: S106
     with pytest.raises(ValidationError):
         _settings_for(_base(), profile)
+
+
+class _Collector:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def notify(self, text: str) -> None:
+        self.messages.append(text)
+
+
+def _offline(**overrides: object) -> Settings:
+    """A base with nothing external configured, so nothing is opened or spawned."""
+    return Settings(
+        database_url=None,
+        alpaca_api_key=None,
+        alpaca_secret_key=None,
+        telegram_bot_token=None,
+        **overrides,  # type: ignore[arg-type]
+    )
+
+
+def _sink_of(agents: list[Agent]) -> object:
+    """The notifier the reporter agent was handed."""
+    reporter = next(agent for agent in agents if agent.name == "telegram_reporter")
+    return reporter._notifier  # type: ignore[attr-defined]
+
+
+async def test_each_profile_notifies_under_its_own_name() -> None:
+    collector = _Collector()
+    base = _offline(profiles='[{"name":"isazobu"},{"name":"rukiyeaslan"}]')
+    async with AsyncExitStack() as stack:
+        runners = await assemble(base, Database(base), None, collector, stack)
+
+    for runner in runners:
+        sink = _sink_of(runner.agents)
+        assert isinstance(sink, ProfileNotifier)
+        sink.notify("📊 *Portfolio snapshot*")
+    assert collector.messages == [
+        "👤 *isazobu*\n📊 *Portfolio snapshot*",
+        "👤 *rukiyeaslan*\n📊 *Portfolio snapshot*",
+    ]
+
+
+async def test_profiles_without_telegram_register_no_reporter() -> None:
+    """A wrapped null sink would read as configured and start a reporter agent."""
+    base = _offline(profiles='[{"name":"isazobu"},{"name":"rukiyeaslan"}]')
+    async with AsyncExitStack() as stack:
+        runners = await assemble(base, Database(base), None, NullNotifier(), stack)
+
+    for runner in runners:
+        assert [agent.name for agent in runner.agents if agent.name == "telegram_reporter"] == []
+
+
+async def test_a_single_profile_is_not_tagged() -> None:
+    """One account is unambiguous, so its messages read exactly as they did."""
+    collector = _Collector()
+    base = _offline()
+    async with AsyncExitStack() as stack:
+        runners = await assemble(base, Database(base), None, collector, stack)
+
+    assert _sink_of(runners[0].agents) is collector
