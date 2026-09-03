@@ -326,7 +326,7 @@ async def test_env_forced_kill_switch_is_reported_and_cannot_be_released() -> No
 
 async def test_kill_switch_routes_require_the_admin_token() -> None:
     db = Database(Settings(database_url=None))
-    settings = Settings(admin_token="secret")  # noqa: S106 - test fixture, not a real credential
+    settings = Settings(admin_token="secret")
     app = create_app(db, [], mcp=None, store=Store(db), settings=settings)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

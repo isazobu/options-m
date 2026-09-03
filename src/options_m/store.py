@@ -1454,7 +1454,9 @@ class Store:
             )
             row = cast("tuple[Any, ...] | None", await cur.fetchone())
             await conn.commit()
-            assert row is not None
+            if row is None:  # pragma: no cover - RETURNING id always yields a row
+                msg = "INSERT ... RETURNING id returned no row"
+                raise RuntimeError(msg)
             return int(row[0])
 
     # ---- LLM call log ---------------------------------------------------

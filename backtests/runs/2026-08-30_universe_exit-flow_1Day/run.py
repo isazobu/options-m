@@ -8,7 +8,7 @@ that run did not have:
   1. **Exits.** PR #16 gave the system a close path: ``PositionManagerAgent``
      marks each position and pre-computes ``pnl_pct``; ``StrategistAgent``
      reads that cache and writes a ``close`` proposal when
-     ``_close_reason`` fires (profit target / stop loss / time stop). This
+     ``exits.close_reason`` fires (profit target / stop loss / time stop). This
      harness calls those two shipped functions directly rather than restating
      the thresholds, so the exit rule under test is the shipped one.
   2. **A sweepable position limit**, via ``Settings`` overrides.
@@ -31,7 +31,7 @@ import json
 import logging
 import sys
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -45,12 +45,13 @@ from backtests.clock import frozen_at  # noqa: E402
 
 from options_m import matrix, strategy_builder  # noqa: E402
 from options_m.agents.execution import fetch_chain_window  # noqa: E402
+
 # The exit rule under test. Imported, not restated: the thresholds live in
-# Settings and the precedence between them lives in _close_reason.
+# Settings and the precedence between them lives in exits.close_reason.
 from options_m.agents.position_manager import _compute_pnl_pct  # noqa: E402
-from options_m.agents.strategist import _close_reason  # noqa: E402
 from options_m.config import Settings  # noqa: E402
 from options_m.evidence.evidence import EvidenceCollector  # noqa: E402
+from options_m.exits import close_reason  # noqa: E402
 from options_m.models import OrderPlan, RegimeRead, Rejection  # noqa: E402
 from options_m.risk import PortfolioSnapshot, RiskEngine, RiskLimits  # noqa: E402
 
@@ -122,7 +123,7 @@ def stub_regime(symbol: str, conviction: float) -> RegimeRead:
     """A fixed regime read, standing in for the Featherless call.
 
     Note this stub only covers the *entry* leg. The close path does not consult
-    the LLM at all — ``_close_reason`` is pure arithmetic over the position
+    the LLM at all — ``exits.close_reason`` is pure arithmetic over the position
     cache — so exits in this replay are the real decision, not a stand-in.
     """
     return RegimeRead(
@@ -382,8 +383,9 @@ async def run(
                 if mark is None:
                     continue
                 payload = position_payload(position, mark)
-                with frozen_at(day):
-                    reason = _close_reason(payload, settings)
+                reason = close_reason(
+                    payload, settings, now=datetime.combine(day, time(20, 0), tzinfo=UTC)
+                )
                 if reason is None:
                     continue
                 position.close_signal_date = day

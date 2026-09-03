@@ -191,6 +191,51 @@ async def test_final_campaign_session_flattens_before_the_close(monkeypatch: Any
     assert proposal["intent"]["thesis"] == "campaign_flatten"
 
 
+async def test_a_session_after_the_campaign_ends_does_not_flatten_forever(
+    monkeypatch: Any,
+) -> None:
+    """Regression: elapsed sessions only grows, so a bare ``elapsed >=
+    campaign_days`` check would keep matching on every session after the
+    campaign's one true final day, flattening the book at every close
+    indefinitely instead of just once."""
+    now = datetime(2026, 9, 4, 19, 45, tzinfo=UTC)
+    monkeypatch.setattr("options_m.agents.position_manager._now_utc", lambda: now)
+    mcp = _FakeMcp(positions=[{"symbol": "AAPL991231C00150000", "qty": "1"}])
+    agent, store = _agent(
+        mcp,
+        campaign_start_date=now.date() - timedelta(days=2),
+        campaign_days=2,
+        campaign_flatten_minutes_before_close=20,
+    )
+    await store.upsert_market_calendar(
+        [
+            {
+                "date": now.date() - timedelta(days=2),
+                "open": datetime(2026, 9, 2, 13, 30, tzinfo=UTC),
+                "close": datetime(2026, 9, 2, 20, 0, tzinfo=UTC),
+                "session_type": "full",
+            },
+            {
+                "date": now.date() - timedelta(days=1),
+                "open": datetime(2026, 9, 3, 13, 30, tzinfo=UTC),
+                "close": datetime(2026, 9, 3, 20, 0, tzinfo=UTC),
+                "session_type": "full",
+            },
+            {
+                "date": now.date(),
+                "open": datetime(2026, 9, 4, 13, 30, tzinfo=UTC),
+                "close": datetime(2026, 9, 4, 20, 0, tzinfo=UTC),
+                "session_type": "full",
+            },
+        ]
+    )
+
+    await agent.step()
+
+    proposals = await store.recent_proposals(limit=5, status="pending")
+    assert proposals == []
+
+
 # ---------------------------------------------------------------------------
 # Enrichment and pnl_pct
 # ---------------------------------------------------------------------------

@@ -505,7 +505,9 @@ class AlpacaMcp:
                 continue
             return self._as_json(tool, result)
 
-        assert last_error is not None
+        if last_error is None:  # pragma: no cover - unreachable: the loop always sets it
+            msg = f"{tool!r} exhausted retries without recording an error"
+            raise McpUnavailableError(msg)
         raise last_error
 
     async def _reconnect_quietly(self) -> None:

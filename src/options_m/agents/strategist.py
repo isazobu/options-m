@@ -26,7 +26,6 @@ PositionManagerAgent from running normally.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import time
@@ -171,6 +170,14 @@ class StrategistAgent:
             evidence_json=json.dumps(pack, default=str, indent=2),
         )
         t0 = time.monotonic()
+        # ``_llm`` is shared with ReflectionAgent, so its last_prompt_tokens /
+        # last_completion_tokens / last_error can be overwritten by that
+        # agent's own concurrent call the moment this one awaits something
+        # else. Capture them right where this call's own outcome is known,
+        # not later in ``finally`` after an intervening await.
+        llm_prompt_tokens = 0
+        llm_completion_tokens = 0
+        llm_error: str | None = None
         try:
             regime: RegimeRead = await self._llm.complete_json(
                 schema=RegimeRead,
@@ -179,7 +186,12 @@ class StrategistAgent:
                 max_tokens=self._settings.llm_max_tokens,
                 temperature=prompt.params.get("temperature", 0.2),
             )
+            llm_prompt_tokens = self._llm.last_prompt_tokens
+            llm_completion_tokens = self._llm.last_completion_tokens
         except LlmContractError:
+            llm_prompt_tokens = self._llm.last_prompt_tokens
+            llm_completion_tokens = self._llm.last_completion_tokens
+            llm_error = self._llm.last_error
             proposal_id = await self._store.save_proposal(
                 underlying=symbol,
                 intent={},
@@ -198,11 +210,11 @@ class StrategistAgent:
             await self._store.record_llm_call(
                 agent=self.name,
                 model=self._settings.featherless_model_deep,
-                prompt_tokens=self._llm.last_prompt_tokens,
-                completion_tokens=self._llm.last_completion_tokens,
+                prompt_tokens=llm_prompt_tokens,
+                completion_tokens=llm_completion_tokens,
                 latency_ms=int((time.monotonic() - t0) * 1000),
                 ok=not failed,
-                error=self._llm.last_error if failed else None,
+                error=llm_error if failed else None,
             )
 
         decision = matrix.decide(pack, regime, settings=self._settings, as_of=now.date())
@@ -351,88 +363,6 @@ class StrategistAgent:
                 continue
             return candidate
         return None
-
-
-# All valid literal values for StrategyIntent.strategy (duplicated here to
-# avoid importing the Literal type annotation at runtime).
-_VALID_STRATEGIES: frozenset[str] = frozenset(
-    StrategyIntent.model_fields["strategy"].annotation.__args__  # type: ignore[union-attr]
-)
-
-
-# Exit families -- the exit-side counterpart of matrix._MATRIX. Both spellings
-# of the debit verticals are listed because models.StrategyIntent still accepts
-# the legacy names alongside the ones the matrix emits.
-_CREDIT_STRATEGIES: frozenset[str] = frozenset(
-    {"put_credit_spread", "call_credit_spread", "iron_condor", "iron_butterfly"}
-)
-_DEBIT_STRATEGIES: frozenset[str] = frozenset(
-    {"call_debit_spread", "put_debit_spread", "debit_call_spread", "debit_put_spread"}
-)
-_LONG_STRATEGIES: frozenset[str] = frozenset({"long_call", "long_put", "long_strangle"})
-
-
-def _exit_thresholds(strategy: str, settings: Settings) -> tuple[float, float]:
-    """``(profit_target, stop_loss)`` for a strategy, both as positive fractions.
-
-    An unknown or unresolved strategy falls back to the single symmetric pair,
-    which is what every position was measured against before families existed.
-    """
-    if strategy in _CREDIT_STRATEGIES:
-        return settings.exit_credit_profit_target_pct, settings.exit_credit_stop_loss_pct
-    if strategy in _DEBIT_STRATEGIES:
-        return settings.exit_debit_profit_target_pct, settings.exit_debit_stop_loss_pct
-    if strategy in _LONG_STRATEGIES:
-        return settings.exit_long_profit_target_pct, settings.exit_long_stop_loss_pct
-    return settings.exit_profit_target_pct, settings.exit_stop_loss_pct
-
-
-def _close_reason(payload: dict[str, Any], settings: Settings) -> str | None:
-    """Return a close reason string if any exit condition is met, else None.
-
-    Checked risk-first, first match wins: expiry, then the short-premium DTE
-    stop, then P&L against the position's own family, then the calendar stop.
-    A position that trips two rungs at once is reported by the more urgent one.
-    """
-    strategy = str(payload.get("strategy") or "")
-
-    # 1. Expiry. Applies to every structure -- an ITM option carried into
-    # expiration becomes a stock position nobody asked for.
-    min_dte = payload.get("min_dte")
-    if isinstance(min_dte, int):
-        if min_dte <= settings.exit_dte_hard_floor:
-            return "expiry_hard_stop"
-        # 2. Short premium in its last weeks: gamma, not the thesis, is what
-        # moves the P&L from here. Debit and long structures are holding
-        # convexity they paid for, so they are left alone.
-        if strategy in _CREDIT_STRATEGIES and min_dte <= settings.exit_dte_short_premium:
-            return "dte_stop"
-
-    # 3-4. P&L, against this family's thresholds.
-    profit_target, stop_loss = _exit_thresholds(strategy, settings)
-    pnl_pct = payload.get("pnl_pct")
-    if isinstance(pnl_pct, float):
-        if pnl_pct <= -stop_loss:
-            return "stop_loss"
-        if pnl_pct >= profit_target:
-            return "profit_target"
-
-    # 5. Calendar backstop, unchanged: capital that has sat in one structure
-    # for a month is capital the rest of the pipeline cannot use.
-    opened_at_raw = payload.get("opened_at")
-    if opened_at_raw is not None:
-        opened_at: datetime | None = None
-        if isinstance(opened_at_raw, datetime):
-            opened_at = opened_at_raw
-        elif isinstance(opened_at_raw, str):
-            with contextlib.suppress(ValueError):
-                opened_at = datetime.fromisoformat(opened_at_raw)
-        if opened_at is not None:
-            utc_opened = opened_at if opened_at.tzinfo else opened_at.replace(tzinfo=UTC)
-            if (datetime.now(UTC) - utc_opened).days >= settings.exit_time_stop_days:
-                return "time_stop"
-
-    return None
 
 
 def _trend_label(pack: dict[str, Any]) -> str:

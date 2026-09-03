@@ -211,6 +211,7 @@ def _fake_server() -> tuple[FastMCP, dict[str, int]]:
         calls["get_option_contracts"] = calls.get("get_option_contracts", 0) + 1
         key = f"get_option_contracts:status={status}"
         calls[key] = calls.get(key, 0) + 1
+        body: dict[str, Any]
         if underlying_symbols == "ENDLESS":
             n = calls["get_option_contracts"]
             body = {
@@ -310,6 +311,7 @@ def _fake_server() -> tuple[FastMCP, dict[str, int]]:
                 },
                 "get_option_chain",
             )
+        body: dict[str, Any]
         if page_token is None:
             body = {
                 "snapshots": {

@@ -41,6 +41,20 @@ logger = logging.getLogger(__name__)
 
 _PASS_B_LOOKBACK_PROPOSALS = 20
 
+# Pass B only queries "no_action" and "rejected" proposals today, but the
+# mapping does not assume that: an unexpected status falls back to a neutral
+# phrase instead of silently being reported to the model as "rejected".
+_STATUS_PHRASES = {
+    "no_action": "held (no trade taken)",
+    "rejected": "rejected",
+}
+_STATUS_PHRASE_FALLBACK = "not acted on"
+_STATUS_SOURCES = {
+    "no_action": "held_proposal",
+    "rejected": "rejected_proposal",
+}
+_STATUS_SOURCE_FALLBACK = "proposal"
+
 _PROMPT = prompt_loader.load("reflection")
 _MAX_TOKENS = int(_PROMPT.params.get("max_tokens", 120))
 _TEMPERATURE = float(_PROMPT.params.get("temperature", 0.3))
@@ -194,10 +208,8 @@ class ReflectionAgent:
                 await self._store.save_lesson(
                     symbol=underlying or None,
                     lesson=lesson,
-                    source=(
-                        "held_proposal"
-                        if full.get("status") == "no_action"
-                        else "rejected_proposal"
+                    source=_STATUS_SOURCES.get(
+                        str(full.get("status", "")), _STATUS_SOURCE_FALLBACK
                     ),
                     reflected_on=reflected_key,
                 )
@@ -215,6 +227,7 @@ class ReflectionAgent:
         filled_qty = order.get("filled_qty")
         filled_price = order.get("filled_avg_price")
         request = order.get("request") or {}
+        legs = request.get("legs") or request.get("symbol") or "NO_DATA_AVAILABLE"
         try:
             result = await self._llm.chat_completion(
                 [
@@ -228,7 +241,7 @@ class ReflectionAgent:
                             "trade_lesson_user",
                             filled_qty=filled_qty,
                             filled_price=filled_price,
-                            legs=request.get("legs") or request.get("symbol"),
+                            legs=legs,
                         ),
                     },
                 ],
@@ -248,7 +261,7 @@ class ReflectionAgent:
         llm_read = proposal.get("llm_read") or proposal.get("arguments") or {}
         thesis = llm_read.get("thesis", "") if isinstance(llm_read, dict) else ""
         conviction = llm_read.get("conviction", "") if isinstance(llm_read, dict) else ""
-        decision_kind = "held (no trade taken)" if status == "no_action" else "rejected"
+        decision_kind = _STATUS_PHRASES.get(status, _STATUS_PHRASE_FALLBACK)
         try:
             result = await self._llm.chat_completion(
                 [
