@@ -24,6 +24,36 @@ _DEBIT_STRATEGIES: frozenset[str] = frozenset(
     {"call_debit_spread", "put_debit_spread", "debit_call_spread", "debit_put_spread"}
 )
 _LONG_STRATEGIES: frozenset[str] = frozenset({"long_call", "long_put", "long_strangle"})
+# Opened for a debit (paid premium): closing means selling, which nets a
+# credit. Everything else in _VALID_STRATEGIES (credit spreads, iron condors/
+# butterflies, covered calls, cash-secured puts) was opened by selling
+# premium, so closing it means buying back, a debit.
+_RECEIVES_CREDIT_ON_CLOSE: frozenset[str] = _DEBIT_STRATEGIES | _LONG_STRATEGIES
+
+
+def closing_pays_a_debit(strategy: str) -> bool:
+    """Does closing a position of this strategy cost a debit or bring in a credit?
+
+    This decides which direction is *more marketable* for a close's limit
+    price: a pay-to-close structure gets more marketable at a higher price
+    (willing to pay more); a receive-a-credit-to-close structure gets more
+    marketable at a lower price (willing to accept less). Treating every
+    close as pay-to-close would push a losing long call/put/strangle's exit
+    further from the market on every reprice, exactly when a stop-loss needs
+    the opposite.
+    """
+    return strategy not in _RECEIVES_CREDIT_ON_CLOSE
+
+
+# Every reason string this module (and _campaign_flatten_active's caller,
+# evaluate_close_proposals) can emit that means "get out now", as opposed to
+# "profit_target" (a natural exit, no rush). The single source of truth for
+# which close reasons ExecutionAgent should price aggressively — duplicating
+# this list at the call site risks a new reason silently defaulting to
+# non-urgent.
+URGENT_CLOSE_REASONS: frozenset[str] = frozenset(
+    {"stop_loss", "expiry_hard_stop", "dte_stop", "time_stop", "campaign_flatten"}
+)
 
 
 def exit_thresholds(strategy: str, settings: Settings) -> tuple[float, float]:
@@ -80,7 +110,10 @@ async def _campaign_flatten_active(
         return False
     today = store.session_day(now)
     elapsed = await store.sessions_between(start, today)
-    if elapsed < settings.campaign_days:
+    # Exactly the final session, not "the campaign has ended by now": elapsed
+    # keeps growing past campaign_days on every later day, and a bare `<`
+    # check would then flatten every open position at every close forever.
+    if elapsed != settings.campaign_days:
         return False
     session_close = await store.last_session_close(now)
     if session_close is None or store.session_day(session_close) != today:

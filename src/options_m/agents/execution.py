@@ -30,7 +30,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from options_m import exposure, session, sizing, strategy_builder
+from options_m import exits, exposure, session, sizing, strategy_builder
 from options_m.config import Settings
 from options_m.evidence.occ import parse_occ_symbol
 from options_m.mcp_client import AlpacaMcp, finite_float
@@ -87,9 +87,6 @@ def _decimal_str(value: float, places: int = 2) -> str:
 
 
 _OCC_RE = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
-_URGENT_CLOSE_REASONS = frozenset(
-    {"stop_loss", "expiry_hard_stop", "dte_stop", "time_stop", "campaign_flatten"}
-)
 
 
 def _close_reason_name(thesis: str) -> str:
@@ -102,11 +99,22 @@ def _close_limit_price(
     *,
     nudge: float,
     attempt: int,
+    pays_a_debit: bool,
 ) -> float:
-    """Return a progressively more marketable debit limit for a close."""
-    initial_rung = 1 if reason in _URGENT_CLOSE_REASONS else 0
+    """Return a progressively more marketable limit for a close.
+
+    A pay-to-close structure (a credit spread, iron condor/butterfly, covered
+    call, or cash-secured put bought back) is more marketable at a *higher*
+    price. A receive-a-credit-to-close structure (a long call/put/strangle or
+    a debit spread sold) is more marketable at a *lower* price. Using the
+    same direction for both would push a losing long position's exit further
+    from the market on every reprice, exactly when a stop-loss needs it to
+    move the other way.
+    """
+    initial_rung = 1 if reason in exits.URGENT_CLOSE_REASONS else 0
     rung = initial_rung + max(0, attempt)
-    return max(0.01, mark * (1.0 + rung * nudge))
+    sign = 1.0 if pays_a_debit else -1.0
+    return max(0.01, mark * (1.0 + sign * rung * nudge))
 
 
 def _build_closing_legs(option_legs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -521,13 +529,15 @@ class ExecutionAgent:
 
         pending_limit = 50 if kill_switch_engaged else _PENDING_BATCH_SIZE
         for proposal in await self._store.pending_proposals(limit=pending_limit):
-            await self._process_one(proposal, detail)
+            await self._process_one(proposal, detail, kill_switch_engaged=kill_switch_engaged)
             detail["processed"] += 1
 
         await self._reconcile(detail)
         return detail
 
-    async def _process_one(self, proposal: dict[str, Any], detail: dict[str, Any]) -> None:
+    async def _process_one(
+        self, proposal: dict[str, Any], detail: dict[str, Any], *, kill_switch_engaged: bool
+    ) -> None:
         proposal_id = int(proposal["id"])
         try:
             intent = StrategyIntent.model_validate(proposal["intent"])
@@ -543,9 +553,7 @@ class ExecutionAgent:
             await self._execute_close(proposal_id, intent, detail)
             return
 
-        if intent.action == "open" and (
-            self._settings.kill_switch or await self._store.is_kill_switch_engaged()
-        ):
+        if intent.action == "open" and kill_switch_engaged:
             detail["open_blocked_by_kill_switch"] = (
                 detail.get("open_blocked_by_kill_switch", 0) + 1
             )
@@ -700,11 +708,14 @@ class ExecutionAgent:
         struct_qty = _closing_structure_qty(option_legs)
         raw_price = mark_value / (struct_qty * 100) if mark_value > 0 else 0.01
         exit_reason = _close_reason_name(intent.thesis)
+        strategy = str(payload.get("strategy") or "")
+        pays_a_debit = exits.closing_pays_a_debit(strategy)
         initial_price = _close_limit_price(
             raw_price,
             exit_reason,
             nudge=self._settings.limit_price_spread_nudge_pct,
             attempt=0,
+            pays_a_debit=pays_a_debit,
         )
         limit_price = _decimal_str(initial_price)
 
@@ -712,6 +723,7 @@ class ExecutionAgent:
         close_request: dict[str, Any] = {
             "action": "close",
             "underlying": intent.underlying,
+            "strategy": strategy,
             "legs": closing_legs,
             "exit_reason": exit_reason,
             "mark_price": raw_price,
@@ -955,14 +967,22 @@ class ExecutionAgent:
         order_id = str(broker_order.get("id") or "")
         if mark is None or mark <= 0 or not order_id:
             return broker_order
+        pays_a_debit = exits.closing_pays_a_debit(str(request.get("strategy") or ""))
         target = _close_limit_price(
             mark,
             reason,
             nudge=self._settings.limit_price_spread_nudge_pct,
             attempt=attempt,
+            pays_a_debit=pays_a_debit,
         )
         current = finite_float(broker_order.get("limit_price"))
-        if current is not None and current >= target:
+        # A pay-to-close target only ever rises, so there is nothing left to do
+        # once current has caught up to (or passed) it; a receive-a-credit
+        # target only ever falls, so the same "nothing to do" state is current
+        # already at or below it.
+        if current is not None and (
+            current >= target if pays_a_debit else current <= target
+        ):
             return broker_order
 
         replacement = await self._mcp.replace_order_by_id(

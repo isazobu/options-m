@@ -126,7 +126,7 @@ class _Collector:
 def _make_agent(
     notifier: _Collector | None = None, **overrides: Any
 ) -> tuple[ExecutionAgent, MagicMock, Store]:
-    settings = Settings(database_url=None, **overrides)  # type: ignore[call-arg]
+    settings = Settings(database_url=None, **overrides)
     store = Store(Database(settings))
     mcp = MagicMock()
     risk = MagicMock()
@@ -216,11 +216,13 @@ async def test_reconcile_still_polls_an_order_that_was_only_accepted_on_the_firs
     )
 
     await agent._reconcile({"reconciled": 0, "broker_rejected": 0})
-    assert (await store.get_proposal(proposal_id))["status"] == "submitted"
+    still_submitted = await store.get_proposal(proposal_id)
+    assert still_submitted is not None and still_submitted["status"] == "submitted"
 
     detail: dict[str, Any] = {"reconciled": 0, "broker_rejected": 0}
     await agent._reconcile(detail)
-    assert (await store.get_proposal(proposal_id))["status"] == "broker_rejected"
+    rejected = await store.get_proposal(proposal_id)
+    assert rejected is not None and rejected["status"] == "broker_rejected"
     assert detail["broker_rejected"] == 1
 
 
@@ -365,7 +367,7 @@ def _close_intent() -> Any:
 async def _close_with(payload: dict[str, Any]) -> dict[str, Any]:
     store = _store()
     await store.upsert_position("AAPL", payload)
-    mcp: Any = _CloseMcp()
+    mcp = _CloseMcp()
     proposal_id = await store.save_proposal(underlying="AAPL", intent={}, evidence={})
     await _close_agent(store, mcp)._execute_close(
         proposal_id, _close_intent(), {"submitted": 0, "failed": 0, "rejected": 0}
@@ -428,17 +430,35 @@ def test_close_leg_ratios_do_not_multiply_the_position_quantity_twice() -> None:
 
 
 def test_stop_and_flatten_limits_start_more_aggressively_than_profit_taking() -> None:
-    assert _close_limit_price(2.0, "profit_target", nudge=0.25, attempt=0) == 2.0
-    assert _close_limit_price(2.0, "stop_loss", nudge=0.25, attempt=0) == 2.5
-    assert _close_limit_price(2.0, "campaign_flatten", nudge=0.25, attempt=0) == 2.5
+    assert _close_limit_price(2.0, "profit_target", nudge=0.25, attempt=0, pays_a_debit=True) == 2.0
+    assert _close_limit_price(2.0, "stop_loss", nudge=0.25, attempt=0, pays_a_debit=True) == 2.5
+    assert (
+        _close_limit_price(2.0, "campaign_flatten", nudge=0.25, attempt=0, pays_a_debit=True) == 2.5
+    )
 
 
 def test_each_reprice_ladder_rung_is_more_marketable() -> None:
     prices = [
-        _close_limit_price(2.0, "profit_target", nudge=0.25, attempt=attempt)
+        _close_limit_price(2.0, "profit_target", nudge=0.25, attempt=attempt, pays_a_debit=True)
         for attempt in range(4)
     ]
     assert prices == [2.0, 2.5, 3.0, 3.5]
+
+
+def test_a_credit_on_close_gets_more_marketable_at_a_lower_price() -> None:
+    """Regression: closing a long call/put/strangle or a debit spread nets a
+    credit. Raising the limit price there (as for a pay-to-close structure)
+    moves a sell-to-close order away from the market, not toward it."""
+    assert (
+        _close_limit_price(2.0, "profit_target", nudge=0.25, attempt=0, pays_a_debit=False) == 2.0
+    )
+    assert _close_limit_price(2.0, "stop_loss", nudge=0.25, attempt=0, pays_a_debit=False) == 1.5
+
+    prices = [
+        _close_limit_price(2.0, "stop_loss", nudge=0.25, attempt=attempt, pays_a_debit=False)
+        for attempt in range(4)
+    ]
+    assert prices == [1.5, 1.0, 0.5, 0.01]
 
 
 async def test_kill_switch_still_executes_a_pending_close() -> None:
