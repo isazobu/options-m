@@ -355,7 +355,7 @@ def test_the_scalars_can_never_size_past_the_hard_per_trade_ceiling() -> None:
     clamp is what keeps sizing and risk.py agreeing rather than burning a full
     round of broker calls to produce a rejection.
     """
-    settings = _settings()
+    settings = _settings(max_premium_pct_per_trade=0.02)
     decision = size_position(
         strategy="put_credit_spread",
         conviction=1.0,

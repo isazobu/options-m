@@ -126,7 +126,7 @@ class Settings(BaseSettings):
 
     # Risk limits. Single source of truth: strategy_builder's liquidity gate
     # and risk.py's account-wide gate both read these fields.
-    max_premium_pct_per_trade: float = Field(default=0.02, gt=0.0, le=1.0)
+    max_premium_pct_per_trade: float = Field(default=0.20, gt=0.0, le=1.0)
     max_total_premium_pct: float = Field(default=0.15, gt=0.0, le=1.0)
     max_concurrent_positions: int = Field(default=5, ge=1)
     max_positions_per_underlying: int = Field(default=1, ge=1)

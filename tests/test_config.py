@@ -114,7 +114,7 @@ def test_render_blueprint_contains_the_complete_two_session_campaign_envelope() 
     expected = {
         "DRY_RUN": "false",
         "BASE_RISK_PCT_PER_TRADE": "0.04",
-        "MAX_PREMIUM_PCT_PER_TRADE": "0.05",
+        "MAX_PREMIUM_PCT_PER_TRADE": "0.20",
         "MAX_BETA_WEIGHTED_DELTA_PCT": "3.0",
         "MAX_NET_VEGA_PCT": "0.03",
         "MAX_TOTAL_PREMIUM_PCT": "0.40",

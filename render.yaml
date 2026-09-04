@@ -80,7 +80,7 @@ services:
       - key: BASE_RISK_PCT_PER_TRADE
         value: "0.04"
       - key: MAX_PREMIUM_PCT_PER_TRADE
-        value: "0.05"
+        value: "0.20"
       - key: MAX_BETA_WEIGHTED_DELTA_PCT
         value: "3.0"
       - key: MAX_NET_VEGA_PCT
