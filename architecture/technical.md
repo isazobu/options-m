@@ -333,7 +333,7 @@ risk_fraction = base_risk_pct_per_trade      (0.015)
               × gain_scalar                  [1.00 … 1.60]
               × conviction_scalar            [0.60 … 1.50], shrunk by reliability
               × horizon_scalar               {0, 1.00}   (front-load off by default)
-              ↓ clamped to max_premium_pct_per_trade (0.02)
+              ↓ clamped to max_premium_pct_per_trade (0.20)
 
 qty = min(
     risk_fraction × equity            ÷ max_loss_per_contract,
@@ -715,7 +715,7 @@ EXIT_DTE_SHORT_PREMIUM=3             # MUST stay below DTE_TARGET_MIN
 EXIT_TIME_STOP_DAYS=3                # holding duration, cut to the campaign length
 
 # Risk limits
-MAX_PREMIUM_PCT_PER_TRADE=0.02
+MAX_PREMIUM_PCT_PER_TRADE=0.20
 MAX_TOTAL_PREMIUM_PCT=0.15
 MAX_CONCURRENT_POSITIONS=5
 MAX_POSITIONS_PER_UNDERLYING=1
